@@ -87,14 +87,19 @@ def _break_the_queue(monkeypatch):
         # The queue assumes delivery succeeded and clears regardless. This is
         # what "offline-tolerant" looks like when it is only claimed.
         def lossy_flush(self):
-            count = len(self._queue)
+            # Must clear the REAL storage. _queue is a computed view now, so
+            # clearing it would clear a temporary list and drop nothing -- the
+            # breakage would then be simulating nothing and the control would
+            # pass for the wrong reason.
+            batch = self._queue
             if self._transport is not None:
                 try:
-                    self._transport.send(list(self._queue))
+                    self._transport.send(batch)
                 except Exception:
                     pass
-            self._queue.clear()
-            return count
+            self._log.clear()
+            self._sessions.clear()
+            return len(batch)
 
         monkeypatch.setattr(EventQueue, "flush", lossy_flush)
 

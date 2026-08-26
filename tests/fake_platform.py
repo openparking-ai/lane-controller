@@ -64,9 +64,19 @@ class FakePlatform:
         self.sessions_by_open_event[event_id] = session
         return {"session": session, "created": True}
 
-    def close_session(self, *, event_id: str, plate: str, exit_at: str) -> dict:
+    def find_open_session(self, *, plate: str) -> dict | None:
+        if not self.online:
+            return None
+        session = self.open_sessions.get(plate)
+        return {"session": {**session, "id": id(session)}} if session else None
+
+    def close_session(
+        self, *, event_id: str, plate: str, exit_at: str, session_id: str | None = None
+    ) -> dict:
         self._check()
-        self.closed.append({"event_id": event_id, "plate": plate, "exit_at": exit_at})
+        self.closed.append(
+            {"event_id": event_id, "plate": plate, "exit_at": exit_at, "session_id": session_id}
+        )
         if event_id in self.sessions_by_close_event:
             return {"session": self.sessions_by_close_event[event_id], "replay": True}
         session = self.open_sessions.pop(plate, None)
