@@ -1,0 +1,38 @@
+name: CLA
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  cla:
+    name: cla
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the BASE commit, not the merge result. The gate and the
+      # signature list therefore come from the branch being merged into, so a
+      # pull request cannot edit the check that judges it.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Collect changed files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename' > "$RUNNER_TEMP/changed.txt"
+          echo "changed files:"; cat "$RUNNER_TEMP/changed.txt"
+
+      - name: Check CLA signature
+        env:
+          # Via the environment rather than inline ${{ }}, so the login is never
+          # pasted into a shell command.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: node .github/scripts/check-cla.js "$PR_AUTHOR" "$RUNNER_TEMP/changed.txt"

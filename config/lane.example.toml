@@ -1,0 +1,33 @@
+# Example lane configuration.
+#
+# Copy to lane.toml and edit. Nothing here is required to run the tests --
+# the simulated stack builds its own config.
+
+[lane]
+id      = "lane-1"
+site_id = "site-1"
+
+# Below this confidence the lane takes its fallback path instead of deciding.
+# Raising it makes the lane more cautious and sends more vehicles to fallback;
+# lowering it lets the lane act on reads it is less sure about. It should never
+# be lowered to make a fallback rate look better.
+confidence_threshold = 0.85
+
+# How old cached rules may be before the lane stops trusting them and falls
+# back. The lane keeps working with the internet down; it does not keep working
+# forever with the internet down.
+rules_max_age_seconds = 86400
+
+# Where events are reported when connectivity allows. Never on the hot path.
+server_url = "https://platform.example/api/lane-events"
+
+[camera]
+id               = "cam-1"
+# RTSP and PoE are required for any camera on this platform.
+rtsp_url         = "rtsp://user:password@192.0.2.10:554/h264Preview_01_main"
+frames_per_read  = 3
+
+[gate]
+# Momentary pulse on the vend relay. There is no close setting: the barrier
+# closes on its own closing loop, which is wired to the barrier and not to us.
+vend_pulse_ms = 500
