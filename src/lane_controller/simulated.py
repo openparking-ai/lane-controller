@@ -91,17 +91,21 @@ class StubVehicleIdentifier(VehicleIdentifier):
     """
 
     def __init__(self, identities: Sequence[VehicleIdentity] | None = None) -> None:
-        self._identities: list[VehicleIdentity] = list(identities) if identities else [
-            VehicleIdentity(
-                plate="SIM-0001",
-                plate_region="FL",
-                make="Toyota",
-                model="Corolla",
-                color="silver",
-                marks=("roof rack",),
-                confidence=0.97,
-            )
-        ]
+        self._identities: list[VehicleIdentity] = (
+            list(identities)
+            if identities
+            else [
+                VehicleIdentity(
+                    plate="SIM-0001",
+                    plate_region="FL",
+                    make="Toyota",
+                    model="Corolla",
+                    color="silver",
+                    marks=("roof rack",),
+                    confidence=0.97,
+                )
+            ]
+        )
         self._iter: Iterator[VehicleIdentity] = iter(self._identities)
         self._last = self._identities[-1]
 

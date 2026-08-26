@@ -68,9 +68,21 @@ class DecisionCache:
         self._rules: dict[str, Rule] = {}
         self._refreshed_at: float | None = None
         self._max_age = max_age_seconds
+        # What to do with a confidently-read plate that has no rule. None means
+        # fall back -- the safe default, and the one that applies until the
+        # platform has said otherwise. A transient garage syncs "allow"; a
+        # permit-only garage will sync nothing and keep falling back.
+        self.default_action: str | None = None
 
-    def load(self, rules: list[Rule], *, now: float | None = None) -> None:
+    def load(
+        self,
+        rules: list[Rule],
+        *,
+        default_action: str | None = None,
+        now: float | None = None,
+    ) -> None:
         self._rules = {r.plate.upper(): r for r in rules}
+        self.default_action = default_action
         self._refreshed_at = time.time() if now is None else now
 
     def is_stale(self, *, now: float | None = None) -> bool:
@@ -132,6 +144,18 @@ def decide(
 
     rule = cache.lookup(identity.plate)
     if rule is None:
+        if cache.default_action == "allow":
+            return Decision(
+                outcome=Outcome.ALLOW,
+                reason=f"no rule for plate {identity.plate}; garage default is allow",
+                identity=identity,
+            )
+        if cache.default_action == "deny":
+            return Decision(
+                outcome=Outcome.DENY,
+                reason=f"no rule for plate {identity.plate}; garage default is deny",
+                identity=identity,
+            )
         return Decision(
             outcome=Outcome.FALLBACK,
             reason=f"no rule for plate {identity.plate}",

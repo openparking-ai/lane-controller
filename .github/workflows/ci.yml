@@ -37,7 +37,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e '.[dev]'
+
       - name: Tests
         # No hardware, no camera, no barrier, no vision model. If this ever
         # needs any of those, a hardware seam has leaked into the lane logic.
         run: pytest -q
+
+      - name: Offline fail-control
+        # Breaks the outbox on purpose and requires the offline suite to fail.
+        # An offline guarantee nobody has seen fail is not known to be one.
+        run: python scripts/offline_fail_control.py

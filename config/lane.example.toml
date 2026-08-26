@@ -4,8 +4,10 @@
 # the simulated stack builds its own config.
 
 [lane]
-id      = "lane-1"
-site_id = "site-1"
+id        = "lane-1"
+site_id   = "site-1"
+# "entry" opens a session; "exit" closes one and the platform prices it.
+direction = "entry"
 
 # Below this confidence the lane takes its fallback path instead of deciding.
 # Raising it makes the lane more cautious and sends more vehicles to fallback;

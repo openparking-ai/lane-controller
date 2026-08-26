@@ -26,6 +26,10 @@ class LaneConfig:
     site_id: str
     camera: CameraConfig
     gate: GateConfig
+    # 'entry' opens a parking session; 'exit' closes one and the platform
+    # computes the fee. A controller does one or the other, never both, because
+    # one physical lane runs in one direction.
+    direction: str = "entry"
     # Below this, the lane takes its fallback path rather than deciding. The
     # default is deliberately high: the cost of a fallback is an operator
     # glancing at a screen, and the cost of a wrong open is a stranger's car
@@ -33,6 +37,10 @@ class LaneConfig:
     confidence_threshold: float = 0.85
     rules_max_age_seconds: float = 86_400.0
     server_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.direction not in ("entry", "exit"):
+            raise ValueError(f"direction must be 'entry' or 'exit', got {self.direction!r}")
 
     @classmethod
     def from_file(cls, path: str | Path) -> LaneConfig:
@@ -48,6 +56,7 @@ class LaneConfig:
         return cls(
             lane_id=lane["id"],
             site_id=lane["site_id"],
+            direction=lane.get("direction", "entry"),
             confidence_threshold=float(lane.get("confidence_threshold", 0.85)),
             rules_max_age_seconds=float(lane.get("rules_max_age_seconds", 86_400.0)),
             server_url=lane.get("server_url"),
