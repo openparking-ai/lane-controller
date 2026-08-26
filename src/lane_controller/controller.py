@@ -12,11 +12,14 @@ which is why `tests/` needs no hardware.
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 
 from .config import LaneConfig
 from .decision import Decision, DecisionCache, Outcome, decide
 from .events import EventQueue
 from .interfaces import CameraFeed, LoopInput, VehicleIdentifier, VendOutput
+from .sync import SESSION_CLOSE, SESSION_OPEN, to_iso
 
 log = logging.getLogger(__name__)
 
@@ -32,14 +35,30 @@ class LaneController:
         identifier: VehicleIdentifier,
         cache: DecisionCache | None = None,
         events: EventQueue | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.config = config
         self.loop = loop
         self.camera = camera
         self.vend = vend
         self.identifier = identifier
-        self.cache = cache or DecisionCache(max_age_seconds=config.rules_max_age_seconds)
-        self.events = events or EventQueue()
+        # `cache or DecisionCache(...)` would be wrong, and was: DecisionCache
+        # defines __len__, so a freshly synced cache that happens to hold zero
+        # plate rules is falsy and would be silently thrown away and replaced
+        # with an empty, never-refreshed one -- which then reports itself STALE
+        # and sends every vehicle to fallback. A transient garage syncs exactly
+        # zero plate rules, so this is the normal case, not an edge case.
+        self.cache = (
+            cache
+            if cache is not None
+            else DecisionCache(max_age_seconds=config.rules_max_age_seconds)
+        )
+        self.events = events if events is not None else EventQueue()
+        # Injectable so a demo or a test can put a car through a three-hour
+        # stay without waiting three hours. The lane's own clock is what stamps
+        # session times, which is the point: the platform must price the stay
+        # from when the car was there, not from when it heard about it.
+        self._clock = clock
 
     def handle_arrival(self) -> Decision:
         """One vehicle, from arming to vend. Assumes the loop has already armed."""
@@ -76,11 +95,41 @@ class LaneController:
         if decision.should_vend:
             self.vend.vend(decision.reason)
             self.events.record("vended", lane, reason=decision.reason, plate=identity.plate)
+
+            # The session action goes on the SAME queue as the log, so a lane
+            # that was offline replays what happened in the order it happened.
+            # The timestamp is the lane's, not the platform's: the car arrived
+            # when it arrived, whatever time the server eventually hears about
+            # it. Pricing a stay by when the network came back would be wrong.
+            at = to_iso(self._clock())
+            if self.config.direction == "entry":
+                self.events.record(
+                    SESSION_OPEN,
+                    lane,
+                    plate=identity.plate,
+                    plate_region=identity.plate_region,
+                    at=at,
+                )
+            else:
+                self.events.record(SESSION_CLOSE, lane, plate=identity.plate, at=at)
+
         elif decision.outcome is Outcome.FALLBACK:
             # Not a guess and not a silent drop. The fallback is a named path
             # with an event behind it, so an operator can see it happened and
             # the record shows why the lane declined to decide.
+            #
+            # The event is the whole of the fallback for now: the human/phone
+            # path that answers it belongs with Claim Check and is not built.
+            # It is a stub that LOGS, not a stub that pretends.
             log.info("lane %s falling back: %s", lane, decision.reason)
+            self.events.record(
+                "fallback_needs_human",
+                lane,
+                reason=decision.reason,
+                fallback=decision.fallback.value if decision.fallback else None,
+                plate=identity.plate,
+                confidence=identity.confidence,
+            )
 
         # Best effort, and after the barrier has already been told what to do.
         # Nothing above this line waits on the network.

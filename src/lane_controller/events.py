@@ -8,6 +8,7 @@ cannot.
 from __future__ import annotations
 
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
@@ -19,6 +20,11 @@ class LaneEvent:
     lane_id: str
     at: float
     detail: dict[str, Any] = field(default_factory=dict)
+    # Generated on the lane, unique forever, and the reason a reconnecting lane
+    # can safely re-send everything it could not confirm: the platform
+    # deduplicates on it. Without this, "flush the queue again" means "bill the
+    # customer again".
+    event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -56,7 +62,13 @@ class EventQueue:
         return event
 
     def flush(self) -> int:
-        """Try to deliver everything queued. Returns how many were delivered."""
+        """Try to deliver everything queued. Returns how many were delivered.
+
+        All or nothing on purpose. A partial flush would need per-item
+        bookkeeping to avoid re-sending; re-sending is free here because every
+        platform endpoint the transport calls is idempotent, so the simple
+        thing is also the correct thing.
+        """
         if self._transport is None or not self._queue:
             return 0
         batch = list(self._queue)

@@ -47,7 +47,7 @@ def test_every_stage_is_reported_as_an_event(lane):
     controller.run_once()
 
     kinds = [e.kind for e in list(controller.events._queue)]
-    assert kinds == ["frames_captured", "vehicle_identified", "decision", "vended"]
+    assert kinds == ["frames_captured", "vehicle_identified", "decision", "vended", "session_open"]
 
 
 def test_a_fallback_is_recorded_not_swallowed(lane):
@@ -94,3 +94,37 @@ def test_several_vehicles_in_a_row(lane):
 
     assert outcomes == [Outcome.ALLOW, Outcome.DENY, Outcome.FALLBACK]
     assert vend.vend_count == 1
+
+
+def test_an_empty_but_synced_cache_is_not_thrown_away(config):
+    """Regression: DecisionCache defines __len__, so an empty one is falsy.
+
+    A garage with no per-plate rules -- which is every transient garage --
+    syncs a cache of length zero. `cache or DecisionCache()` replaced it with a
+    fresh, never-refreshed cache, which reports STALE, which sends every single
+    vehicle to fallback. The gate would have stopped working for the most
+    ordinary configuration there is.
+    """
+    from lane_controller import DecisionCache, LaneController
+    from lane_controller.simulated import (
+        CannedCameraFeed,
+        RecordingVendOutput,
+        SimulatedLoopInput,
+        StubVehicleIdentifier,
+    )
+
+    empty_but_fresh = DecisionCache()
+    empty_but_fresh.load([], default_action="allow")
+    assert len(empty_but_fresh) == 0
+    assert not empty_but_fresh.is_stale()
+
+    controller = LaneController(
+        config,
+        loop=SimulatedLoopInput(),
+        camera=CannedCameraFeed(),
+        vend=RecordingVendOutput(),
+        identifier=StubVehicleIdentifier(),
+        cache=empty_but_fresh,
+    )
+    assert controller.cache is empty_but_fresh
+    assert controller.run_once().outcome is Outcome.ALLOW
