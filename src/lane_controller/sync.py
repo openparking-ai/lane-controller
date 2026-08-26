@@ -70,6 +70,7 @@ class PlatformTransport(EventTransport):
                 if event.kind == SESSION_OPEN:
                     self._guarded(
                         lambda e=event: self._client.open_session(
+                            event_id=e.event_id,
                             plate=e.detail["plate"],
                             entry_at=e.detail.get("at") or to_iso(e.at),
                             plate_region=e.detail.get("plate_region"),
@@ -78,6 +79,7 @@ class PlatformTransport(EventTransport):
                 elif event.kind == SESSION_CLOSE:
                     result = self._guarded(
                         lambda e=event: self._client.close_session(
+                            event_id=e.event_id,
                             plate=e.detail["plate"],
                             exit_at=e.detail.get("at") or to_iso(e.at),
                         )
@@ -106,6 +108,12 @@ class PlatformTransport(EventTransport):
         A rejected item is poison: retrying it forever would block every later
         item behind it. So it is dropped -- but counted and logged, never
         silently, because a dropped session is a gap in the money record.
+
+        This is why the platform answers a stale exit with 409 rather than
+        letting a constraint surface as 500: a 5xx is classified unreachable
+        above, and would be re-sent forever with the whole outbox stuck behind
+        it. A terminal refusal is the difference between one lost item and a
+        lane that never reports again.
         """
         try:
             return call()

@@ -220,3 +220,39 @@ def test_both_directions_work_offline(direction):
     assert controller.run_once().outcome is Outcome.ALLOW
     assert vend.vend_count == 1
     assert controller.events.pending > 0
+
+
+def test_an_entry_replayed_after_the_car_left_does_not_double_open():
+    """A lost acknowledgement, which is ordinary, must not create a phantom.
+
+    The entry lane delivers its open, the reply never arrives, so the item stays
+    queued. Meanwhile the car leaves and the exit lane -- a different controller
+    with its own outbox -- closes the session. Only then does the entry lane
+    re-send.
+
+    Keying on state rather than on the event id gets this wrong: there is no
+    open session by then, so a second one is created, never exits, and the
+    garage's inside-count is wrong from that moment on.
+    """
+    platform = FakePlatform()
+    entry, _, entry_transport = build(platform, direction="entry")
+
+    platform.online = False
+    entry.run_once()
+    held = list(entry.events._queue)
+    platform.online = True
+    assert entry.events.flush() == len(held)
+    assert platform.unique_opens == 1
+
+    exit_lane, _, _ = build(platform, direction="exit")
+    exit_lane.run_once()
+    assert platform.open_sessions == {}, "the car has left"
+
+    # The entry lane never saw the reply, so it delivers the identical batch again.
+    assert entry_transport.send(held) is True
+
+    assert platform.unique_opens == 1, "a replayed entry must not open a second session"
+    assert platform.open_sessions == {}, "no phantom open session may be left behind"
+    assert platform.open_deliveries > platform.unique_opens, (
+        "control: the replay really was delivered, so the count above means dedup, not silence"
+    )

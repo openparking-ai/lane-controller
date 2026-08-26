@@ -72,14 +72,26 @@ class PlatformClient:
     def post_events(self, events: list[dict]) -> dict:
         return self._request("POST", "/api/v1/lane/events", {"events": events})
 
-    def open_session(self, *, plate: str, entry_at: str, plate_region: str | None = None) -> dict:
+    def open_session(
+        self, *, event_id: str, plate: str, entry_at: str, plate_region: str | None = None
+    ) -> dict:
+        # event_id is the lane's own, and it is what makes a re-sent flush safe.
+        # The platform keys the session on it, so this exact arrival can only
+        # ever produce one session however many times we deliver it.
         return self._request(
             "POST",
             "/api/v1/lane/sessions/open",
-            {"plate": plate, "entry_at": entry_at, "plate_region": plate_region},
+            {
+                "event_id": event_id,
+                "plate": plate,
+                "entry_at": entry_at,
+                "plate_region": plate_region,
+            },
         )
 
-    def close_session(self, *, plate: str, exit_at: str) -> dict:
+    def close_session(self, *, event_id: str, plate: str, exit_at: str) -> dict:
         return self._request(
-            "POST", "/api/v1/lane/sessions/close", {"plate": plate, "exit_at": exit_at}
+            "POST",
+            "/api/v1/lane/sessions/close",
+            {"event_id": event_id, "plate": plate, "exit_at": exit_at},
         )
