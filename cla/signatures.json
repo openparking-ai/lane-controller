@@ -1,0 +1,10 @@
+{
+  "$comment": "Signatories to the Open Parking AI CLA. See ../CLA.md. Adding yourself here, in a pull request of its own, is how you sign.",
+  "signatories": [
+    {
+      "github": "Gokhangulec",
+      "name": "Gokhan Gulec",
+      "date": "2026-08-26"
+    }
+  ]
+}
