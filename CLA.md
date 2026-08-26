@@ -95,4 +95,4 @@ the check — otherwise signing would require having already signed.
 
 ---
 
-Built by 72 Knots. Method by [72Knots.ai](https://72knots.ai)
+Built by 72 Knots Method by 72Knots.ai
