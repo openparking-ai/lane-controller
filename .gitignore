@@ -7,3 +7,5 @@ venv/
 .ruff_cache/
 config/lane.toml
 .DS_Store
+models/
+eval-data/
