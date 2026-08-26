@@ -36,6 +36,7 @@ class LaneController:
         cache: DecisionCache | None = None,
         events: EventQueue | None = None,
         clock: Callable[[], float] = time.time,
+        session_lookup: Callable[[str], dict | None] | None = None,
     ) -> None:
         self.config = config
         self.loop = loop
@@ -59,6 +60,9 @@ class LaneController:
         # session times, which is the point: the platform must price the stay
         # from when the car was there, not from when it heard about it.
         self._clock = clock
+        # Injected rather than reached for, so a lane can be built with no
+        # platform at all and the tests need no network.
+        self.session_lookup = session_lookup
 
     def handle_arrival(self) -> Decision:
         """One vehicle, from arming to vend. Assumes the loop has already armed."""
@@ -111,7 +115,18 @@ class LaneController:
                     at=at,
                 )
             else:
-                self.events.record(SESSION_CLOSE, lane, plate=identity.plate, at=at)
+                # Ask the platform which session this is, while the answer is
+                # still unambiguous. If it cannot be reached the close goes out
+                # without an id and the platform falls back to matching on the
+                # plate -- which works, and is merely less precise.
+                session_id = None
+                if self.session_lookup is not None:
+                    found = self.session_lookup(identity.plate)
+                    if found:
+                        session_id = found.get("session", {}).get("id")
+                self.events.record(
+                    SESSION_CLOSE, lane, plate=identity.plate, at=at, session_id=session_id
+                )
 
         elif decision.outcome is Outcome.FALLBACK:
             # Not a guess and not a silent drop. The fallback is a named path

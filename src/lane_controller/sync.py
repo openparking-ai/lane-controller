@@ -82,6 +82,10 @@ class PlatformTransport(EventTransport):
                             event_id=e.event_id,
                             plate=e.detail["plate"],
                             exit_at=e.detail.get("at") or to_iso(e.at),
+                            # Recorded at the moment of the exit, when it was
+                            # still unambiguous which session was open. By the
+                            # time a queued close is delivered it may not be.
+                            session_id=e.detail.get("session_id"),
                         )
                     )
                     if result is not None:

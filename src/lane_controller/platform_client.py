@@ -89,9 +89,24 @@ class PlatformClient:
             },
         )
 
-    def close_session(self, *, event_id: str, plate: str, exit_at: str) -> dict:
-        return self._request(
-            "POST",
-            "/api/v1/lane/sessions/close",
-            {"event_id": event_id, "plate": plate, "exit_at": exit_at},
-        )
+    def find_open_session(self, *, plate: str) -> dict | None:
+        """The session currently open for this plate, if the platform is reachable.
+
+        Best effort on purpose. Naming the session on the close is what stops a
+        stale exit landing on a later visit -- but a lane with no network still
+        has to open its gate, so failing to look it up is not an error.
+        """
+        from urllib.parse import quote
+
+        try:
+            return self._request("GET", f"/api/v1/lane/sessions/open?plate={quote(plate)}")
+        except (PlatformUnreachable, PlatformRejected):
+            return None
+
+    def close_session(
+        self, *, event_id: str, plate: str, exit_at: str, session_id: str | None = None
+    ) -> dict:
+        body = {"event_id": event_id, "plate": plate, "exit_at": exit_at}
+        if session_id:
+            body["session_id"] = session_id
+        return self._request("POST", "/api/v1/lane/sessions/close", body)

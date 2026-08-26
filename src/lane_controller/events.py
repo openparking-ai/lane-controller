@@ -38,28 +38,52 @@ class EventTransport(Protocol):
         ...
 
 
-class EventQueue:
-    """Bounded, offline-tolerant, oldest-dropped-first.
+#: Kinds that move money. These are never dropped to make room.
+SESSION_KINDS = frozenset({"session_open", "session_close"})
 
-    Bounded because a lane that has been offline for a week must not run the
-    controller out of memory. Dropping is visible -- `dropped` is a counter the
-    lane reports on -- rather than silent, because a gap in the event record
-    that nobody knows about is worse than one that is measured.
+
+class EventQueue:
+    """Bounded for the log, unbounded for the money.
+
+    Bounded because a lane offline for a week must not run the controller out of
+    memory. But the original policy -- one queue, oldest dropped first -- drops
+    the OLDEST items first, and in a long outage the oldest items are the
+    session opens. Losing those means cars that entered have no session, exit to
+    a refusal, and park free, while the log entries that would have explained it
+    are the ones still in the queue. The cheapest thing to throw away was
+    exactly the most expensive.
+
+    So session actions go in their own queue and are never dropped. Only log
+    events are, and a drop is counted rather than silent: a gap nobody knows
+    about is worse than one that is measured.
     """
 
     def __init__(
         self, transport: EventTransport | None = None, *, max_events: int = 10_000
     ) -> None:
-        self._queue: deque[LaneEvent] = deque(maxlen=max_events)
+        self._log: deque[LaneEvent] = deque(maxlen=max_events)
+        self._sessions: deque[LaneEvent] = deque()
         self._transport = transport
         self.dropped = 0
 
+    @property
+    def _queue(self) -> list[LaneEvent]:
+        """Everything pending, in the order it happened."""
+        return sorted([*self._sessions, *self._log], key=lambda e: e.at)
+
     def record(self, kind: str, lane_id: str, **detail: Any) -> LaneEvent:
         event = LaneEvent(kind=kind, lane_id=lane_id, at=time.time(), detail=detail)
-        if self._queue.maxlen is not None and len(self._queue) == self._queue.maxlen:
+        if kind in SESSION_KINDS:
+            self._sessions.append(event)
+            return event
+        if self._log.maxlen is not None and len(self._log) == self._log.maxlen:
             self.dropped += 1
-        self._queue.append(event)
+        self._log.append(event)
         return event
+
+    @property
+    def pending_sessions(self) -> int:
+        return len(self._sessions)
 
     def flush(self) -> int:
         """Try to deliver everything queued. Returns how many were delivered.
@@ -69,14 +93,15 @@ class EventQueue:
         platform endpoint the transport calls is idempotent, so the simple
         thing is also the correct thing.
         """
-        if self._transport is None or not self._queue:
+        batch = self._queue
+        if self._transport is None or not batch:
             return 0
-        batch = list(self._queue)
         if not self._transport.send(batch):
             return 0  # keep everything; try again next time
-        self._queue.clear()
+        self._log.clear()
+        self._sessions.clear()
         return len(batch)
 
     @property
     def pending(self) -> int:
-        return len(self._queue)
+        return len(self._log) + len(self._sessions)

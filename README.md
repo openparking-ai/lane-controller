@@ -39,12 +39,16 @@ neither on the path between a car arriving and a barrier opening.
 | | |
 |---|---|
 | `sync_rules()` | pulls the garage's rules into the local cache. On failure it keeps the cache it had — a failed request is not a reason to forget good rules. |
-| `EventQueue` | one outbox holding both the activity log and the session actions, so a lane that was offline replays what happened in the order it happened. |
+| `EventQueue` | one outbox holding both the activity log and the session actions, so a lane that was offline replays what happened in the order it happened. **Session actions are never dropped**; only log events are, and a drop is counted. |
 | `PlatformTransport` | delivers the outbox. All-or-nothing, because every platform endpoint it calls is idempotent. |
 
 **Session times come from the lane, never the server.** A car arrives when it
 arrives, whatever time the platform eventually hears about it; pricing a stay by
 when the network came back would be wrong.
+
+**At an exit, the lane names the session it is closing** when the platform is
+reachable, so a queued close cannot land on a later visit. Offline it closes on
+the plate alone, which works and is merely less precise.
 
 **Every queued item carries an `event_id` generated on the lane.** That is what
 makes reconnecting safe: the queue re-sends everything it could not confirm, and

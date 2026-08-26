@@ -21,6 +21,13 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: ruff check .
 
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: No real personal data in the repository
+        run: |
+          node .github/scripts/check-no-real-data.js --self-test
+          node .github/scripts/check-no-real-data.js
+
   test:
     name: test
     runs-on: ubuntu-latest
