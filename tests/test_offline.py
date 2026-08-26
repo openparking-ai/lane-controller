@@ -256,3 +256,68 @@ def test_an_entry_replayed_after_the_car_left_does_not_double_open():
     assert platform.open_deliveries > platform.unique_opens, (
         "control: the replay really was delivered, so the count above means dedup, not silence"
     )
+
+
+def test_session_actions_are_never_dropped_to_make_room():
+    """Review item 6.
+
+    The original outbox was one queue, oldest dropped first. In a long outage
+    the oldest items are the session opens, so the cheapest thing to throw away
+    was exactly the most expensive: cars that entered would have no session,
+    exit to a refusal, and park free -- while the log entries that would have
+    explained it were the ones still queued.
+    """
+    platform = FakePlatform()
+    platform.online = False
+    queue = EventQueue(PlatformTransport(platform), max_events=3)
+
+    for i in range(3):
+        queue.record("session_open", "lane-1", plate=f"CAR-{i}", at="t")
+    for i in range(50):
+        queue.record("frames_captured", "lane-1", n=i)
+
+    assert queue.pending_sessions == 3, "not one session action may be dropped"
+    assert queue.dropped > 0, "log events are what gets dropped"
+    kinds = [e.kind for e in queue._queue]
+    assert kinds.count("session_open") == 3
+    assert len([k for k in kinds if k != "session_open"]) == 3, "the log stays bounded"
+
+
+def test_a_dropped_log_event_is_counted_not_silent():
+    queue = EventQueue(max_events=2)
+    for i in range(5):
+        queue.record("frames_captured", "lane-1", n=i)
+    assert queue.pending == 2
+    assert queue.dropped == 3
+
+
+def test_the_exit_names_the_session_when_the_platform_is_reachable():
+    """C5(a). Recorded at the exit, while it is still unambiguous which session
+    is open — by the time a queued close is delivered, it may not be."""
+    platform = FakePlatform()
+    entry, _, _ = build(platform, direction="entry")
+    entry.run_once()
+
+    exit_lane, _, _ = build(platform, direction="exit")
+    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    exit_lane.run_once()
+
+    assert len(platform.closed) == 1
+    assert platform.closed[0]["session_id"] is not None, "the close must name the session"
+
+
+def test_an_offline_exit_still_closes_without_a_session_id():
+    """The lookup is best effort: a lane with no network must still open its gate."""
+    platform = FakePlatform()
+    platform.reject_close_without_open = False
+    exit_lane, vend, _ = build(platform, direction="exit")
+    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+
+    platform.online = False
+    decision = exit_lane.run_once()
+
+    assert decision.outcome is Outcome.ALLOW
+    assert vend.vend_count == 1
+    queued = [e for e in exit_lane.events._queue if e.kind == "session_close"]
+    assert len(queued) == 1
+    assert queued[0].detail["session_id"] is None, "no id available offline, and that is fine"
