@@ -1,0 +1,37 @@
+name: Emails
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  emails:
+    name: emails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history. On main this checks every commit, so a real address
+          # cannot arrive by a route nobody predicted.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Self-test the guard
+        # Before trusting the result below, prove the check can fail: it plants
+        # a real address in a scratch repository and requires a rejection.
+        run: node .github/scripts/check-commit-emails.js --self-test
+
+      - name: Check this pull request's commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: node .github/scripts/check-commit-emails.js "$BASE..$HEAD"
+
+      - name: Check the whole history
+        if: github.event_name != 'pull_request'
+        run: node .github/scripts/check-commit-emails.js --all
