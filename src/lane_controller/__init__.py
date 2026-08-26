@@ -1,6 +1,6 @@
 """Open Parking AI lane controller.
 
-Built by 72 Knots. Method by 72Knots.ai
+Built by 72 Knots Method by 72Knots.ai
 """
 
 from .config import CameraConfig, GateConfig, LaneConfig
