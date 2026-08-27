@@ -54,29 +54,3 @@ jobs:
         # Breaks the outbox on purpose and requires the offline suite to fail.
         # An offline guarantee nobody has seen fail is not known to be one.
         run: python scripts/offline_fail_control.py
-
-  vision:
-    name: vision
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { persist-credentials: false }
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: pip install -e '.[dev,vision]'
-
-      - name: Train a small recogniser
-        # Weights are not committed, so CI builds its own. Small and short --
-        # this proves the pipeline and the never-wrong-silently guarantee, not
-        # the accuracy numbers, which come from the full harness run recorded
-        # in the receipt.
-        run: |
-          python -m lane_controller.vision.plates.train \
-            --steps 600 --train-size 4000 --batch-size 32 --device cpu
-
-      - name: Vision tests, including V4 never-wrong-silently
-        run: pytest tests/test_vision_plates.py -q
-
-      - name: The harness runs and reports
-        run: python scripts/eval_plates.py --per-rung 40 --skip-baseline

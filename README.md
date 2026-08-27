@@ -89,7 +89,8 @@ Pass `--confidence 0.40` to watch the lane refuse to guess instead.
 
 Three interfaces — `LoopInput`, `CameraFeed`, `VendOutput` — plus a
 `VehicleIdentifier`, each with a fully simulated implementation. The complete
-sequence runs and the tests pass on any machine.
+sequence runs and the tests pass on any machine, with no Vehicle ID service
+running: the simulated identifier stands in for it.
 
 ```sh
 python3 -m venv .venv && source .venv/bin/activate
@@ -101,39 +102,39 @@ python scripts/offline_fail_control.py   # breaks the outbox, requires the tests
 
 ## Vehicle ID
 
-Plate reading is real; make/model, colour and appearance are the next slice and
-their fields stay `None` rather than being invented.
-
-The recogniser is **ours** — a small CRNN+CTC trained on generated plates. That
-was a licensing decision before it was a technical one: no public US plate-reading
-dataset permits commercial use (see [docs/EVAL_DATA.md](docs/EVAL_DATA.md)), and
-every third-party model we checked ships permissive *code* with **no stated licence
-for its weights**. Generating the training data removes both problems and makes the
-weights our own asset.
+Identification is a **separate system**: [openparking-ai/vehicle-id](https://github.com/openparking-ai/vehicle-id).
+This lane is an ordinary client of its contract — the same interface a third
+party integrating their own system uses. There is no in-process path reserved
+for us, and `tests/test_vehicle_id_boundary.py` fails if this package ever
+imports anything from that one except its public contract.
 
 ```sh
-pip install -e '.[dev,vision]'
-python -m lane_controller.vision.plates.train      # weights are NOT committed
-python scripts/eval_plates.py                      # every number we quote
+# in the vehicle-id repository, on the same device or the same LAN
+vehicle-id serve
 ```
 
-Measured on synthetic plates, 200 per rung across a 10-rung degradation ladder:
+```python
+from lane_controller.vehicle_id_client import VehicleIdClient
 
-| | rungs 0–7 exact | rung 9 exact | ms/plate |
-|---|---|---|---|
-| ours (CRNN+CTC) | 98.0–100% | 68.5% | **4.1** (CPU) |
-| baseline (RapidOCR PP-OCRv3) | 10.5–98.5% | 50.0% | 208.7 |
+identifier = VehicleIdClient("http://127.0.0.1:8088")
+```
 
-**These are synthetic numbers and are not a prediction of real-world accuracy** —
-the generator uses OpenCV fonts, not embossing typefaces. The harness prints
-real-plate accuracy as NOT MEASURABLE, and it stays that way until the physical
-bench exists.
+The engine applies its own **measured** operating threshold and returns
+`answer` or `fallback`. A fallback arrives here as no identity at all, so a read
+the engine would not stand behind can never match a rule — and the lane's own
+threshold cannot second-guess a decision made against measured data. The engine
+being unreachable is a fallback too, not a crash: there is a car at the barrier
+and the lane needs an outcome it can act on.
 
-**The recogniser is accurate and overconfident**, which matters more than the
-accuracy: mean confidence barely moves across the ladder while accuracy falls.
-The operating threshold is therefore measured, not chosen — **0.99**, giving
-0.87% wrong-but-answered. A lane running this engine must use that value, not
-the lane's own 0.85 default.
+Accuracy numbers, the licensing audit behind the recogniser and the statement
+that real-plate accuracy is NOT MEASURED all live with the engine, where they
+travel with the thing they describe.
+
+**The lane does not trust the engine to be right.** The engine has no rejection
+stage — it reads text out of sensor noise — so a plate that matches no rule is
+refused here whatever confidence came with it. Two independent things have to
+fail before a barrier opens, and that is deliberate: measured against a lane
+holding a permit list, confident noise reads opened zero barriers.
 
 ## Reference hardware
 
@@ -149,8 +150,10 @@ None of it is required to run this package, and none of it has been purchased ye
 
 RTSP and PoE are required for any camera.
 
-Vision runs in Python on the Jetson. The platform server is Node/Express/Postgres —
-see [openparking-ai/platform](https://github.com/openparking-ai/platform).
+Vehicle ID runs in its own process on the Jetson, beside this one — see
+[openparking-ai/vehicle-id](https://github.com/openparking-ai/vehicle-id). The
+platform server is Node/Express/Postgres — see
+[openparking-ai/platform](https://github.com/openparking-ai/platform).
 
 ## Licence and contributing
 
