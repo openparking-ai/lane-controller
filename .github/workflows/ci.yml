@@ -21,6 +21,12 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: ruff check .
 
+      - name: The vehicle-id pin names a commit on vehicle-id main
+        # A pin to a feature-branch commit resolves until that branch is
+        # deleted and then breaks `pip install` for everyone. The comment in
+        # pyproject.toml saying so was not a check; this is.
+        run: bash .github/scripts/check-vehicle-id-pin.sh
+
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
       - name: No real personal data in the repository

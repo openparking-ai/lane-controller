@@ -20,11 +20,17 @@ dependencies = [
   # without a commit here, which is the opposite of what versioning a contract
   # is for. Bumping it is a deliberate act with its own PR.
   #
-  # TEMPORARY: this commit is on vehicle-id's feat/presence-gate branch, not on
-  # its main, because it is what adds the `presence` field this package now
-  # reads. It MUST be re-pinned to the squash-merge SHA on vehicle-id main
-  # before this pull request is merged -- a pin to a branch commit survives only
-  # as long as nobody deletes the branch.
+  # TEMPORARY, AND CI IS RED UNTIL IT IS FIXED. This commit is on vehicle-id's
+  # feat/presence-gate branch, not on its main, because it is what adds the
+  # `presence` field this package now reads. A pin to a branch commit survives
+  # only as long as nobody deletes the branch, and `pip install` of this package
+  # breaks the moment somebody does.
+  #
+  # `.github/scripts/check-vehicle-id-pin.sh` fails the build while this is the
+  # case, so the merge order is enforced rather than remembered:
+  #   1. merge vehicle-id's pull request
+  #   2. re-pin the line below to the resulting commit on vehicle-id main
+  #   3. merge this one
   "openparking-vehicle-id @ git+https://github.com/openparking-ai/vehicle-id@771dd13c9cfa40ce50147cd42415bc0a063fda05",
 ]
 
