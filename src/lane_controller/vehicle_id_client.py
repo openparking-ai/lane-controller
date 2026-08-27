@@ -35,6 +35,7 @@ import urllib.request
 import uuid
 from base64 import b64encode
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from vehicle_id.contract import Read
@@ -110,11 +111,20 @@ class VehicleIdClient:
             log.warning("vehicle-id unavailable or unusable (%s); falling back", exc)
             return NO_IDENTITY
 
+        if read.presence is False:
+            # A different thing from a read the engine would not stand behind,
+            # and it must stay different all the way to the barrier: nothing
+            # was there, so nothing should happen -- no ticket, no session, no
+            # vend. The contract already guarantees such a record carries no
+            # identity.
+            log.info("vehicle-id reports no vehicle present (read %s)", read.read_id)
+            return VehicleIdentity(plate=None, confidence=0.0, presence=False)
+
         if not read.is_answer:
             # The engine measured a confidence and declined to stand behind it.
             # Passing that number on would let the lane's own threshold second-
             # guess a decision the engine already made against measured data.
-            return NO_IDENTITY
+            return replace(NO_IDENTITY, presence=read.presence)
 
         # The lane's own event log carries a plate and a confidence and nothing
         # else, so without this line a wrong open has no read_id to trace, no
@@ -142,6 +152,7 @@ class VehicleIdClient:
             color=identity.color,
             marks=tuple(identity.marks),
             confidence=read.confidence,
+            presence=read.presence,
         )
 
     def operating_threshold(self) -> float | None:
