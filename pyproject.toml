@@ -15,7 +15,11 @@ license = "AGPL-3.0-or-later"
 # is standard-library only, so this stays a dependency-free package to install:
 # no torch, no OpenCV. The engine runs in its own process, reached over HTTP.
 dependencies = [
-  "openparking-vehicle-id @ git+https://github.com/openparking-ai/vehicle-id@main",
+  # Pinned to a commit, not to @main. This is a contract boundary: a moving
+  # target on the other side of one means the lane's behaviour can change
+  # without a commit here, which is the opposite of what versioning a contract
+  # is for. Bumping it is a deliberate act with its own PR.
+  "openparking-vehicle-id @ git+https://github.com/openparking-ai/vehicle-id@540b792d2859804f171765a0401ca828474b5cff",
 ]
 
 [project.optional-dependencies]
