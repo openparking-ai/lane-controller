@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 from base64 import b64encode
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from vehicle_id.contract import Read
 
@@ -73,6 +74,12 @@ class VehicleIdClient:
                 {
                     "image_b64": b64encode(frame.image_bytes).decode(),
                     "camera_id": frame.camera_id,
+                    # The time the CAMERA took it, not the time the engine
+                    # happened to parse the request. Dropping this and letting
+                    # the service stamp its own arrival time skews every
+                    # entry and exit the platform prices a stay from, by
+                    # however long the lane and the engine were busy.
+                    "captured_at": _utc(frame.captured_at),
                 }
                 for frame in frames
             ],
@@ -122,6 +129,11 @@ class VehicleIdClient:
     def _open_health(self, url: str) -> dict:
         with urllib.request.urlopen(url, timeout=self.timeout) as response:
             return json.loads(response.read())
+
+
+def _utc(captured_at: float) -> str:
+    """`Frame.captured_at` is epoch seconds; the contract wants ISO 8601 UTC."""
+    return datetime.fromtimestamp(captured_at, tz=UTC).isoformat()
 
 
 def _post_json(url: str, payload: dict, timeout: float) -> dict:

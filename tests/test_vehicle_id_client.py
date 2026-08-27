@@ -148,3 +148,35 @@ def test_an_unreachable_service_reports_no_operating_point_rather_than_a_default
 
     c._open_health = boom
     assert c.operating_threshold() is None
+
+
+def test_the_capture_time_sent_is_the_cameras_not_the_services():
+    """`captured_at` means when the camera took it.
+
+    Letting the service stamp its own arrival time instead skews every entry
+    and exit by however long the lane and the engine were busy -- and the
+    platform prices a stay from those two timestamps.
+    """
+    sent = {}
+
+    def opener(url, body, timeout):
+        sent.update(body)
+        return {"cursor": 1, "read": a_read()}
+
+    # 2026-08-27T12:00:00+00:00
+    frame = Frame(image_bytes=b"jpeg-ish", captured_at=1787832000.0, camera_id="lane-1")
+    client_returning(opener).identify([frame])
+
+    assert sent["captures"][0]["captured_at"] == "2026-08-27T12:00:00+00:00"
+
+
+def test_the_capture_time_is_utc_with_an_offset_whatever_the_lanes_timezone():
+    sent = {}
+
+    def opener(url, body, timeout):
+        sent.update(body)
+        return {"cursor": 1, "read": a_read()}
+
+    client_returning(opener).identify([a_frame()])
+    stamp = sent["captures"][0]["captured_at"]
+    assert stamp.endswith("+00:00"), f"a naive timestamp crossed the boundary: {stamp}"
