@@ -128,6 +128,23 @@ class LaneController:
                     SESSION_CLOSE, lane, plate=identity.plate, at=at, session_id=session_id
                 )
 
+        elif decision.outcome is Outcome.NO_VEHICLE:
+            # D3. Nothing was there, so nothing happens: no ticket, no session,
+            # no vend. But it is RECORDED, and that is the point of the event --
+            # a lane being worked by someone tripping the loop with a piece of
+            # metal shows up as a pattern in the log instead of as silence.
+            #
+            # No plate and no image in the detail. `events` is append-only by
+            # grant, so the retention purge cannot reach what is written here.
+            log.info("lane %s refusing to transact: %s", lane, decision.reason)
+            self.events.record(
+                "arming_rejected",
+                lane,
+                reason=decision.reason,
+                presence=False,
+                camera=self.camera.camera_id,
+            )
+
         elif decision.outcome is Outcome.FALLBACK:
             # Not a guess and not a silent drop. The fallback is a named path
             # with an event behind it, so an operator can see it happened and
