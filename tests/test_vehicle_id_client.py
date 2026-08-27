@@ -180,3 +180,39 @@ def test_the_capture_time_is_utc_with_an_offset_whatever_the_lanes_timezone():
     client_returning(opener).identify([a_frame()])
     stamp = sent["captures"][0]["captured_at"]
     assert stamp.endswith("+00:00"), f"a naive timestamp crossed the boundary: {stamp}"
+
+
+def test_the_lanes_rule_lookup_is_a_second_gate_the_engine_does_not_share():
+    """Measured, and worth pinning: the engine has no rejection stage.
+
+    A noisy camera feed makes it answer confidently on a small fraction of
+    reads with a plate that is essentially random. The lane does not rely on
+    the engine being right about that -- a plate that matches no rule is a
+    fallback whatever confidence came with it, so two independent things have
+    to fail before a barrier opens.
+    """
+    from lane_controller import Rule
+
+    cache = DecisionCache()
+    cache.load([Rule(plate="PERMIT001", allow=True)], default_action="deny")
+
+    confident_nonsense = a_read(identity=Identity(plate="X7QK2ZB"), confidence=0.9991)
+    c = client_returning({"cursor": 1, "read": confident_nonsense})
+
+    decision = decide(c.identify([a_frame()]), cache, confidence_threshold=0.99)
+    assert not decision.should_vend
+    # DENY on a deny-default garage, FALLBACK on one that prices unknown
+    # vehicles; either way the barrier stays down and the reason is recorded.
+    assert decision.outcome in (Outcome.DENY, Outcome.FALLBACK)
+
+
+def test_the_second_gate_still_lets_a_known_vehicle_through():
+    """The control. A gate that refuses everything is not a gate."""
+    from lane_controller import Rule
+
+    cache = DecisionCache()
+    cache.load([Rule(plate="PERMIT001", allow=True)], default_action="deny")
+    c = client_returning({"cursor": 1, "read": a_read(identity=Identity(plate="PERMIT001"))})
+
+    decision = decide(c.identify([a_frame()]), cache, confidence_threshold=0.99)
+    assert decision.should_vend

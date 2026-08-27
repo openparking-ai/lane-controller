@@ -32,6 +32,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
+import uuid
 from base64 import b64encode
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -43,7 +44,19 @@ from .interfaces import Frame, VehicleIdentity
 log = logging.getLogger(__name__)
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:8088"
-DEFAULT_TIMEOUT = 2.0
+
+#: Comfortably above the engine's measured per-plate time even on a loaded
+#: Jetson. A timeout that fires while the engine is still working is not a free
+#: fallback: the engine finishes, pushes a complete `answer` record for a car
+#: this lane has already ticketed, and the consumer sees an entry nobody acted
+#: on. Re-sending carries the same `Idempotency-Key`, so a retry cannot become
+#: a second vehicle.
+DEFAULT_TIMEOUT = 5.0
+
+#: A response larger than this is not a read. Reading an unbounded body took
+#: peak memory from 31 MB to 1.5 GB in half a second, which on a Jetson is an
+#: OOM kill -- a barrier that dies rather than a barrier that falls back.
+MAX_RESPONSE_BYTES = 1 << 20
 
 #: What the lane hands `decide()` when it has no usable identification. Named
 #: once so that every failure path below returns the same thing, rather than
@@ -68,7 +81,9 @@ class VehicleIdClient:
         if not frames:
             return NO_IDENTITY
 
+        request_id = uuid.uuid4().hex
         payload = {
+            "request_id": request_id,
             "camera_id": frames[0].camera_id,
             "captures": [
                 {
@@ -101,6 +116,23 @@ class VehicleIdClient:
             # guess a decision the engine already made against measured data.
             return NO_IDENTITY
 
+        # The lane's own event log carries a plate and a confidence and nothing
+        # else, so without this line a wrong open has no read_id to trace, no
+        # weights to blame and no operating point to check. It costs one log
+        # record per vehicle and it is the only provenance that survives the
+        # translation below.
+        log.info(
+            "vehicle-id read %s answered at %.4f (threshold %.4f, engine %s %s, "
+            "weights %s, %d capture(s))",
+            read.read_id,
+            read.confidence,
+            read.threshold_applied,
+            read.engine.name,
+            read.engine.version,
+            read.engine.weights_id,
+            read.captures_seen,
+        )
+
         identity = read.identity
         return VehicleIdentity(
             plate=identity.plate,
@@ -128,7 +160,7 @@ class VehicleIdClient:
 
     def _open_health(self, url: str) -> dict:
         with urllib.request.urlopen(url, timeout=self.timeout) as response:
-            return json.loads(response.read())
+            return json.loads(response.read(MAX_RESPONSE_BYTES + 1))
 
 
 def _utc(captured_at: float) -> str:
@@ -140,8 +172,18 @@ def _post_json(url: str, payload: dict, timeout: float) -> dict:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            # The same key on every re-send of one identification, so a request
+            # this lane gave up on cannot come back as a second vehicle.
+            "Idempotency-Key": payload["request_id"],
+        },
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read())
+        body = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(body) > MAX_RESPONSE_BYTES:
+            raise ValueError(
+                f"vehicle-id returned more than {MAX_RESPONSE_BYTES} bytes; refusing to read it"
+            )
+        return json.loads(body)
