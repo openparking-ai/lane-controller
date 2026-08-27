@@ -9,17 +9,17 @@ description = "Open Parking AI lane controller — arm, identify, decide, vend"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "AGPL-3.0-or-later"
-dependencies = []
+# Vehicle ID is a separate system, and this lane is an ordinary client of its
+# contract -- the same interface a third party uses. Only `vehicle_id.contract`
+# is imported (tests/test_vehicle_id_boundary.py enforces it), and that module
+# is standard-library only, so this stays a dependency-free package to install:
+# no torch, no OpenCV. The engine runs in its own process, reached over HTTP.
+dependencies = [
+  "openparking-vehicle-id @ git+https://github.com/openparking-ai/vehicle-id@main",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.8"]
-# Vision is deliberately NOT part of dev. The core lane package stays
-# dependency-free so the simulated lane and its tests run on any machine with
-# no torch and no OpenCV; only the Vehicle ID engine needs these.
-#   torch      BSD-3-Clause
-#   opencv     Apache-2.0
-#   rapidocr   Apache-2.0, and its PP-OCRv3 weights ship under it
-vision = ["torch>=2.4", "opencv-python-headless>=4.9", "numpy>=1.26", "rapidocr-onnxruntime>=1.2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -10,6 +10,7 @@ from .events import EventQueue, LaneEvent
 from .interfaces import CameraFeed, Frame, LoopInput, VehicleIdentifier, VehicleIdentity, VendOutput
 from .platform_client import PlatformClient, PlatformRejected, PlatformUnreachable
 from .sync import PlatformTransport, sync_rules
+from .vehicle_id_client import VehicleIdClient
 
 __all__ = [
     "CameraConfig",
@@ -30,6 +31,7 @@ __all__ = [
     "PlatformTransport",
     "PlatformUnreachable",
     "Rule",
+    "VehicleIdClient",
     "VehicleIdentifier",
     "VehicleIdentity",
     "VendOutput",
