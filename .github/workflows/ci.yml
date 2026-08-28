@@ -60,3 +60,12 @@ jobs:
         # Breaks the outbox on purpose and requires the offline suite to fail.
         # An offline guarantee nobody has seen fail is not known to be one.
         run: python scripts/offline_fail_control.py
+
+      - name: Confirmation fail-control
+        # Breaks the entry confirmation on purpose -- the window, the crossing
+        # direction, the promotion of an unconfirmed entry, and the
+        # both-arming-loops check -- and requires the loop suite to fail each
+        # time. This is also what proves the suite RUNS: a suite that had
+        # quietly stopped being collected would pass intact and then fail to
+        # fail under every break, and this reports that.
+        run: python scripts/confirmation_fail_control.py

@@ -3,11 +3,20 @@
 Built by 72 Knots Method by 72Knots.ai
 """
 
-from .config import CameraConfig, GateConfig, LaneConfig
+from .config import CameraConfig, GateConfig, LaneConfig, LoopConfig
 from .controller import LaneController
 from .decision import Decision, DecisionCache, Fallback, Outcome, Rule, decide
 from .events import EventQueue, LaneEvent
-from .interfaces import CameraFeed, Frame, LoopInput, VehicleIdentifier, VehicleIdentity, VendOutput
+from .interfaces import (
+    CameraFeed,
+    ClosingLoops,
+    ClosingSequence,
+    Frame,
+    LoopInput,
+    VehicleIdentifier,
+    VehicleIdentity,
+    VendOutput,
+)
 from .platform_client import PlatformClient, PlatformRejected, PlatformUnreachable
 from .sync import PlatformTransport, sync_rules
 from .vehicle_id_client import VehicleIdClient
@@ -15,6 +24,8 @@ from .vehicle_id_client import VehicleIdClient
 __all__ = [
     "CameraConfig",
     "CameraFeed",
+    "ClosingLoops",
+    "ClosingSequence",
     "Decision",
     "DecisionCache",
     "EventQueue",
@@ -24,6 +35,7 @@ __all__ = [
     "LaneConfig",
     "LaneController",
     "LaneEvent",
+    "LoopConfig",
     "LoopInput",
     "Outcome",
     "PlatformClient",

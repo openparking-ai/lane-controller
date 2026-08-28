@@ -31,5 +31,52 @@ frames_per_read  = 3
 
 [gate]
 # Momentary pulse on the vend relay. There is no close setting: the barrier
-# closes on its own closing loop, which is wired to the barrier and not to us.
+# closes on its own safety closing loop, which is wired to the barrier and not
+# to us. That loop is not the confirmation pair in [loops] below.
 vend_pulse_ms = 500
+
+[loops]
+# THE LANE'S LOOP GEOMETRY, AND THIS IS THE STANDARD INSTALLATION: two arming
+# loops before the barrier, two confirmation loops after it, 1.5 m apart, a 10
+# second window.
+#
+# EVERY VALUE HERE IS A PER-SITE SETTING AND AN ASSUMPTION -- nothing in this
+# package measures a spacing or a crossing time, and none of these is a
+# constant. They are published with the events they govern, under
+# `geometry_assumed`, so nobody reading the record can mistake them for
+# something that was measured here.
+#
+# ALL FIVE KEYS ARE REQUIRED. There is no default for any of them: a file with
+# no [loops] table, or with one of these spelt wrong, is refused at startup and
+# told which key is missing. A defaulted geometry is indistinguishable from a
+# mistyped one -- both write `unconfirmable` on every session -- and only one of
+# them is a decision.
+
+# Arming loops BEFORE the barrier: 1 or 2. With 2, the lane arms only when both
+# read occupied together, so an object has to SPAN the gap between them -- a
+# person standing on one loop with a piece of metal cannot, and two masses at
+# the right spacing is a deliberate, slow, visible setup rather than a casual
+# fraud. With 1, the lane runs exactly as it always has and does NOT get that
+# protection; it records `arming_loops: 1` on every vehicle so the weakness is
+# in the record rather than only in a document.
+arming_loops     = 2
+arming_spacing_m = 1.5
+
+# Confirmation loops AFTER the barrier: 0 or 2, never 1. Crossed A then B
+# within the window, they CONFIRM that a vehicle-length object travelled
+# forward through the gate, and the pending entry the vend created is promoted
+# to a session. B then A is a vehicle backing out. ONE loop reads an occupancy
+# and cannot tell those apart, so one is refused at startup rather than accepted
+# as half a confirmation.
+#
+# With 0, this lane cannot confirm anything: it opens its sessions as it always
+# did and marks every one of them `unconfirmable`, with an
+# `entry_unconfirmable` event beside it. That is a weaker lane, it says so on
+# every vehicle, and a site that wants it writes the 0 here itself.
+closing_loops     = 2
+closing_spacing_m = 1.5
+
+# How long after the vend the crossing may take before the entry is HELD.
+# Held is its own answer: never voided silently (that is the abandoned-ticket
+# fraud) and never turned into a session (that is a phantom occupant).
+confirmation_window_seconds = 10.0

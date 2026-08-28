@@ -10,6 +10,8 @@ never been seen to fail is not known to be measuring anything.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from fake_platform import FakePlatform
@@ -182,6 +184,98 @@ def test_a_rule_sync_failure_keeps_the_rules_it_already_had():
     assert sync_rules(platform, cache) is None
     assert cache.default_action == "allow", "a failed sync must not blank the cache"
     assert not cache.is_stale(), "a failed sync must not mark good rules stale"
+
+
+class PlatformBehindThisLane(FakePlatform):
+    """The platform as it is BEFORE it records what confirmed a session.
+
+    It accepts the call, answers with a session, and drops the field -- which is
+    what an older platform genuinely does, because the column is not there and
+    the route echoes the row it wrote. Nothing about that response is an error,
+    and that is the whole problem: deploy this lane ahead of its platform and
+    every confirmed session and every unconfirmable one become the same row.
+
+    BOTH ENDS, because migration 0005 adds both columns and a platform without
+    it drops both. An exit is where the money is written, so a close nothing
+    recorded is the same silence over a larger number.
+    """
+
+    def open_session(self, **kwargs) -> dict:
+        result = super().open_session(**kwargs)
+        session = {k: v for k, v in result["session"].items() if k != "entry_confirmation"}
+        return {**result, "session": session}
+
+    def close_session(self, **kwargs) -> dict:
+        result = super().close_session(**kwargs)
+        session = {k: v for k, v in (result["session"] or {}).items() if k != "exit_confirmation"}
+        return {**result, "session": session}
+
+
+def test_a_platform_that_does_not_record_the_confirmation_is_refused_loudly(caplog):
+    caplog.set_level(logging.ERROR)
+    platform = PlatformBehindThisLane()
+    controller, vend, transport = build(platform)
+
+    controller.run_once()
+
+    assert vend.vend_count == 1, "the barrier still opened; the car is not the one being refused"
+    assert transport.rejected == 1, "an open the platform did not record was counted as delivered"
+    assert controller.events.pending == 0, "poison must not block everything behind it"
+    assert any(
+        "entry_confirmation" in record.getMessage() for record in caplog.records
+    ), "the drop must name what the platform did not record"
+
+
+def test_a_platform_that_does_record_it_delivers_the_open():
+    """The control. Without it, the test above is satisfied by a lane whose
+    opens are refused by every platform there is."""
+    platform = FakePlatform()
+    controller, _, transport = build(platform)
+
+    controller.run_once()
+
+    assert transport.rejected == 0
+    assert platform.unique_opens == 1
+    assert platform.opened[0]["entry_confirmation"] == "unconfirmable"
+
+
+def test_a_platform_that_does_not_record_the_exit_confirmation_is_refused_loudly(caplog):
+    """C4, at the other end of the stay. The exit is where the money is written,
+    and against a platform that predates the column the close is accepted, the
+    stay is billed, and nothing records what saw the car leave."""
+    caplog.set_level(logging.ERROR)
+    platform = PlatformBehindThisLane()
+    entry, _, _ = build(platform, direction="entry")
+    entry.run_once()  # the session exists on the platform; its open was dropped loudly
+
+    exit_lane, vend, transport = build(platform, direction="exit")
+    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    exit_lane.run_once()
+
+    assert vend.vend_count == 1, "the barrier still opened; the car is not the one being refused"
+    assert transport.rejected == 1, "a close the platform did not record was counted as delivered"
+    assert transport.last_close is None, "a response that does not say must not become the record"
+    assert exit_lane.events.pending == 0, "poison must not block everything behind it"
+    assert any(
+        "exit_confirmation" in record.getMessage() for record in caplog.records
+    ), "the drop must name what the platform did not record"
+
+
+def test_a_platform_that_does_record_it_delivers_the_close():
+    """The control. Without it, the test above is satisfied by a lane whose
+    closes are refused by every platform there is."""
+    platform = FakePlatform()
+    entry, _, _ = build(platform, direction="entry")
+    entry.run_once()
+
+    exit_lane, _, transport = build(platform, direction="exit")
+    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    exit_lane.run_once()
+
+    assert transport.rejected == 0
+    assert len(platform.closed) == 1
+    assert platform.closed[0]["exit_confirmation"] == "unconfirmable"
+    assert transport.last_close["session"]["exit_confirmation"] == "unconfirmable"
 
 
 def test_a_refused_item_is_dropped_and_counted_not_retried_forever():

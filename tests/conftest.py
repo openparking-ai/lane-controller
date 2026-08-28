@@ -132,3 +132,67 @@ def _break_the_queue(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_OFFLINE_QUEUE mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the confirmation fail-control.
+#
+# scripts/confirmation_fail_control.py sets BREAK_CONFIRMATION and requires the
+# loop suite to FAIL. Each mode breaks exactly one decision point -- not a
+# fixture, not a stub, the code that decides -- so a control that passes is
+# telling us the suite measures that decision and not something beside it.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_confirmation(monkeypatch):
+    mode = os.environ.get("BREAK_CONFIRMATION")
+    if not mode:
+        return
+
+    from lane_controller.controller import LaneController
+    from lane_controller.interfaces import ClosingSequence
+
+    if mode == "window":
+        # The configured window is ignored, so a crossing at any speed
+        # confirms. "Something happened here eventually" is not a vehicle
+        # going through the gate.
+        monkeypatch.setattr(LaneController, "_confirmation_window", lambda self: float("inf"))
+
+    elif mode == "elapsed":
+        # The window is still configured, still published on the event, and no
+        # longer COMPARED against: whatever the loops report FORWARD for is
+        # accepted however long it took. This is the break the `window` mode
+        # cannot make -- that one changes the configured value, which the
+        # fixture then honours, so it proves the config reaches the loops and
+        # nothing about whether the controller applies it.
+        monkeypatch.setattr(
+            LaneController, "_within_window", staticmethod(lambda elapsed, window: True)
+        )
+
+    elif mode == "direction":
+        # B-then-A confirms too, so a vehicle backing out of the gate opens a
+        # session. One loop could not tell those apart; this is what having two
+        # and not reading the order looks like.
+        monkeypatch.setattr(
+            LaneController,
+            "_confirms",
+            staticmethod(lambda crossing: crossing is not ClosingSequence.NONE),
+        )
+
+    elif mode == "promote":
+        # The window elapsing with nothing at all confirms. This is the phantom
+        # occupant: a ticket no car followed, promoted to a billable session.
+        monkeypatch.setattr(
+            LaneController,
+            "_confirms",
+            staticmethod(lambda crossing: crossing is not ClosingSequence.REVERSE),
+        )
+
+    elif mode == "arming":
+        # One arming loop is enough. A person with a piece of metal on a single
+        # loop arms the lane again.
+        monkeypatch.setattr(LaneController, "_arming_complete", staticmethod(lambda loop_b: True))
+
+    else:
+        raise RuntimeError(f"unknown BREAK_CONFIRMATION mode: {mode}")

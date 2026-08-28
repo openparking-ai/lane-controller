@@ -23,10 +23,18 @@ class PlatformUnreachable(Exception):
 
 
 class PlatformRejected(Exception):
-    """A 4xx. The platform understood and refused; retrying will not help."""
+    """The platform understood us and did not do what we asked. Not retryable.
 
-    def __init__(self, status: int, body: str) -> None:
-        super().__init__(f"platform rejected the request: HTTP {status}: {body}")
+    Two shapes, and the second is why the status is optional. A 4xx is the
+    ordinary one. The other is a SUCCESS whose body does not carry a field the
+    request sent: a platform older than the lane accepts the call and silently
+    drops what it does not know about, and re-sending that forever is no more
+    useful than re-sending a 400.
+    """
+
+    def __init__(self, status: int | None, body: str) -> None:
+        where = f"HTTP {status}: " if status is not None else ""
+        super().__init__(f"platform rejected the request: {where}{body}")
         self.status = status
         self.body = body
 
@@ -73,7 +81,13 @@ class PlatformClient:
         return self._request("POST", "/api/v1/lane/events", {"events": events})
 
     def open_session(
-        self, *, event_id: str, plate: str, entry_at: str, plate_region: str | None = None
+        self,
+        *,
+        event_id: str,
+        plate: str,
+        entry_at: str,
+        entry_confirmation: str,
+        plate_region: str | None = None,
     ) -> dict:
         # event_id is the lane's own, and it is what makes a re-sent flush safe.
         # The platform keys the session on it, so this exact arrival can only
@@ -86,6 +100,10 @@ class PlatformClient:
                 "plate": plate,
                 "entry_at": entry_at,
                 "plate_region": plate_region,
+                # Not optional and not defaulted, here or at the platform. A
+                # default would be a second copy of a claim about what
+                # confirmed an entry, and the copy is the one that lies.
+                "entry_confirmation": entry_confirmation,
             },
         )
 
@@ -104,9 +122,20 @@ class PlatformClient:
             return None
 
     def close_session(
-        self, *, event_id: str, plate: str, exit_at: str, session_id: str | None = None
+        self,
+        *,
+        event_id: str,
+        plate: str,
+        exit_at: str,
+        exit_confirmation: str,
+        session_id: str | None = None,
     ) -> dict:
-        body = {"event_id": event_id, "plate": plate, "exit_at": exit_at}
+        body = {
+            "event_id": event_id,
+            "plate": plate,
+            "exit_at": exit_at,
+            "exit_confirmation": exit_confirmation,
+        }
         if session_id:
             body["session_id"] = session_id
         return self._request("POST", "/api/v1/lane/sessions/close", body)
