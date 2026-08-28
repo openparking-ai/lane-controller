@@ -61,6 +61,13 @@ jobs:
         # An offline guarantee nobody has seen fail is not known to be one.
         run: python scripts/offline_fail_control.py
 
+      - name: Barrier-guard fail-control
+        # Plants a way to close a barrier -- on the relay protocol, on an
+        # implementation, in the controller's source and on the controller --
+        # and requires the guard to fail on each. The safety case says this
+        # package cannot lower a boom; until this ran, nothing tested it.
+        run: python scripts/barrier_guard_fail_control.py
+
       - name: Confirmation fail-control
         # Breaks the entry confirmation on purpose -- the window, the crossing
         # direction, the promotion of an unconfirmed entry, and the
