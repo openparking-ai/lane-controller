@@ -1,8 +1,7 @@
-"""Event reporting: every lane event reaches the server, eventually.
+"""Event reporting.
 
-Eventually is the operative word. The lane never waits on the network to make a
-decision, so reporting is a queue that drains when it can and holds when it
-cannot.
+The lane never waits on the network to make a decision, so reporting is a queue
+that drains when it can and holds when it cannot.
 """
 
 from __future__ import annotations
