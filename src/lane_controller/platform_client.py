@@ -73,7 +73,13 @@ class PlatformClient:
         return self._request("POST", "/api/v1/lane/events", {"events": events})
 
     def open_session(
-        self, *, event_id: str, plate: str, entry_at: str, plate_region: str | None = None
+        self,
+        *,
+        event_id: str,
+        plate: str,
+        entry_at: str,
+        entry_confirmation: str,
+        plate_region: str | None = None,
     ) -> dict:
         # event_id is the lane's own, and it is what makes a re-sent flush safe.
         # The platform keys the session on it, so this exact arrival can only
@@ -86,6 +92,10 @@ class PlatformClient:
                 "plate": plate,
                 "entry_at": entry_at,
                 "plate_region": plate_region,
+                # Not optional and not defaulted, here or at the platform. A
+                # default would be a second copy of a claim about what
+                # confirmed an entry, and the copy is the one that lies.
+                "entry_confirmation": entry_confirmation,
             },
         )
 
@@ -104,9 +114,20 @@ class PlatformClient:
             return None
 
     def close_session(
-        self, *, event_id: str, plate: str, exit_at: str, session_id: str | None = None
+        self,
+        *,
+        event_id: str,
+        plate: str,
+        exit_at: str,
+        exit_confirmation: str,
+        session_id: str | None = None,
     ) -> dict:
-        body = {"event_id": event_id, "plate": plate, "exit_at": exit_at}
+        body = {
+            "event_id": event_id,
+            "plate": plate,
+            "exit_at": exit_at,
+            "exit_confirmation": exit_confirmation,
+        }
         if session_id:
             body["session_id"] = session_id
         return self._request("POST", "/api/v1/lane/sessions/close", body)

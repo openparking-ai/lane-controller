@@ -8,6 +8,12 @@ lane produced no duplicates rather than assuming it.
 from __future__ import annotations
 
 from lane_controller.platform_client import PlatformRejected, PlatformUnreachable
+from lane_controller.sync import CONFIRMED, UNCONFIRMABLE
+
+#: What the platform accepts as an answer to "what confirmed this?". Taken from
+#: the names the lane publishes rather than written out here, so the fake and
+#: the lane cannot come to disagree about the vocabulary.
+ACCEPTED_CONFIRMATIONS = frozenset({CONFIRMED, UNCONFIRMABLE})
 
 
 class FakePlatform:
@@ -49,9 +55,30 @@ class FakePlatform:
                 accepted += 1
         return {"accepted": accepted, "duplicates": len(events) - accepted}
 
-    def open_session(self, *, event_id: str, plate: str, entry_at: str, plate_region=None) -> dict:
+    def open_session(
+        self,
+        *,
+        event_id: str,
+        plate: str,
+        entry_at: str,
+        entry_confirmation: str,
+        plate_region=None,
+    ) -> dict:
         self._check()
-        self.opened.append({"event_id": event_id, "plate": plate, "entry_at": entry_at})
+        # Refused here exactly as the real platform refuses it. A fake that
+        # accepted an open with no confirmation would let the lane's side of
+        # this pass while the contract it is written against says no.
+        if entry_confirmation not in ACCEPTED_CONFIRMATIONS:
+            raise PlatformRejected(400, f"entry_confirmation {entry_confirmation!r} is not one of "
+                                        f"{sorted(ACCEPTED_CONFIRMATIONS)}")
+        self.opened.append(
+            {
+                "event_id": event_id,
+                "plate": plate,
+                "entry_at": entry_at,
+                "entry_confirmation": entry_confirmation,
+            }
+        )
         # Keyed on the event, exactly as the platform is. An entry replayed
         # after the car has left must resolve to the session it originally
         # opened -- not open a second one.
@@ -71,11 +98,26 @@ class FakePlatform:
         return {"session": {**session, "id": id(session)}} if session else None
 
     def close_session(
-        self, *, event_id: str, plate: str, exit_at: str, session_id: str | None = None
+        self,
+        *,
+        event_id: str,
+        plate: str,
+        exit_at: str,
+        exit_confirmation: str,
+        session_id: str | None = None,
     ) -> dict:
         self._check()
+        if exit_confirmation not in ACCEPTED_CONFIRMATIONS:
+            raise PlatformRejected(400, f"exit_confirmation {exit_confirmation!r} is not one of "
+                                       f"{sorted(ACCEPTED_CONFIRMATIONS)}")
         self.closed.append(
-            {"event_id": event_id, "plate": plate, "exit_at": exit_at, "session_id": session_id}
+            {
+                "event_id": event_id,
+                "plate": plate,
+                "exit_at": exit_at,
+                "session_id": session_id,
+                "exit_confirmation": exit_confirmation,
+            }
         )
         if event_id in self.sessions_by_close_event:
             return {"session": self.sessions_by_close_event[event_id], "replay": True}

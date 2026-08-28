@@ -43,11 +43,34 @@ def test_the_controller_cannot_close_the_barrier(lane):
 
 
 def test_every_stage_is_reported_as_an_event(lane):
+    """CHANGED, deliberately: the vend is no longer what opens the session.
+
+    This test asserted `["frames_captured", "vehicle_identified", "decision",
+    "vended", "session_open"]` -- the vend-opens-a-session behaviour, by name.
+    That behaviour was the finding two outside reviews returned: a ticket is not
+    an entry, so a driver who took one and drove away became a phantom occupant,
+    and a vend with no car behind it became a billable session.
+
+    The sequence now records the ARMING, then a PENDING entry, and only then a
+    session. This lane is the default one -- one arming loop, no closing loops
+    -- so nothing here can confirm the entry and the record says exactly that
+    before the session, on every vehicle. A lane with the loops installed is in
+    tests/test_loops.py.
+    """
     controller, _ = lane([VehicleIdentity(plate="SIM-0001", confidence=0.97)])
     controller.run_once()
 
     kinds = [e.kind for e in list(controller.events._queue)]
-    assert kinds == ["frames_captured", "vehicle_identified", "decision", "vended", "session_open"]
+    assert kinds == [
+        "armed",
+        "frames_captured",
+        "vehicle_identified",
+        "decision",
+        "vended",
+        "entry_pending",
+        "entry_unconfirmable",
+        "session_open",
+    ]
 
 
 def test_a_fallback_is_recorded_not_swallowed(lane):
