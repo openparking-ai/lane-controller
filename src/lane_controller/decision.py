@@ -18,6 +18,12 @@ class Outcome(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     FALLBACK = "fallback"
+    #: Nothing was there. NOT a fallback: a fallback means a human deals with a
+    #: vehicle we could not identify, and it ends in a ticket. This ends in
+    #: nothing at all -- no ticket, no session, no vend -- because there is no
+    #: car. Conflating the two is how a person on foot with a piece of metal
+    #: gets issued a ticket they can walk a car out on.
+    NO_VEHICLE = "no_vehicle"
 
 
 class Fallback(StrEnum):
@@ -107,10 +113,22 @@ def decide(
 ) -> Decision:
     """Turn an identification into a decision, or into an honest refusal.
 
-    The ordering here is the safety property. Confidence is checked before the
-    plate is ever used to look anything up, so a low-confidence read cannot
-    match a rule by accident and open a barrier for the wrong vehicle.
+    The ordering here is the safety property. Presence is checked before
+    confidence, and confidence before the plate is ever used to look anything
+    up -- so nothing that was not there can be identified, and a low-confidence
+    read cannot match a rule by accident and open a barrier for the wrong
+    vehicle.
     """
+    if identity.presence is False:
+        # Note `is False`, not `not identity.presence`. The latter reads
+        # "nobody measured it" as "nothing is there", which would make every
+        # lane without a reference view refuse every customer.
+        return Decision(
+            outcome=Outcome.NO_VEHICLE,
+            reason="no vehicle present; refusing to transact",
+            identity=identity,
+        )
+
     if identity.confidence < confidence_threshold:
         return Decision(
             outcome=Outcome.FALLBACK,

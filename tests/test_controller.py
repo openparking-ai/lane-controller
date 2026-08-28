@@ -128,3 +128,41 @@ def test_an_empty_but_synced_cache_is_not_thrown_away(config):
     )
     assert controller.cache is empty_but_fresh
     assert controller.run_once().outcome is Outcome.ALLOW
+
+
+def test_no_vehicle_present_records_a_rejection_and_transacts_nothing(lane):
+    """D3, at the controller. The lane must issue no ticket, open no session and
+    not vend -- and the refusal must be RECORDED, so a lane being worked by
+    someone tripping the loop shows up as a pattern instead of as silence.
+    """
+    controller, vend = lane([VehicleIdentity(plate=None, confidence=0.0, presence=False)])
+
+    decision = controller.run_once()
+
+    assert decision.outcome is Outcome.NO_VEHICLE
+    assert vend.vend_count == 0, "the barrier was told to open with no car there"
+
+    kinds = [event.kind for event in list(controller.events._queue)]
+    assert "arming_rejected" in kinds
+    assert "session_open" not in kinds, "a session was opened with no vehicle present"
+    assert "vended" not in kinds
+
+    rejection = next(e for e in list(controller.events._queue) if e.kind == "arming_rejected")
+    # `events` is append-only by grant, so the retention purge cannot reach what
+    # is written here. Nothing identifying goes in.
+    assert "plate" not in rejection.detail
+    assert rejection.detail["reason"]
+
+
+def test_an_unreadable_plate_still_opens_the_fallback_path(lane):
+    """D4, at the controller. A car with a filthy plate is a legitimate entry:
+    a different event, a different outcome, and a human involved."""
+    controller, vend = lane([VehicleIdentity(plate=None, confidence=0.0, presence=True)])
+
+    decision = controller.run_once()
+
+    assert decision.outcome is Outcome.FALLBACK
+    kinds = [event.kind for event in list(controller.events._queue)]
+    assert "fallback_needs_human" in kinds
+    assert "arming_rejected" not in kinds
+    assert vend.vend_count == 0

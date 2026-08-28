@@ -83,6 +83,12 @@ class VehicleIdentity:
 
     `confidence` is the whole point of this type. A caller that reads `plate`
     without reading `confidence` has turned a maybe into a fact.
+
+    `presence` is the second point, and it is deliberately not folded into
+    `confidence`. "Nothing was there" and "something was there and I could not
+    read it" are different events with opposite correct responses: the first
+    must produce no transaction at all, the second must produce a ticket and a
+    human.
     """
 
     plate: str | None
@@ -92,6 +98,12 @@ class VehicleIdentity:
     color: str | None = None
     marks: tuple[str, ...] = field(default_factory=tuple)
     confidence: float = 0.0
+    #: Whether a VEHICLE was there at all, which is a different question from
+    #: whether it could be identified. `None` means nobody measured it, and a
+    #: lane that has not configured a reference view of its empty tarmac must
+    #: behave exactly as it did before this field existed -- NOT refuse
+    #: everybody.
+    presence: bool | None = None
 
 
 class VehicleIdentifier(Protocol):
