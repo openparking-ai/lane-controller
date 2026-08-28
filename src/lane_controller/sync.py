@@ -18,6 +18,51 @@ log = logging.getLogger(__name__)
 SESSION_OPEN = "session_open"
 SESSION_CLOSE = "session_close"
 
+# ---------------------------------------------------------------------------
+# The transit events: a vend creates a PENDING entry, and the loops after the
+# gate decide what becomes of it. The ticket is not the entry -- a driver can
+# pull up, take one and drive away, and until this existed that abandoned
+# approach became a phantom occupant, counted as inside and never seen again.
+#
+# EVERY OUTCOME HAS ITS OWN NAME AND NONE IS FOLDED INTO ANOTHER. A silent void
+# would re-create the abandoned-ticket fraud; a silent promotion to a session
+# is the phantom occupant. Both are named, both are recorded, and neither is
+# the other.
+#
+# They ride the SAME queue as everything else, so a lane that was offline
+# replays what happened in the order it happened.
+# ---------------------------------------------------------------------------
+ARMED = "armed"
+ARMING_INCOMPLETE = "arming_incomplete"
+
+ENTRY_PENDING = "entry_pending"
+ENTRY_CONFIRMED = "entry_confirmed"
+ENTRY_BACKED_OUT = "entry_backed_out"
+ENTRY_HELD = "entry_held"
+ENTRY_UNCONFIRMABLE = "entry_unconfirmable"
+
+EXIT_PENDING = "exit_pending"
+EXIT_CONFIRMED = "exit_confirmed"
+EXIT_BACKED_IN = "exit_backed_in"
+EXIT_HELD = "exit_held"
+EXIT_UNCONFIRMABLE = "exit_unconfirmable"
+
+#: Why an entry or an exit ended the way it did. One reason per outcome, and
+#: the reason travels to the platform with the session so the money record can
+#: say what confirmed it.
+REASON_FORWARD = "closing_sequence_forward"
+REASON_REVERSE = "closing_sequence_reverse"
+REASON_WINDOW_ELAPSED = "confirmation_window_elapsed"
+REASON_NO_CLOSING_LOOPS = "no_closing_loops_configured"
+REASON_ARMING_INCOMPLETE = "only_one_arming_loop_occupied"
+
+#: What the platform is told confirmed a session. `confirmed` means two loops
+#: after the gate saw a vehicle cross them forward. `unconfirmable` means this
+#: lane has no closing loops and nothing could have confirmed or refuted it --
+#: which is the honest name for it, and is not the same word as `confirmed`.
+CONFIRMED = "confirmed"
+UNCONFIRMABLE = "unconfirmable"
+
 
 def to_iso(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
@@ -74,6 +119,11 @@ class PlatformTransport(EventTransport):
                             plate=e.detail["plate"],
                             entry_at=e.detail.get("at") or to_iso(e.at),
                             plate_region=e.detail.get("plate_region"),
+                            # What confirmed this entry travels WITH it. The
+                            # platform refuses an open that does not say, so a
+                            # session can never exist without the record
+                            # carrying whether two loops saw the car cross.
+                            entry_confirmation=e.detail["entry_confirmation"],
                         )
                     )
                 elif event.kind == SESSION_CLOSE:
@@ -86,6 +136,7 @@ class PlatformTransport(EventTransport):
                             # still unambiguous which session was open. By the
                             # time a queued close is delivered it may not be.
                             session_id=e.detail.get("session_id"),
+                            exit_confirmation=e.detail["exit_confirmation"],
                         )
                     )
                     if result is not None:
