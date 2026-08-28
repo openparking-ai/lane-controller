@@ -8,6 +8,9 @@ passes says the suite measures the decision rather than something next to it.
 
   window     the configured confirmation window is ignored, so a crossing at
              any speed confirms
+  elapsed    the window is still configured and stamped on the event, and the
+             controller stops comparing it against the time the crossing took,
+             so loops that report FORWARD late confirm
   direction  B-then-A confirms as well as A-then-B, so a vehicle backing out
              of the gate opens a session
   promote    the window elapsing with nothing confirms, which is the phantom
@@ -29,6 +32,7 @@ import sys
 SUITE = ["-q", "tests/test_loops.py"]
 BREAKAGES = [
     ("window", "the confirmation window is ignored"),
+    ("elapsed", "the controller never compares the crossing against the window"),
     ("direction", "a vehicle backing out confirms the entry"),
     ("promote", "an unconfirmed entry is promoted to a session"),
     ("arming", "one arming loop is enough"),

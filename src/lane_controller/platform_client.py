@@ -23,10 +23,18 @@ class PlatformUnreachable(Exception):
 
 
 class PlatformRejected(Exception):
-    """A 4xx. The platform understood and refused; retrying will not help."""
+    """The platform understood us and did not do what we asked. Not retryable.
 
-    def __init__(self, status: int, body: str) -> None:
-        super().__init__(f"platform rejected the request: HTTP {status}: {body}")
+    Two shapes, and the second is why the status is optional. A 4xx is the
+    ordinary one. The other is a SUCCESS whose body does not carry a field the
+    request sent: a platform older than the lane accepts the call and silently
+    drops what it does not know about, and re-sending that forever is no more
+    useful than re-sending a 400.
+    """
+
+    def __init__(self, status: int | None, body: str) -> None:
+        where = f"HTTP {status}: " if status is not None else ""
+        super().__init__(f"platform rejected the request: {where}{body}")
         self.status = status
         self.body = body
 

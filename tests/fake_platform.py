@@ -8,12 +8,18 @@ lane produced no duplicates rather than assuming it.
 from __future__ import annotations
 
 from lane_controller.platform_client import PlatformRejected, PlatformUnreachable
-from lane_controller.sync import CONFIRMED, UNCONFIRMABLE
+from lane_controller.sync import CONFIRMED, HELD, UNCONFIRMABLE
 
 #: What the platform accepts as an answer to "what confirmed this?". Taken from
 #: the names the lane publishes rather than written out here, so the fake and
 #: the lane cannot come to disagree about the vocabulary.
+#:
+#: The two sets are DIFFERENT and the difference is the decision, not an
+#: oversight: an exit the loops did not confirm still closes and bills, marked
+#: `held`, because the barrier opened and the car is gone. An entry nothing
+#: confirmed is not a session at all, so `held` on an open is refused.
 ACCEPTED_CONFIRMATIONS = frozenset({CONFIRMED, UNCONFIRMABLE})
+ACCEPTED_EXIT_CONFIRMATIONS = frozenset({CONFIRMED, UNCONFIRMABLE, HELD})
 
 
 class FakePlatform:
@@ -86,7 +92,17 @@ class FakePlatform:
             return {"session": self.sessions_by_open_event[event_id], "created": False}
         if plate in self.open_sessions:
             return {"session": self.open_sessions[plate], "created": False}
-        session = {"plate": plate, "entry_at": entry_at, "fee_minor": None}
+        # Echoed back, exactly as the route does -- it answers with the row it
+        # wrote, and `PlatformClient.open_session` refuses an open that comes
+        # back without the value it sent. A fake that did not echo would make
+        # every lane test look like a lane talking to a platform too old to
+        # record the field.
+        session = {
+            "plate": plate,
+            "entry_at": entry_at,
+            "fee_minor": None,
+            "entry_confirmation": entry_confirmation,
+        }
         self.open_sessions[plate] = session
         self.sessions_by_open_event[event_id] = session
         return {"session": session, "created": True}
@@ -107,9 +123,9 @@ class FakePlatform:
         session_id: str | None = None,
     ) -> dict:
         self._check()
-        if exit_confirmation not in ACCEPTED_CONFIRMATIONS:
+        if exit_confirmation not in ACCEPTED_EXIT_CONFIRMATIONS:
             raise PlatformRejected(400, f"exit_confirmation {exit_confirmation!r} is not one of "
-                                       f"{sorted(ACCEPTED_CONFIRMATIONS)}")
+                                       f"{sorted(ACCEPTED_EXIT_CONFIRMATIONS)}")
         self.closed.append(
             {
                 "event_id": event_id,

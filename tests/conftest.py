@@ -159,6 +159,17 @@ def _break_the_confirmation(monkeypatch):
         # going through the gate.
         monkeypatch.setattr(LaneController, "_confirmation_window", lambda self: float("inf"))
 
+    elif mode == "elapsed":
+        # The window is still configured, still published on the event, and no
+        # longer COMPARED against: whatever the loops report FORWARD for is
+        # accepted however long it took. This is the break the `window` mode
+        # cannot make -- that one changes the configured value, which the
+        # fixture then honours, so it proves the config reaches the loops and
+        # nothing about whether the controller applies it.
+        monkeypatch.setattr(
+            LaneController, "_within_window", staticmethod(lambda elapsed, window: True)
+        )
+
     elif mode == "direction":
         # B-then-A confirms too, so a vehicle backing out of the gate opens a
         # session. One loop could not tell those apart; this is what having two

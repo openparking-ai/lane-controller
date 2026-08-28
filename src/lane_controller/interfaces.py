@@ -97,8 +97,7 @@ class ClosingSequence(StrEnum):
     cannot tell a vehicle going in from one backing out.
     """
 
-    #: A then B. A vehicle went through the gate. This, and only this, is what
-    #: a session is opened on.
+    #: A then B. A vehicle went through the gate.
     FORWARD = "forward"
     #: B then A. Somebody backed out. No session, no occupancy.
     REVERSE = "reverse"
