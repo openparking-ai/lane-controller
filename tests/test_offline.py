@@ -289,6 +289,50 @@ def test_a_refused_item_is_dropped_and_counted_not_retried_forever():
     assert controller.events.pending == 0, "poison must not block everything behind it"
 
 
+def test_a_refused_log_batch_is_dropped_and_counted_rather_than_raised(caplog):
+    """A 4xx on the batched log post behaves like every other refusal.
+
+    It was the one call on this surface that was not guarded. The platform now
+    refuses a kind it does not know, so this became reachable: the exception
+    left `flush()`, left `run_once()` and ended the process -- after the barrier
+    had already opened -- taking a memory-only outbox with it, while the counter
+    that exists so a lost item is never silent stayed at zero.
+    """
+    platform = FakePlatform()
+    platform.reject_event_kinds = {"totally_invented_kind"}
+    controller, vend, transport = build(platform)
+
+    with caplog.at_level(logging.ERROR):
+        controller.run_once()
+        vends_before = vend.vend_count
+        controller.events.record("totally_invented_kind", "lane-entry")
+        delivered = controller.events.flush()
+
+    # The process is alive: nothing propagated out of flush().
+    assert delivered > 0
+    assert transport.rejected == 1
+    assert controller.events.pending == 0, "the poisoned batch must not stay queued forever"
+    assert vend.vend_count == vends_before, "a refused log post must not touch the barrier"
+    dropped = [r.getMessage() for r in caplog.records if "dropping it" in r.getMessage()]
+    assert dropped, "a dropped batch must not be silent"
+    assert "400" in dropped[0], f"the drop must name the status: {dropped[0]}"
+    assert "totally_invented_kind" in dropped[0], f"the drop must name the kind: {dropped[0]}"
+
+
+def test_a_log_batch_the_platform_accepts_is_not_counted_as_rejected():
+    """The control. Without it the test above is satisfied by a lane whose every
+    log post is refused."""
+    platform = FakePlatform()
+    controller, _, transport = build(platform)
+
+    controller.run_once()
+    controller.events.record("totally_invented_kind", "lane-entry")
+    assert controller.events.flush() > 0
+
+    assert transport.rejected == 0
+    assert controller.events.pending == 0
+
+
 def test_low_confidence_offline_still_falls_back_rather_than_guessing(caplog):
     platform = FakePlatform()
     controller, vend, _ = build(

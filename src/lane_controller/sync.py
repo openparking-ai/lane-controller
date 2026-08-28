@@ -170,7 +170,15 @@ class PlatformTransport(EventTransport):
                         }
                     )
             if plain:
-                self._client.post_events(plain)
+                # The one call on this surface that was not guarded, and the
+                # platform now refuses a kind it does not know. Unguarded, that
+                # 4xx left `flush()`, left `run_once()` and killed the process
+                # -- after the barrier had already opened -- taking a
+                # memory-only outbox with it, while `rejected` stayed at zero.
+                # A batched log post is one lost batch, counted and logged with
+                # the status and the kind the platform named, and the queue
+                # keeps draining behind it.
+                self._guarded(lambda: self._client.post_events(plain))
         except PlatformUnreachable as err:
             log.info("platform unreachable, %d item(s) stay queued: %s", len(events), err)
             return False

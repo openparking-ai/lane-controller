@@ -159,11 +159,7 @@ Accuracy numbers, the licensing audit behind the recogniser and the statement
 that real-plate accuracy is NOT MEASURED all live with the engine, where they
 travel with the thing they describe.
 
-**The second gate is CONFIGURATION, not a property of this code.** The engine
-has no rejection stage — it reads text out of sensor noise — so at a lane
-holding a permit list, or a garage whose `default_action` is `deny`, a plate
-that matches no rule is refused here whatever confidence came with it: measured
-against such a lane, confident noise reads opened zero barriers. The platform
+**The second gate is CONFIGURATION, not a property of this code.** The platform
 serves `plate_rules: []` and the garage's `default_action`, whose column default
 is `allow`, so a lane is refusing nothing here until an operator has asked it
 to.
