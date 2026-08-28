@@ -1,20 +1,48 @@
 # Open Parking AI — lane controller
 
-The software that runs one lane: an arming loop reports a vehicle, cameras are
+The software that runs one lane: the arming loops report a vehicle, cameras are
 read, the vehicle is identified, a decision is made from rules already on the
-box, and the vend relay asks the barrier to open.
+box, the vend relay asks the barrier to open, and the loops after the barrier
+say whether a vehicle actually went through.
 
 ```
-arming loop ─▶ grab frames ─▶ identify ─▶ decide ─▶ vend
-                                            │
-                                            └─▶ fallback (named, logged, never a guess)
+arming loops ─▶ grab frames ─▶ identify ─▶ decide ─▶ vend ─▶ closing loops
+                                             │                    │
+                                             │                    ├─▶ A→B  confirmed  → session
+                                             │                    ├─▶ B→A  backed out → nothing
+                                             │                    └─▶ none held       → flagged
+                                             └─▶ fallback (named, logged, never a guess)
 ```
 
-Then nothing. **The barrier closes itself on its own closing loop.** That loop is
-wired to the barrier and never to this controller, and there is no `close()`
-anywhere in this package. A controller that could close a barrier is a
+**The ticket is not the entry.** A driver can pull up, take a ticket and drive
+away; a vend with nothing behind it is not an arrival. So the vend creates a
+PENDING entry, and two loops after the barrier, crossed in order inside the
+confirmation window, promote it to a session. Nothing counts toward occupancy
+or billing until it is promoted. An entry that is never confirmed is HELD and
+flagged — never voided silently, and never turned into a session.
+
+**It narrows the fraud rather than closing it**: a ticket with no car becomes a
+ticket with *a* car, because nothing here binds the crossing to the vehicle that
+took the ticket, and that binding is unbuilt.
+
+**An EXIT is the other way round.** The vend there is the payment moment and the
+barrier opened, so an exit the loops did not confirm still closes the session and
+bills the stay — marked `held`, with an `exit_held` event for a human to look at.
+Holding it open instead would leave the stay unbilled and the vehicle counted as
+inside for ever, which would make installing the loops worse than not.
+
+**The barrier still closes itself on its own closing loop.** That loop is wired
+to the barrier and never to this controller, the confirmation loops above are a
+different pair that this package reads and never drives, and there is no
+`close()` anywhere in this package. A controller that could close a barrier is a
 controller that could close one on a vehicle; the safety case rests on that
 being impossible rather than on us being careful.
+
+**Every loop count, spacing and window is a per-site setting** in `[loops]`, and
+every one of them is an ASSUMPTION until a site measures it — nothing here
+measures a spacing or a crossing time. A site with one arming loop and no
+closing loops runs exactly as it always did; what it does not get is named in
+the record on every vehicle rather than described in a document.
 
 ## Two properties worth stating plainly
 
@@ -87,8 +115,8 @@ Pass `--confidence 0.40` to watch the lane refuse to guess instead.
 
 ## Runs with no hardware
 
-Three interfaces — `LoopInput`, `CameraFeed`, `VendOutput` — plus a
-`VehicleIdentifier`, each with a fully simulated implementation. The complete
+Four interfaces — `LoopInput`, `ClosingLoops`, `CameraFeed`, `VendOutput` — plus
+a `VehicleIdentifier`, each with a fully simulated implementation. The complete
 sequence runs and the tests pass on any machine, with no Vehicle ID service
 running: the simulated identifier stands in for it.
 
@@ -97,7 +125,8 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 pytest
 ruff check .
-python scripts/offline_fail_control.py   # breaks the outbox, requires the tests to fail
+python scripts/offline_fail_control.py       # breaks the outbox, requires the tests to fail
+python scripts/confirmation_fail_control.py  # breaks the confirmation, same requirement
 ```
 
 ## Vehicle ID
@@ -144,7 +173,7 @@ None of it is required to run this package, and none of it has been purchased ye
 |---|---|
 | Controller | Seeed reComputer Industrial J3011 (Jetson Orin NX), in the gate housing |
 | Barrier | Q-SAQ, driven by a dry-contact vend relay |
-| Detection | Inductive arming loop; the barrier's own closing loop |
+| Detection | Inductive arming loops before the barrier, and two confirmation loops after it; plus the barrier's own closing loop, which is wired to the barrier |
 | Cameras — default | Reolink RLC-810A |
 | Cameras — upper tiers | Axis P1465-LE, Hanwha XNO-9082R |
 

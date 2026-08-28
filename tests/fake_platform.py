@@ -8,6 +8,18 @@ lane produced no duplicates rather than assuming it.
 from __future__ import annotations
 
 from lane_controller.platform_client import PlatformRejected, PlatformUnreachable
+from lane_controller.sync import CONFIRMED, HELD, UNCONFIRMABLE
+
+#: What the platform accepts as an answer to "what confirmed this?". Taken from
+#: the names the lane publishes rather than written out here, so the fake and
+#: the lane cannot come to disagree about the vocabulary.
+#:
+#: The two sets are DIFFERENT and the difference is the decision, not an
+#: oversight: an exit the loops did not confirm still closes and bills, marked
+#: `held`, because the barrier opened and the car is gone. An entry nothing
+#: confirmed is not a session at all, so `held` on an open is refused.
+ACCEPTED_CONFIRMATIONS = frozenset({CONFIRMED, UNCONFIRMABLE})
+ACCEPTED_EXIT_CONFIRMATIONS = frozenset({CONFIRMED, UNCONFIRMABLE, HELD})
 
 
 class FakePlatform:
@@ -49,9 +61,30 @@ class FakePlatform:
                 accepted += 1
         return {"accepted": accepted, "duplicates": len(events) - accepted}
 
-    def open_session(self, *, event_id: str, plate: str, entry_at: str, plate_region=None) -> dict:
+    def open_session(
+        self,
+        *,
+        event_id: str,
+        plate: str,
+        entry_at: str,
+        entry_confirmation: str,
+        plate_region=None,
+    ) -> dict:
         self._check()
-        self.opened.append({"event_id": event_id, "plate": plate, "entry_at": entry_at})
+        # Refused here exactly as the real platform refuses it. A fake that
+        # accepted an open with no confirmation would let the lane's side of
+        # this pass while the contract it is written against says no.
+        if entry_confirmation not in ACCEPTED_CONFIRMATIONS:
+            raise PlatformRejected(400, f"entry_confirmation {entry_confirmation!r} is not one of "
+                                        f"{sorted(ACCEPTED_CONFIRMATIONS)}")
+        self.opened.append(
+            {
+                "event_id": event_id,
+                "plate": plate,
+                "entry_at": entry_at,
+                "entry_confirmation": entry_confirmation,
+            }
+        )
         # Keyed on the event, exactly as the platform is. An entry replayed
         # after the car has left must resolve to the session it originally
         # opened -- not open a second one.
@@ -59,7 +92,17 @@ class FakePlatform:
             return {"session": self.sessions_by_open_event[event_id], "created": False}
         if plate in self.open_sessions:
             return {"session": self.open_sessions[plate], "created": False}
-        session = {"plate": plate, "entry_at": entry_at, "fee_minor": None}
+        # Echoed back, exactly as the route does -- it answers with the row it
+        # wrote, and `PlatformClient.open_session` refuses an open that comes
+        # back without the value it sent. A fake that did not echo would make
+        # every lane test look like a lane talking to a platform too old to
+        # record the field.
+        session = {
+            "plate": plate,
+            "entry_at": entry_at,
+            "fee_minor": None,
+            "entry_confirmation": entry_confirmation,
+        }
         self.open_sessions[plate] = session
         self.sessions_by_open_event[event_id] = session
         return {"session": session, "created": True}
@@ -71,11 +114,26 @@ class FakePlatform:
         return {"session": {**session, "id": id(session)}} if session else None
 
     def close_session(
-        self, *, event_id: str, plate: str, exit_at: str, session_id: str | None = None
+        self,
+        *,
+        event_id: str,
+        plate: str,
+        exit_at: str,
+        exit_confirmation: str,
+        session_id: str | None = None,
     ) -> dict:
         self._check()
+        if exit_confirmation not in ACCEPTED_EXIT_CONFIRMATIONS:
+            raise PlatformRejected(400, f"exit_confirmation {exit_confirmation!r} is not one of "
+                                       f"{sorted(ACCEPTED_EXIT_CONFIRMATIONS)}")
         self.closed.append(
-            {"event_id": event_id, "plate": plate, "exit_at": exit_at, "session_id": session_id}
+            {
+                "event_id": event_id,
+                "plate": plate,
+                "exit_at": exit_at,
+                "session_id": session_id,
+                "exit_confirmation": exit_confirmation,
+            }
         )
         if event_id in self.sessions_by_close_event:
             return {"session": self.sessions_by_close_event[event_id], "replay": True}
@@ -84,7 +142,17 @@ class FakePlatform:
             if self.reject_close_without_open:
                 raise PlatformRejected(404, "no open session for this vehicle")
             return {"session": None, "replay": True}
-        session = {**session, "exit_at": exit_at, "fee_minor": 250}
+        # Echoed back, exactly as the close route does -- it answers with the
+        # row it wrote, `exit_confirmation` with it, and
+        # `PlatformTransport._close_session` refuses a close that comes back
+        # without the value it sent. A fake that did not echo would make every
+        # lane test look like a lane talking to a platform too old to record it.
+        session = {
+            **session,
+            "exit_at": exit_at,
+            "fee_minor": 250,
+            "exit_confirmation": exit_confirmation,
+        }
         self.sessions_by_close_event[event_id] = session
         return {"session": session, "closed": True}
 

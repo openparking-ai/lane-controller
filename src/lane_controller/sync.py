@@ -18,6 +18,59 @@ log = logging.getLogger(__name__)
 SESSION_OPEN = "session_open"
 SESSION_CLOSE = "session_close"
 
+# ---------------------------------------------------------------------------
+# The transit events: a vend creates a PENDING entry, and the loops after the
+# gate decide what becomes of it. The ticket is not the entry -- a driver can
+# pull up, take one and drive away, and until this existed that abandoned
+# approach became a phantom occupant, counted as inside and never seen again.
+#
+# EVERY OUTCOME HAS ITS OWN NAME AND NONE IS FOLDED INTO ANOTHER. A silent void
+# would re-create the abandoned-ticket fraud; a silent promotion to a session
+# is the phantom occupant. Both are named, both are recorded, and neither is
+# the other.
+#
+# They ride the SAME queue as everything else, so a lane that was offline
+# replays what happened in the order it happened.
+# ---------------------------------------------------------------------------
+ARMED = "armed"
+ARMING_INCOMPLETE = "arming_incomplete"
+
+ENTRY_PENDING = "entry_pending"
+ENTRY_CONFIRMED = "entry_confirmed"
+ENTRY_BACKED_OUT = "entry_backed_out"
+ENTRY_HELD = "entry_held"
+ENTRY_UNCONFIRMABLE = "entry_unconfirmable"
+
+EXIT_PENDING = "exit_pending"
+EXIT_CONFIRMED = "exit_confirmed"
+EXIT_BACKED_IN = "exit_backed_in"
+EXIT_HELD = "exit_held"
+EXIT_UNCONFIRMABLE = "exit_unconfirmable"
+
+#: Why an entry or an exit ended the way it did. One reason per outcome, and
+#: the reason travels to the platform with the session so the money record can
+#: say what confirmed it.
+REASON_FORWARD = "closing_sequence_forward"
+REASON_REVERSE = "closing_sequence_reverse"
+REASON_WINDOW_ELAPSED = "confirmation_window_elapsed"
+REASON_NO_CLOSING_LOOPS = "no_closing_loops_configured"
+REASON_ARMING_INCOMPLETE = "only_one_arming_loop_occupied"
+
+#: What the platform is told confirmed a session. `confirmed` means two loops
+#: after the gate saw a vehicle cross them forward. `unconfirmable` means this
+#: lane has no closing loops and nothing could have confirmed or refuted it --
+#: which is the honest name for it, and is not the same word as `confirmed`.
+CONFIRMED = "confirmed"
+UNCONFIRMABLE = "unconfirmable"
+
+#: EXITS ONLY, and it is the one place a lane reports a session on something the
+#: loops did not confirm. At an exit the vend IS the payment moment and the
+#: barrier opened: the car is gone whatever the loops saw, so the session closes
+#: and the stay is billed, marked `held` and flagged with an `exit_held` event
+#: for a human. An entry is the opposite -- nothing confirmed it, so there is no
+#: session at all -- and this value is never sent on an open.
+HELD = "held"
+
 
 def to_iso(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
@@ -45,6 +98,40 @@ def sync_rules(client: PlatformClient, cache: DecisionCache) -> dict | None:
     return payload
 
 
+def require_confirmation_echo(
+    result: dict | None, declared: str, *, end: str, action: str
+) -> None:
+    """Refuse a session action the platform accepted without recording what confirmed it.
+
+    ONE function for both ends of a stay, because two copies of this rule would
+    be two claims about the same thing and the copy is the one that goes wrong.
+
+    What confirmed an entry or an exit travels WITH it, and a platform that
+    knows the field refuses an action that does not carry it. THE OTHER
+    DIRECTION IS THE SILENT ONE: a platform older than this lane accepts the
+    call, answers with a session, and drops the field, because the column is not
+    there and the route echoes the row it wrote. No error, nothing queued,
+    nothing in a log -- and a confirmed session and an unconfirmable one become
+    the same row.
+
+    So an action that does not come back carrying the value it was sent is NOT
+    DELIVERED. Its caller goes down `_guarded`, the path a stale close already
+    takes: counted, logged at error, and dropped rather than re-sent forever
+    with the whole outbox stuck behind it. The platform did do the thing -- an
+    old route does -- so the car can still leave; what is lost is this lane's
+    report of what saw it, and the log line is what says so.
+    """
+    field = f"{end}_confirmation"
+    echoed = ((result or {}).get("session") or {}).get(field)
+    if echoed != declared:
+        raise PlatformRejected(
+            None,
+            f"the {action} was accepted but the platform did not echo "
+            f"{field}={declared!r} (it said {echoed!r}). That platform does not "
+            f"record what confirmed an {end}: its migration 0005 goes before this lane build.",
+        )
+
+
 class PlatformTransport(EventTransport):
     """Delivers the outbox to the platform.
 
@@ -68,26 +155,9 @@ class PlatformTransport(EventTransport):
         try:
             for event in events:
                 if event.kind == SESSION_OPEN:
-                    self._guarded(
-                        lambda e=event: self._client.open_session(
-                            event_id=e.event_id,
-                            plate=e.detail["plate"],
-                            entry_at=e.detail.get("at") or to_iso(e.at),
-                            plate_region=e.detail.get("plate_region"),
-                        )
-                    )
+                    self._guarded(lambda e=event: self._open_session(e))
                 elif event.kind == SESSION_CLOSE:
-                    result = self._guarded(
-                        lambda e=event: self._client.close_session(
-                            event_id=e.event_id,
-                            plate=e.detail["plate"],
-                            exit_at=e.detail.get("at") or to_iso(e.at),
-                            # Recorded at the moment of the exit, when it was
-                            # still unambiguous which session was open. By the
-                            # time a queued close is delivered it may not be.
-                            session_id=e.detail.get("session_id"),
-                        )
-                    )
+                    result = self._guarded(lambda e=event: self._close_session(e))
                     if result is not None:
                         self.last_close = result
                 else:
@@ -105,6 +175,49 @@ class PlatformTransport(EventTransport):
             log.info("platform unreachable, %d item(s) stay queued: %s", len(events), err)
             return False
         return True
+
+    def _open_session(self, event: LaneEvent) -> dict:
+        """Open the session, and require the platform to say it recorded WHAT
+        confirmed it. The rule is `require_confirmation_echo` above.
+        """
+        declared = event.detail["entry_confirmation"]
+        result = self._client.open_session(
+            event_id=event.event_id,
+            plate=event.detail["plate"],
+            entry_at=event.detail.get("at") or to_iso(event.at),
+            plate_region=event.detail.get("plate_region"),
+            entry_confirmation=declared,
+        )
+        require_confirmation_echo(result, declared, end="entry", action="open")
+        return result
+
+    def _close_session(self, event: LaneEvent) -> dict:
+        """Close the session, and require the platform to say it recorded WHAT
+        confirmed the exit.
+
+        The same silence, at the other end of the stay, through the same
+        function -- not a second check that can come to disagree with the
+        first. The close route answers with the row it wrote, so
+        `exit_confirmation` comes back from a platform that has the column and
+        is simply absent from one that does not, with no error either way.
+        A close that does not come back carrying the value it was sent is NOT
+        DELIVERED: it goes down `_guarded`, counted and logged at error, and
+        `last_close` is left alone rather than being set from a response that
+        does not say what closed the stay.
+        """
+        declared = event.detail["exit_confirmation"]
+        result = self._client.close_session(
+            event_id=event.event_id,
+            plate=event.detail["plate"],
+            exit_at=event.detail.get("at") or to_iso(event.at),
+            # Recorded at the moment of the exit, when it was still unambiguous
+            # which session was open. By the time a queued close is delivered it
+            # may not be.
+            session_id=event.detail.get("session_id"),
+            exit_confirmation=declared,
+        )
+        require_confirmation_echo(result, declared, end="exit", action="close")
+        return result
 
     def _guarded(self, call):
         """Run one platform call, dropping it if the platform refused it outright.

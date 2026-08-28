@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Protocol
 
 
@@ -32,10 +33,19 @@ class Frame:
 
 
 class LoopInput(Protocol):
-    """The arming loop: an inductive loop that reports a vehicle presenting.
+    """One arming loop: an inductive loop that reports a vehicle presenting.
 
-    This is the *arming* loop only. The barrier's closing loop is wired to the
-    barrier and is deliberately not represented here -- see VendOutput.
+    A lane may have two of these, ~1.5 m apart, and arms only when both read
+    occupied together -- an object then has to SPAN the gap, which a person
+    standing on one loop with a piece of metal cannot. How many a site has is
+    `LoopConfig.arming_loops`; a site with one is not refused and says so in
+    every record it writes.
+
+    This is the *arming* stage only. Two other loops exist and neither is this:
+    the barrier's own safety closing loop, which is wired to the barrier and is
+    deliberately not represented anywhere in this package (see VendOutput); and
+    the pair of CONFIRMATION loops after the gate, which this package reads but
+    does not drive (see ClosingLoops).
     """
 
     def wait_for_vehicle(self, timeout: float | None = None) -> bool:
@@ -74,6 +84,48 @@ class VendOutput(Protocol):
 
     def vend(self, reason: str) -> None:
         """Pulse the relay to open the barrier."""
+        ...
+
+
+class ClosingSequence(StrEnum):
+    """What the two loops after the gate saw, in order.
+
+    The direction is the whole point, and it is why there are two. Every camera
+    measurement PREDICTS -- is there a vehicle there now -- and a prediction can
+    be quietly wrong. Two loops crossed in order CONFIRM that a vehicle-length
+    object travelled forward through the gate. One loop reads an occupancy and
+    cannot tell a vehicle going in from one backing out.
+    """
+
+    #: A then B. A vehicle went through the gate.
+    FORWARD = "forward"
+    #: B then A. Somebody backed out. No session, no occupancy.
+    REVERSE = "reverse"
+    #: The window elapsed with no sequence at all. NOT a confirmation and NOT a
+    #: refutation -- a third state, and it is held rather than folded into
+    #: either of the other two.
+    NONE = "none"
+
+
+class ClosingLoops(Protocol):
+    """The pair of confirmation loops AFTER the barrier, read and never driven.
+
+    Not to be confused with the barrier's own closing loop, which lowers the
+    boom and is wired to the barrier. This package still cannot close a barrier
+    and there is still no close() anywhere in it -- the safety case depends on
+    that remaining impossible. These two loops are an INPUT: they report that
+    something crossed them, in an order, and the controller reads that report.
+    """
+
+    def wait_for_sequence(self, window_seconds: float) -> ClosingSequence:
+        """Block up to `window_seconds` for a crossing, and say which way it went.
+
+        Returns NONE if the window elapses with no complete sequence. An
+        implementation must not report FORWARD for a crossing that took longer
+        than the window -- the window is what makes the confirmation mean "a
+        vehicle went through in a plausible time" rather than "something
+        happened here eventually".
+        """
         ...
 
 

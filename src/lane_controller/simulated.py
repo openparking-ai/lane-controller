@@ -10,7 +10,15 @@ from __future__ import annotations
 import time
 from collections.abc import Iterator, Sequence
 
-from .interfaces import CameraFeed, Frame, LoopInput, VehicleIdentifier, VehicleIdentity
+from .interfaces import (
+    CameraFeed,
+    ClosingLoops,
+    ClosingSequence,
+    Frame,
+    LoopInput,
+    VehicleIdentifier,
+    VehicleIdentity,
+)
 
 
 class SimulatedLoopInput(LoopInput):
@@ -117,3 +125,57 @@ class StubVehicleIdentifier(VehicleIdentifier):
         except StopIteration:
             pass
         return self._last
+
+
+class OccupancyLoopInput(LoopInput):
+    """A loop whose occupancy is set directly, for the SECOND arming loop.
+
+    The second loop is never the one that wakes the lane -- it is the one asked
+    whether it agrees -- so what a test needs from it is a settable occupancy,
+    not a scripted arrival.
+    """
+
+    def __init__(self, occupied: bool = True) -> None:
+        self._occupied = occupied
+
+    def wait_for_vehicle(self, timeout: float | None = None) -> bool:
+        return self._occupied
+
+    def is_occupied(self) -> bool:
+        return self._occupied
+
+    def set_occupied(self, occupied: bool) -> None:
+        self._occupied = occupied
+
+
+class ScriptedClosingLoops(ClosingLoops):
+    """The two loops after the gate, driven by a script of crossings.
+
+    Each entry is a direction AND how long the crossing took. The time is not
+    decoration: the window is a real branch in the lane's behaviour, so a
+    fixture that could not put a crossing on both sides of it would pin the one
+    axis the answer depends on, and would read as coverage while measuring one
+    point.
+
+    A crossing that takes longer than the window is not reported as a crossing.
+    Real loops would still be waiting when the window expired, and the whole
+    meaning of the window is "a vehicle went through in a plausible time".
+    """
+
+    def __init__(self, crossings: Sequence[tuple[ClosingSequence, float]] | None = None) -> None:
+        self._crossings: list[tuple[ClosingSequence, float]] = list(crossings or [])
+        self._index = 0
+        #: What was asked of it, so a test can assert the configured window was
+        #: the one applied rather than a number the fixture chose for itself.
+        self.windows_seen: list[float] = []
+
+    def wait_for_sequence(self, window_seconds: float) -> ClosingSequence:
+        self.windows_seen.append(window_seconds)
+        if self._index >= len(self._crossings):
+            # Nothing scripted means nothing crossed: the window elapses.
+            return ClosingSequence.NONE
+        sequence, took_seconds = self._crossings[self._index]
+        self._index += 1
+        if took_seconds > window_seconds:
+            return ClosingSequence.NONE
+        return sequence
