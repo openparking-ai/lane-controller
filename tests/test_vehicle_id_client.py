@@ -216,3 +216,76 @@ def test_the_second_gate_still_lets_a_known_vehicle_through():
 
     decision = decide(c.identify([a_frame()]), cache, confidence_threshold=0.99)
     assert decision.should_vend
+
+
+# --- D3 and D4: two different things that must never be confused ----------
+
+def a_presence_read(**overrides) -> dict:
+    base = dict(presence=False, identity=Identity(), confidence=0.0, outcome=FALLBACK)
+    base.update(overrides)
+    return a_read(**base)
+
+
+def test_no_vehicle_present_reaches_the_lane_as_its_own_outcome():
+    """D3. Not a fallback. A fallback ends in a ticket and a human; this ends in
+    nothing at all, because there is no car."""
+    cache = DecisionCache()
+    cache.load([], default_action="allow")
+    c = client_returning({"cursor": 1, "read": a_presence_read()})
+
+    decision = decide(c.identify([a_frame()]), cache, confidence_threshold=0.85)
+
+    assert decision.outcome is Outcome.NO_VEHICLE
+    assert not decision.should_vend
+    assert decision.fallback is None
+
+
+def test_a_vehicle_with_an_unreadable_plate_is_a_fallback_not_a_refusal():
+    """D4. The other half of the requirement, and the one a detector keyed on
+    plate presence would get wrong: a car with a filthy plate is a legitimate
+    entry and must be admitted to the fallback path."""
+    cache = DecisionCache()
+    cache.load([], default_action="allow")
+    unreadable = a_read(presence=True, identity=Identity(), confidence=0.31, outcome=FALLBACK)
+    c = client_returning({"cursor": 1, "read": unreadable})
+
+    decision = decide(c.identify([a_frame()]), cache, confidence_threshold=0.85)
+
+    assert decision.outcome is Outcome.FALLBACK
+    assert decision.fallback in (Fallback.LOW_CONFIDENCE, Fallback.NO_PLATE_READ)
+    assert not decision.should_vend
+
+
+def test_the_two_outcomes_are_distinct_and_cannot_be_confused():
+    """D4 states this explicitly, so it is asserted explicitly rather than left
+    to be inferred from the two tests above."""
+    assert Outcome.NO_VEHICLE is not Outcome.FALLBACK
+    assert Outcome.NO_VEHICLE.value != Outcome.FALLBACK.value
+
+
+def test_presence_not_measured_behaves_exactly_as_before():
+    """The control that protects every existing lane. `None` is not `False`, and
+    a lane with no reference view must not start refusing customers."""
+    cache = DecisionCache()
+    cache.load([], default_action="allow")
+    c = client_returning({"cursor": 1, "read": a_read(presence=None)})
+
+    identity = c.identify([a_frame()])
+    assert identity.presence is None
+    decision = decide(identity, cache, confidence_threshold=0.85)
+    assert decision.outcome is Outcome.ALLOW
+
+
+def test_a_falsy_check_on_presence_would_break_every_unconfigured_lane():
+    """The bug this guards against, written down so it cannot come back.
+
+    `if not identity.presence` reads "nobody measured it" as "nothing is there".
+    The decision path must use `is False`.
+    """
+    from lane_controller.interfaces import VehicleIdentity
+
+    unmeasured = VehicleIdentity(plate="ABC123", confidence=0.99, presence=None)
+    assert not unmeasured.presence, "the trap only exists because None is falsy"
+    cache = DecisionCache()
+    cache.load([], default_action="allow")
+    assert decide(unmeasured, cache, confidence_threshold=0.85).outcome is Outcome.ALLOW
