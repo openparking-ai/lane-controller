@@ -142,7 +142,17 @@ class FakePlatform:
             if self.reject_close_without_open:
                 raise PlatformRejected(404, "no open session for this vehicle")
             return {"session": None, "replay": True}
-        session = {**session, "exit_at": exit_at, "fee_minor": 250}
+        # Echoed back, exactly as the close route does -- it answers with the
+        # row it wrote, `exit_confirmation` with it, and
+        # `PlatformTransport._close_session` refuses a close that comes back
+        # without the value it sent. A fake that did not echo would make every
+        # lane test look like a lane talking to a platform too old to record it.
+        session = {
+            **session,
+            "exit_at": exit_at,
+            "fee_minor": 250,
+            "exit_confirmation": exit_confirmation,
+        }
         self.sessions_by_close_event[event_id] = session
         return {"session": session, "closed": True}
 
