@@ -16,10 +16,20 @@ arming loops ─▶ grab frames ─▶ identify ─▶ decide ─▶ vend ─▶
 
 **The ticket is not the entry.** A driver can pull up, take a ticket and drive
 away; a vend with nothing behind it is not an arrival. So the vend creates a
-PENDING entry, and only two loops after the barrier, crossed in order inside the
+PENDING entry, and two loops after the barrier, crossed in order inside the
 confirmation window, promote it to a session. Nothing counts toward occupancy
 or billing until it is promoted. An entry that is never confirmed is HELD and
 flagged — never voided silently, and never turned into a session.
+
+**It narrows the fraud rather than closing it**: a ticket with no car becomes a
+ticket with *a* car, because nothing here binds the crossing to the vehicle that
+took the ticket, and that binding is unbuilt.
+
+**An EXIT is the other way round.** The vend there is the payment moment and the
+barrier opened, so an exit the loops did not confirm still closes the session and
+bills the stay — marked `held`, with an `exit_held` event for a human to look at.
+Holding it open instead would leave the stay unbilled and the vehicle counted as
+inside for ever, which would make installing the loops worse than not.
 
 **The barrier still closes itself on its own closing loop.** That loop is wired
 to the barrier and never to this controller, the confirmation loops above are a

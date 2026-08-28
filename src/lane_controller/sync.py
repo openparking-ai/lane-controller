@@ -63,6 +63,14 @@ REASON_ARMING_INCOMPLETE = "only_one_arming_loop_occupied"
 CONFIRMED = "confirmed"
 UNCONFIRMABLE = "unconfirmable"
 
+#: EXITS ONLY, and it is the one place a lane reports a session on something the
+#: loops did not confirm. At an exit the vend IS the payment moment and the
+#: barrier opened: the car is gone whatever the loops saw, so the session closes
+#: and the stay is billed, marked `held` and flagged with an `exit_held` event
+#: for a human. An entry is the opposite -- nothing confirmed it, so there is no
+#: session at all -- and this value is never sent on an open.
+HELD = "held"
+
 
 def to_iso(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
@@ -113,19 +121,7 @@ class PlatformTransport(EventTransport):
         try:
             for event in events:
                 if event.kind == SESSION_OPEN:
-                    self._guarded(
-                        lambda e=event: self._client.open_session(
-                            event_id=e.event_id,
-                            plate=e.detail["plate"],
-                            entry_at=e.detail.get("at") or to_iso(e.at),
-                            plate_region=e.detail.get("plate_region"),
-                            # What confirmed this entry travels WITH it. The
-                            # platform refuses an open that does not say, so a
-                            # session can never exist without the record
-                            # carrying whether two loops saw the car cross.
-                            entry_confirmation=e.detail["entry_confirmation"],
-                        )
-                    )
+                    self._guarded(lambda e=event: self._open_session(e))
                 elif event.kind == SESSION_CLOSE:
                     result = self._guarded(
                         lambda e=event: self._client.close_session(
@@ -156,6 +152,43 @@ class PlatformTransport(EventTransport):
             log.info("platform unreachable, %d item(s) stay queued: %s", len(events), err)
             return False
         return True
+
+    def _open_session(self, event: LaneEvent) -> dict:
+        """Open the session, and require the platform to say it recorded WHAT
+        confirmed it.
+
+        What confirmed this entry travels WITH it, and the platform refuses an
+        open that does not say. That check only runs on a platform that knows
+        about the field. THE OTHER DIRECTION IS THE SILENT ONE: a platform older
+        than this lane accepts the call, answers 201 with a session, and drops
+        the field, because the column is not there and the route echoes the row
+        it wrote. No error, nothing queued, nothing in a log -- and every
+        confirmed session and every unconfirmable one become the same row.
+
+        So an open that does not come back carrying the value it was sent is NOT
+        DELIVERED. It goes down `_guarded`, the path a stale close already
+        takes: counted, logged at error, and dropped rather than re-sent forever
+        with the whole outbox stuck behind it. The platform did create a session
+        -- an old route does -- so the car can still leave; what is lost is this
+        lane's report of what saw it, and the log line is what says so.
+        """
+        declared = event.detail["entry_confirmation"]
+        result = self._client.open_session(
+            event_id=event.event_id,
+            plate=event.detail["plate"],
+            entry_at=event.detail.get("at") or to_iso(event.at),
+            plate_region=event.detail.get("plate_region"),
+            entry_confirmation=declared,
+        )
+        echoed = (result or {}).get("session", {}).get("entry_confirmation")
+        if echoed != declared:
+            raise PlatformRejected(
+                None,
+                f"the open was accepted but the platform did not echo "
+                f"entry_confirmation={declared!r} (it said {echoed!r}). That platform does not "
+                "record what confirmed an entry: its migration 0005 goes before this lane build.",
+            )
+        return result
 
     def _guarded(self, call):
         """Run one platform call, dropping it if the platform refused it outright.

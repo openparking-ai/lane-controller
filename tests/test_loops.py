@@ -1,16 +1,10 @@
 """The loops: two before the barrier to arm, two after it to confirm.
 
-THE PROPERTY THIS FILE EXISTS FOR, and it is the one two outside reviews asked
-for and did not get: **an unmeasured presence can never cause a transaction.**
-
-It is not enforced by a check that inspects a presence value -- `decide()` is
-untouched and still treats `None` as "nobody measured it" rather than as a
-refusal, because a lane with no reference view must not refuse every customer.
-It holds by CONSTRUCTION: a vend with no car behind it produces a pending entry
-that no closing loop ever confirms, and an unconfirmed entry is never a session.
-The fraudster can produce a plate, a loop occupancy and a confident read. The
-one thing they cannot produce is a vehicle-length object crossing two loops in
-order, and that is now the only thing that opens a session.
+What the code does, and it is the whole of what is claimed here: at a lane with
+two closing loops, a forward crossing inside the confirmation window promotes
+the pending entry the vend created. `decide()` is untouched and still treats
+`presence=None` as "nobody measured it" rather than as a refusal, because a lane
+with no reference view must not refuse every customer.
 
 Every test below is paired with a break in `scripts/confirmation_fail_control.py`
 that must turn it red. A guarantee nobody has watched fail is not known to be
@@ -31,7 +25,7 @@ from lane_controller import (
     Outcome,
     VehicleIdentity,
 )
-from lane_controller.interfaces import ClosingSequence
+from lane_controller.interfaces import ClosingLoops, ClosingSequence
 from lane_controller.simulated import (
     CannedCameraFeed,
     OccupancyLoopInput,
@@ -42,6 +36,7 @@ from lane_controller.simulated import (
 )
 from lane_controller.sync import (
     CONFIRMED,
+    HELD,
     SESSION_CLOSE,
     SESSION_OPEN,
     UNCONFIRMABLE,
@@ -60,6 +55,8 @@ def build(
     second_loop_occupied: bool = True,
     window: float = WINDOW,
     default_action: str = "allow",
+    loops_impl: ClosingLoops | None = None,
+    clock=None,
 ):
     """A whole lane with the geometry named, and nothing about it implied.
 
@@ -84,7 +81,11 @@ def build(
     cache = DecisionCache()
     cache.load([], default_action=default_action)
     vend = RecordingVendOutput()
-    loops = ScriptedClosingLoops(crossings) if closing_loops == 2 else None
+    if loops_impl is not None:
+        loops = loops_impl
+    else:
+        loops = ScriptedClosingLoops(crossings) if closing_loops == 2 else None
+    extra = {"clock": clock} if clock is not None else {}
     controller = LaneController(
         config,
         loop=SimulatedLoopInput(arrivals=1),
@@ -98,6 +99,7 @@ def build(
         ),
         closing_loops=loops,
         cache=cache,
+        **extra,
     )
     return controller, vend, loops
 
@@ -270,6 +272,77 @@ def test_a_crossing_slower_than_the_window_does_not_confirm():
     assert SESSION_OPEN not in kinds(controller)
 
 
+class _FakeClock:
+    """A clock a test moves by hand, so a slow crossing costs no wall time."""
+
+    def __init__(self, now: float = 1_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class LateForwardLoops(ClosingLoops):
+    """Loops that report FORWARD after the window has already gone by.
+
+    A real one: a loop board whose own clock drifted, or one that reports the
+    crossing it eventually saw rather than the one that happened in time.
+    `interfaces.ClosingLoops` ASKS an implementation not to do this, and an
+    obligation on the other side of a seam is a comment, not a check -- so the
+    thing measured here is that the controller applies the window itself.
+    """
+
+    def __init__(self, clock: _FakeClock, took_seconds: float) -> None:
+        self._clock = clock
+        self._took = took_seconds
+        self.windows_seen: list[float] = []
+
+    def wait_for_sequence(self, window_seconds: float) -> ClosingSequence:
+        self.windows_seen.append(window_seconds)
+        self._clock.advance(self._took)
+        return ClosingSequence.FORWARD
+
+
+def test_a_forward_reported_after_the_window_is_held_not_confirmed():
+    """The window is applied by the CONTROLLER, not trusted to the loops.
+
+    The event stamps `confirmation_window_seconds` under `geometry_assumed` on
+    every vehicle. It may only do that because the comparison is made here: a
+    published window that nothing applies is a number the record asserts and the
+    lane never used.
+    """
+    clock = _FakeClock()
+    controller, vend, loops = build(
+        window=10.0, loops_impl=LateForwardLoops(clock, took_seconds=30.0), clock=clock
+    )
+
+    controller.run_once()
+
+    assert vend.vend_count == 1, "the barrier did open; that is not what is being undone"
+    assert loops.windows_seen == [10.0], "the configured window must reach the loops"
+    assert SESSION_OPEN not in kinds(controller), "a crossing reported late opened a session"
+    assert "entry_confirmed" not in kinds(controller)
+    assert "entry_held" in kinds(controller)
+    assert detail(controller, "entry_held")["reason"] == "confirmation_window_elapsed"
+
+
+def test_a_forward_reported_inside_the_window_still_confirms():
+    """The other side of the same comparison, on the same implementation. Without
+    it the test above is satisfied by a lane that confirms nothing at all."""
+    clock = _FakeClock()
+    controller, _, _ = build(
+        window=10.0, loops_impl=LateForwardLoops(clock, took_seconds=3.0), clock=clock
+    )
+
+    controller.run_once()
+
+    assert "entry_confirmed" in kinds(controller)
+    assert detail(controller, SESSION_OPEN)["entry_confirmation"] == CONFIRMED
+
+
 def test_a_lane_with_no_closing_loops_opens_sessions_and_marks_every_one():
     """The backwards path. A site that has not installed the loops is not
     refused -- but `unconfirmable` is not the word `confirmed`, and it is on
@@ -331,13 +404,35 @@ def test_an_exit_that_reverses_back_inside_closes_nothing():
     assert "entry_backed_out" not in kinds(controller)
 
 
-def test_an_unconfirmed_exit_is_held_not_closed():
-    controller, _, _ = build(direction="exit", crossings=[])
+def test_an_unconfirmed_exit_still_closes_and_bills_and_is_flagged():
+    """The one asymmetry between the two directions, and it is a decision.
+
+    At an exit the vend IS the payment moment and the barrier opened -- the car
+    is gone whatever the loops saw. Holding the session open would leave the
+    stay unbilled and the vehicle inside for ever, so a site that installed the
+    loops would be worse off than one that did not. It closes, it bills, and it
+    carries `held` with the `exit_held` event beside it: a flag for a human, not
+    a hole in the ledger. An ENTRY is the opposite and opens nothing."""
+    controller, vend, _ = build(direction="exit", crossings=[])
 
     controller.run_once()
 
+    assert vend.vend_count == 1
     assert "exit_held" in kinds(controller)
-    assert SESSION_CLOSE not in kinds(controller)
+    assert SESSION_CLOSE in kinds(controller), "an exit that vended left the session open"
+    assert detail(controller, SESSION_CLOSE)["exit_confirmation"] == HELD
+    assert detail(controller, "exit_held")["reason"] == "confirmation_window_elapsed"
+
+
+def test_a_held_ENTRY_still_opens_nothing():
+    """The control for the asymmetry above: the same missing crossing, the other
+    direction. Nothing confirmed the entry, so there is no session to bill."""
+    controller, _, _ = build(direction="entry", crossings=[])
+
+    controller.run_once()
+
+    assert "entry_held" in kinds(controller)
+    assert SESSION_OPEN not in kinds(controller)
 
 
 # ---------------------------------------------------------------------------

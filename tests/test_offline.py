@@ -10,6 +10,8 @@ never been seen to fail is not known to be measuring anything.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from fake_platform import FakePlatform
@@ -182,6 +184,50 @@ def test_a_rule_sync_failure_keeps_the_rules_it_already_had():
     assert sync_rules(platform, cache) is None
     assert cache.default_action == "allow", "a failed sync must not blank the cache"
     assert not cache.is_stale(), "a failed sync must not mark good rules stale"
+
+
+class PlatformBehindThisLane(FakePlatform):
+    """The platform as it is BEFORE it records what confirmed an entry.
+
+    It accepts the open, answers with a session, and drops the field -- which is
+    what an older platform genuinely does, because the column is not there and
+    the route echoes the row it wrote. Nothing about that response is an error,
+    and that is the whole problem: deploy this lane ahead of its platform and
+    every confirmed session and every unconfirmable one become the same row.
+    """
+
+    def open_session(self, **kwargs) -> dict:
+        result = super().open_session(**kwargs)
+        session = {k: v for k, v in result["session"].items() if k != "entry_confirmation"}
+        return {**result, "session": session}
+
+
+def test_a_platform_that_does_not_record_the_confirmation_is_refused_loudly(caplog):
+    caplog.set_level(logging.ERROR)
+    platform = PlatformBehindThisLane()
+    controller, vend, transport = build(platform)
+
+    controller.run_once()
+
+    assert vend.vend_count == 1, "the barrier still opened; the car is not the one being refused"
+    assert transport.rejected == 1, "an open the platform did not record was counted as delivered"
+    assert controller.events.pending == 0, "poison must not block everything behind it"
+    assert any(
+        "entry_confirmation" in record.getMessage() for record in caplog.records
+    ), "the drop must name what the platform did not record"
+
+
+def test_a_platform_that_does_record_it_delivers_the_open():
+    """The control. Without it, the test above is satisfied by a lane whose
+    opens are refused by every platform there is."""
+    platform = FakePlatform()
+    controller, _, transport = build(platform)
+
+    controller.run_once()
+
+    assert transport.rejected == 0
+    assert platform.unique_opens == 1
+    assert platform.opened[0]["entry_confirmation"] == "unconfirmable"
 
 
 def test_a_refused_item_is_dropped_and_counted_not_retried_forever():

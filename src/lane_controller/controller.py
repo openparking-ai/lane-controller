@@ -57,6 +57,7 @@ from .sync import (
     EXIT_HELD,
     EXIT_PENDING,
     EXIT_UNCONFIRMABLE,
+    HELD,
     REASON_ARMING_INCOMPLETE,
     REASON_FORWARD,
     REASON_NO_CLOSING_LOOPS,
@@ -270,6 +271,18 @@ class LaneController:
         return self.config.loops.confirmation_window_seconds
 
     @staticmethod
+    def _within_window(elapsed: float, window: float) -> bool:
+        """Whether the crossing arrived inside the window the event stamps.
+
+        The comparison the event's `geometry_assumed` describes. A FORWARD that
+        took longer is not a confirmation -- the window is what makes one mean
+        "a vehicle went through in a plausible time" rather than "something
+        happened here eventually" -- and it falls through to HELD like any other
+        window that elapsed.
+        """
+        return elapsed <= window
+
+    @staticmethod
     def _confirms(crossing: ClosingSequence) -> bool:
         """Only A-then-B confirms. Nothing else is folded into it."""
         return crossing is ClosingSequence.FORWARD
@@ -316,9 +329,19 @@ class LaneController:
             return
 
         window = self._confirmation_window()
+        # Read either side of the call, because the window is OURS to apply.
+        # `interfaces.ClosingLoops` asks an implementation not to report FORWARD
+        # for a crossing slower than the window, and an obligation on the other
+        # side of a seam is a comment, not a check: a loop board that reports a
+        # crossing late -- because it is faulty, because its own clock drifted,
+        # or because somebody wrote it that way -- got a confirmed, billable
+        # session out of a window this lane published on the event and never
+        # applied.
+        started = self._clock()
         crossing = self.closing_loops.wait_for_sequence(window)
+        elapsed = self._clock() - started
 
-        if self._confirms(crossing):
+        if self._confirms(crossing) and self._within_window(elapsed, window):
             self.events.record(
                 names.confirmed, lane, reason=REASON_FORWARD, at=at, geometry_assumed=geometry
             )
@@ -336,17 +359,33 @@ class LaneController:
             )
             return
 
-        # The window elapsed with no sequence. NEVER silently voided -- that is
-        # the abandoned-ticket fraud, which is exactly the ticket no car ever
-        # followed -- and NEVER turned into a session, which is the phantom
-        # occupant. Held and flagged. What an attendant does about it is the
-        # intercom's job and is not built.
+        # No confirmation inside the window: nothing crossed, or a FORWARD
+        # arrived after it. At an ENTRY that is NEVER silently voided -- that is
+        # the abandoned-ticket fraud, exactly the ticket no car ever followed --
+        # and NEVER turned into a session, which is the phantom occupant. Held
+        # and flagged. What an attendant does about it is the intercom's job and
+        # is not built.
         log.warning(
-            "lane %s: %.1fs elapsed with no closing sequence; entry HELD", lane, window
+            "lane %s: no crossing confirmed inside the %.1fs window (%.1fs elapsed); %s HELD",
+            lane,
+            window,
+            elapsed,
+            self.config.direction,
         )
         self.events.record(
             names.held, lane, reason=REASON_WINDOW_ELAPSED, at=at, geometry_assumed=geometry
         )
+        if self.config.direction == "exit":
+            # AN EXIT IS THE OTHER WAY ROUND, and this is the one asymmetry in
+            # the file. The vend at an exit IS the payment moment and the
+            # barrier opened: the car has left whatever the loops saw. Leaving
+            # the session open would mean an unbilled stay and a vehicle counted
+            # as inside for ever -- so installing the loops would make a site
+            # worse than one without them, which is the opposite of what they
+            # are for. It closes, it bills, and it says `held` with the
+            # `exit_held` event above beside it: a flag for a human, not a hole
+            # in the ledger.
+            self._record_session(identity, at, confirmation=HELD)
 
     def _record_session(self, identity, at: str, *, confirmation: str) -> None:
         """Put the session action on the queue, saying what confirmed it."""

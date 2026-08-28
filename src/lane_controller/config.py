@@ -26,11 +26,14 @@ class LoopConfig:
 
     EVERY VALUE HERE IS A PER-SITE SETTING AND AN ASSUMPTION. Nothing in this
     package measures a spacing or a crossing time, and nothing here is a
-    constant -- the defaults are the ones Gokhan named from having run parking
-    operations, and they stay assumptions until a real site measures them. They
-    are published with the events they govern, under the key
+    constant. They are published with the events they govern, under the key
     `geometry_assumed`, so a reader of the record cannot mistake them for
     something this software established.
+
+    THE VALUES BELOW ARE NOT WHAT A CONFIGURATION FILE GETS. A file declares all
+    five or it is refused -- see `_declared_loops`. These defaults exist for a
+    `LaneConfig` built in code, and they describe the lane this package shipped
+    before the loops existed.
 
     Two arming loops BEFORE the barrier: both must read occupied together, so an
     object has to span the gap. Two closing loops AFTER it, crossed in order:
@@ -90,6 +93,53 @@ class LoopConfig:
         }
 
 
+#: The five keys a `[loops]` table must declare. There is no default for any of
+#: them at the file boundary, and that is the whole point of the list.
+LOOP_KEYS = (
+    "arming_loops",
+    "arming_spacing_m",
+    "closing_loops",
+    "closing_spacing_m",
+    "confirmation_window_seconds",
+)
+
+
+def _declared_loops(raw: dict) -> dict:
+    """The `[loops]` table, or a refusal naming the first key that is missing.
+
+    A lane's loop geometry is DECLARED, never defaulted, and a configuration
+    that does not say is refused before the lane runs rather than served a
+    plausible answer -- the same shape as the engine refusing weights whose
+    operating point nobody measured.
+
+    It is not a style preference. A defaulted `closing_loops = 0` is
+    indistinguishable, in the record and to an operator, from a site that
+    installed the loops and mistyped the key: both write `unconfirmable` on
+    every session, and only one of them is a decision. A site with no closing
+    loops writes `closing_loops = 0` on the page and gets exactly what it had
+    before; a site that meant to install them finds out here, not at 3am.
+
+    A misspelt key is caught by the same rule, because a key spelt wrong is a
+    key that is missing.
+    """
+    loops = raw.get("loops")
+    if not isinstance(loops, dict):
+        raise ValueError(
+            "the configuration has no [loops] table. The loop geometry is declared, never "
+            f"defaulted: give a [loops] table with all of {', '.join(LOOP_KEYS)} "
+            "(config/lane.example.toml is the standard installation). A lane with no closing "
+            "loops declares closing_loops = 0 and is not refused."
+        )
+    for key in LOOP_KEYS:
+        if key not in loops:
+            raise ValueError(
+                f"[loops] does not declare {key}. Every one of {', '.join(LOOP_KEYS)} is "
+                "required -- a value nobody wrote is not a value, and a key spelt wrong is a "
+                "key that is missing. See config/lane.example.toml."
+            )
+    return loops
+
+
 @dataclass(frozen=True, slots=True)
 class LaneConfig:
     lane_id: str
@@ -127,7 +177,7 @@ class LaneConfig:
         lane = raw.get("lane", {})
         camera = raw.get("camera", {})
         gate = raw.get("gate", {})
-        loops = raw.get("loops", {})
+        loops = _declared_loops(raw)
         return cls(
             lane_id=lane["id"],
             site_id=lane["site_id"],
@@ -142,10 +192,10 @@ class LaneConfig:
             ),
             gate=GateConfig(vend_pulse_ms=int(gate.get("vend_pulse_ms", 500))),
             loops=LoopConfig(
-                arming_loops=int(loops.get("arming_loops", 1)),
-                arming_spacing_m=float(loops.get("arming_spacing_m", 1.5)),
-                closing_loops=int(loops.get("closing_loops", 0)),
-                closing_spacing_m=float(loops.get("closing_spacing_m", 1.5)),
-                confirmation_window_seconds=float(loops.get("confirmation_window_seconds", 10.0)),
+                arming_loops=int(loops["arming_loops"]),
+                arming_spacing_m=float(loops["arming_spacing_m"]),
+                closing_loops=int(loops["closing_loops"]),
+                closing_spacing_m=float(loops["closing_spacing_m"]),
+                confirmation_window_seconds=float(loops["confirmation_window_seconds"]),
             ),
         )

@@ -43,7 +43,7 @@ def test_the_controller_cannot_close_the_barrier(lane):
 
 
 def test_every_stage_is_reported_as_an_event(lane):
-    """CHANGED, deliberately: the vend is no longer what opens the session.
+    """CHANGED, deliberately: the vend now records a PENDING entry first.
 
     This test asserted `["frames_captured", "vehicle_identified", "decision",
     "vended", "session_open"]` -- the vend-opens-a-session behaviour, by name.
