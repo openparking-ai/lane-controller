@@ -24,16 +24,6 @@ afterwards; the barrier never waits on a network call. If the rules go stale
 past their configured age, the lane falls back rather than acting on pricing it
 no longer trusts.
 
-**Nothing that is not a vehicle gets a transaction.** The engine is asked
-whether a VEHICLE is there before it is asked to read anything, and that answer
-is a separate outcome — `NO_VEHICLE`, no ticket, no session, no barrier, and a
-recorded `arming_rejected` event so a lane being worked by somebody tripping the
-loop with a piece of metal shows up as a pattern rather than as silence. It is
-deliberately **not** a fallback: a fallback means a human deals with a car we
-could not identify, and it ends in a ticket. A car with a filthy or missing
-front plate is a legitimate entry and still gets that fallback. Where presence
-was not measured at all, the lane behaves exactly as it did before.
-
 **It is never wrong silently.** When identification is not confident enough, the
 lane takes an explicit fallback path — `LOW_CONFIDENCE`, `NO_PLATE_READ`,
 `UNKNOWN_VEHICLE` or `STALE_RULES` — each of which is a named outcome with an
