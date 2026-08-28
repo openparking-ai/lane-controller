@@ -34,6 +34,12 @@ class FakePlatform:
         self.sessions_by_open_event: dict[str, dict] = {}
         self.sessions_by_close_event: dict[str, dict] = {}
         self.reject_close_without_open = True
+        #: Kinds this platform refuses outright, as the real one refuses a kind
+        #: it does not know about. The SET is supplied by whoever builds the
+        #: fake: which kinds the real platform accepts is its own list, in
+        #: another repository, and a copy of it here would be exactly the second
+        #: copy the kind-set check exists to catch.
+        self.reject_event_kinds: set[str] = set()
 
     # -- the PlatformClient surface ---------------------------------------
 
@@ -53,6 +59,12 @@ class FakePlatform:
 
     def post_events(self, events: list[dict]) -> dict:
         self._check()
+        for event in events:
+            if event["kind"] in self.reject_event_kinds:
+                raise PlatformRejected(
+                    400,
+                    f"kind {event['kind']!r} is not one a lane reports",
+                )
         accepted = 0
         for event in events:
             self.event_deliveries += 1
