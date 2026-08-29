@@ -8,7 +8,7 @@ public record shape and nothing else. `tests/test_vehicle_id_boundary.py`
 enforces that, and fails if it is ever untrue.
 
 Local, not remote. The default address is loopback, because identification runs
-on the same device or the same LAN and the lane has to work with the internet
+on the same device and the lane has to work with the internet
 down. A hostname pointing at anything else is a deployment mistake, not a
 feature.
 
