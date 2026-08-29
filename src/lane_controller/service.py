@@ -45,6 +45,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from vehicle_id.contract import SCHEMA_VERSION
+
 from .contract import (
     CONTRACT_VERSION,
     Capabilities,
@@ -138,6 +140,31 @@ def bearer(header: str | None) -> str | None:
     return value.strip()
 
 
+class _BoundedRead:
+    """One call to somebody else's health route, with a flag for "it came back".
+
+    `body` is `None` for every failure, exactly as `identity_health` already
+    answers for one: the caller has nothing to say either way, and a read that
+    raised and a read that could not be parsed are the same fact to it.
+    """
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.body = None
+
+    def run(self, reader) -> None:
+        try:
+            self.body = reader()
+        except Exception as exc:  # noqa: BLE001
+            # An identifier this package did not write may raise anything at
+            # all. Letting it out of this thread would kill it silently and
+            # leave `done` unset, which reads to the caller as a hang.
+            log.warning("the identification service health read raised: %s", exc)
+            self.body = None
+        finally:
+            self.done.set()
+
+
 class LaneService:
     """A `LaneController`, read through the contract.
 
@@ -150,6 +177,17 @@ class LaneService:
     def __init__(self, controller) -> None:
         self.controller = controller
         self._lock = threading.Lock()
+        #: The one identification-service health read that may be outstanding.
+        #: See `_bounded_identity_health` -- it is what keeps a service that
+        #: never answers from leaving one thread behind per poll.
+        self._identity_read: _BoundedRead | None = None
+        self._identity_read_lock = threading.Lock()
+        #: Whether the unreadable-version refusal below has already been said.
+        #: It is a property of the service on the other end, not of one request,
+        #: and this route is polled -- so it is said once rather than on every
+        #: poll for as long as that service stays on a version this build does
+        #: not know.
+        self._identity_version_refused = False
 
     # --- GET /v1/lane -----------------------------------------------------
 
@@ -314,10 +352,12 @@ class LaneService:
 
         Three answers and none of them guesses:
 
-          * the service could not be read, or answered no `status` this build
-            recognises -- `unknown`. NOT `ok`: a service that cannot be asked
-            has not been found healthy. Whether it is unreachable is
-            `identity_service_down`, derived from a different signal.
+          * the service could not be read, did not answer within this lane's
+            own bound, answered on a `schema_version` this build does not know,
+            or answered no `status` this build recognises -- `unknown`. NOT
+            `ok`: a service that cannot be asked has not been found healthy.
+            Whether it is unreachable is `identity_service_down`, derived from a
+            different signal.
           * `degraded` -- `active`.
           * `ok` -- `ok`, and that is a real measurement: it was asked and it
             answered.
@@ -330,8 +370,10 @@ class LaneService:
         reader = getattr(self.controller.identifier, "identity_health", None)
         if not callable(reader):
             return HealthState.UNKNOWN
-        body = reader()
+        body = self._bounded_identity_health(reader)
         if not isinstance(body, dict):
+            return HealthState.UNKNOWN
+        if not self._known_identity_schema(body.get("schema_version")):
             return HealthState.UNKNOWN
         status = body.get("status")
         if status == "degraded":
@@ -339,6 +381,92 @@ class LaneService:
         if status == "ok":
             return HealthState.OK
         return HealthState.UNKNOWN
+
+    def _known_identity_schema(self, version) -> bool:
+        """The version refusal, COPIED from the reader of the same payload.
+
+        `Read.from_dict` refuses an unrecognised `schema_version` rather than
+        guessing which fields still mean what they used to, and both contracts
+        state that policy in the same words: *an unrecognised version is
+        refused, not partially read*. This is the same payload from the same
+        service, and it was being read regardless -- with the value taken off it
+        published as `measured`. One payload, one repository, two policies.
+
+        A missing version is refused too. A payload that does not say which
+        contract it is is not a payload this build can place, and reading it
+        anyway is the half-read both contracts forbid.
+
+        A `bool` is refused explicitly, for the reason `Read.from_dict` refuses
+        it: `True == 1`, so `schema_version: true` would otherwise read as
+        version 1.
+
+        The answer for an unreadable one is the answer this method already has
+        for every other unreadable case -- `unknown`, never `ok`.
+        """
+        if not isinstance(version, bool) and isinstance(version, int) and version == SCHEMA_VERSION:
+            return True
+        if not self._identity_version_refused:
+            self._identity_version_refused = True
+            log.warning(
+                "the identification service's health declares schema_version %r; this build "
+                "understands %d. Refusing to guess which fields still mean what they used to: "
+                "identity_service_degraded is unknown.",
+                version,
+                SCHEMA_VERSION,
+            )
+        return False
+
+    def _bounded_identity_health(self, reader):
+        """The identification service's health, or `None`, within OUR OWN bound.
+
+        **This route must not block on another machine for longer than its own
+        bounded read.** The identification service runs in a different process,
+        usually on a different box, and a HUNG one -- a socket that accepts and
+        never answers -- used to hold this route open for that client's whole
+        timeout. The monitor polling this lane gave up first and published
+        `lane_unreachable`: a lane that is up, serving, and answering correctly,
+        reported as a dead lane, with every real signal it was publishing
+        retired at the same moment. A slow third machine became a fault
+        attributed to this one.
+
+        So the bound is the LANE'S, `[lane] identity_health_timeout_s`, and it is
+        applied here rather than left to whatever the identifier's own client
+        happens to use: an identifier this package did not write has a timeout
+        this package did not choose, and the route's promise is the route's to
+        keep.
+
+        On timeout the answer is `None`, which the caller reads as `unknown` --
+        nobody measured. A hung service is not the same fact as a refused one.
+
+        **One read at a time.** The reader runs on a daemon thread so a service
+        that never answers cannot hold this route or the interpreter's exit, and
+        while one is still outstanding a second is not started: it would be one
+        more thread per poll, for ever, against a machine that is not answering.
+        A poll that arrives during an outstanding read is told `unknown`, which
+        is exactly what it is.
+        """
+        with self._identity_read_lock:
+            outstanding = self._identity_read
+            if outstanding is not None and not outstanding.done.is_set():
+                log.warning(
+                    "the identification service has not answered the previous health read; "
+                    "not starting a second"
+                )
+                return None
+            read = _BoundedRead()
+            self._identity_read = read
+
+        threading.Thread(
+            target=read.run, args=(reader,), name="identity-health", daemon=True
+        ).start()
+        if not read.done.wait(self.controller.config.identity_health_timeout_s):
+            log.warning(
+                "the identification service did not answer its health route within %.3fs; "
+                "identity_service_degraded is unknown",
+                self.controller.config.identity_health_timeout_s,
+            )
+            return None
+        return read.body
 
     def _clock_skew_rejected(self) -> HealthState:
         """`active` once the platform has refused an item for clock skew.
@@ -364,6 +492,12 @@ class LaneService:
             platform older than the field answers for every refusal, including
             a skew, so reading the absence as a negative would report a healthy
             clock on exactly the deployment where the failure is invisible.
+
+        AND IT COMES BACK. Both counts are cleared by the next write the
+        platform ACCEPTS, so this reads `ok` again once the clock is fixed and
+        the lane is being taken. Without that it was a latch that read like a
+        state: `active` for the life of the process, the operator's repair
+        invisible, and `recovered` unable to fire at whatever is watching.
         """
         transport = self.controller.events.transport
         if transport is None:

@@ -38,6 +38,28 @@ because that is the direction a health surface fails in when nobody is looking.
   doc_stale_list        the document still lists a code this build now reads
                         among the ones waiting to be read. Applied to the parsed
                         paragraph, so no tracked document is edited here.
+  health_blocks_on_the_service
+                        the health route waits on the identification service for
+                        as long as THAT client will, instead of for as long as
+                        this lane said. A hung third machine is then published
+                        as a dead lane.
+  version_is_not_checked
+                        the health payload is read whatever `schema_version` it
+                        declares, and the value taken off it is published as
+                        `measured`. The half-read both contracts refuse.
+  skew_never_recovers   the skew counts only ever go up. `active` until the
+                        process restarts, however long ago the clock was fixed,
+                        and no recovery for a monitor to report.
+  never_alarm_as_a_string
+                        the flag ships as a string. Every non-empty string is
+                        truthy, so `"false"` silences a code with nothing
+                        anywhere reporting it.
+  doc_set_missing_a_member
+                        the document publishes one fewer malfunction code than
+                        the enum holds. A lane an implementer cannot write.
+  enum_gained_a_member  the code gains a malfunction code the document does not
+                        publish, which is what every future round does the day
+                        it adds one.
 
 This also proves the suite RUNS. A suite that had quietly stopped being
 collected would pass control A and then fail to fail under every break, which is
@@ -61,6 +83,12 @@ BREAKS = [
     ("silence_is_ok", "a lane that has sent nothing reports its clock as fine"),
     ("labelled_not_derived", "a code is labelled measured with nothing deriving it"),
     ("doc_stale_list", "the document still lists a code this build now reads"),
+    ("health_blocks_on_the_service", "the health route waits on another machine's client"),
+    ("version_is_not_checked", "the health payload is read on any schema_version"),
+    ("skew_never_recovers", "the skew state can never leave active"),
+    ("never_alarm_as_a_string", "never_alarm ships as a string instead of a boolean"),
+    ("doc_set_missing_a_member", "the document publishes fewer codes than the enum holds"),
+    ("enum_gained_a_member", "the enum gains a code the document does not publish"),
 ]
 
 

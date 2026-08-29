@@ -153,6 +153,25 @@ def _declared_loops(raw: dict) -> dict:
 #: site that wants to hear about a five-minute outage lowers it.
 DEFAULT_OUTBOX_DEPTH_THRESHOLD = 1_000
 
+#: The published default for `LaneConfig.identity_health_timeout_s`: how long
+#: `GET /v1/lane/health` may wait for the identification service's own health
+#: route before answering `unknown` for `identity_service_degraded`.
+#:
+#: A PER-SITE SETTING AND AN ASSUMPTION. Nothing here measures how long a loaded
+#: identification service takes to answer its health route. What this number IS
+#: measured against is the other side of the seam: this route is polled by a
+#: monitor, and a lane that blocks on a THIRD machine for as long as its own
+#: consumers are willing to wait is published as a dead lane while it is up and
+#: serving. So the bound belongs to the lane, it is short, and it is the lane's
+#: own -- a hung identification service costs one field on this payload, not the
+#: whole payload.
+#:
+#: On timeout the entry is `unknown`: nobody measured. NEVER `ok` and never
+#: `active` -- a service that has not answered has not been found healthy and has
+#: not been found degraded either, and `identity_service_down` is a different
+#: code derived from a different signal.
+DEFAULT_IDENTITY_HEALTH_TIMEOUT_S = 1.0
+
 
 @dataclass(frozen=True, slots=True)
 class LaneConfig:
@@ -179,6 +198,10 @@ class LaneConfig:
     # reports `outbox_depth_growing` as `active`. A per-site setting: see
     # DEFAULT_OUTBOX_DEPTH_THRESHOLD above for what it is and is not.
     outbox_depth_threshold: int = DEFAULT_OUTBOX_DEPTH_THRESHOLD
+    # How long the health route may wait on the identification service's own
+    # health route before answering `unknown`. A per-site setting: see
+    # DEFAULT_IDENTITY_HEALTH_TIMEOUT_S above for what it is and is not.
+    identity_health_timeout_s: float = DEFAULT_IDENTITY_HEALTH_TIMEOUT_S
 
     def __post_init__(self) -> None:
         if self.direction not in ("entry", "exit"):
@@ -189,6 +212,18 @@ class LaneConfig:
             raise ValueError(
                 f"outbox_depth_threshold must be a positive integer, "
                 f"got {self.outbox_depth_threshold!r}"
+            )
+        if (
+            isinstance(self.identity_health_timeout_s, bool)
+            or not isinstance(self.identity_health_timeout_s, (int, float))
+            or self.identity_health_timeout_s <= 0
+        ):
+            # Zero or negative would mean the route never waits at all, which is
+            # a lane that answers `unknown` for that code for ever while looking
+            # like it measured something.
+            raise ValueError(
+                f"identity_health_timeout_s must be a positive number of seconds, "
+                f"got {self.identity_health_timeout_s!r}"
             )
 
     @classmethod
@@ -212,6 +247,9 @@ class LaneConfig:
             server_url=lane.get("server_url"),
             outbox_depth_threshold=int(
                 lane.get("outbox_depth_threshold", DEFAULT_OUTBOX_DEPTH_THRESHOLD)
+            ),
+            identity_health_timeout_s=float(
+                lane.get("identity_health_timeout_s", DEFAULT_IDENTITY_HEALTH_TIMEOUT_S)
             ),
             camera=CameraConfig(
                 camera_id=camera.get("id", "cam-1"),

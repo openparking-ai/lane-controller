@@ -689,5 +689,77 @@ def _break_the_measured_codes(monkeypatch):
         )
         monkeypatch.setattr(test_lane_contract, "_not_measured_paragraph", lambda: stale)
 
+    elif mode == "health_blocks_on_the_service":
+        # The route waits on the identification service for as long as THAT
+        # client is willing to, instead of for as long as this lane said. A hung
+        # third machine then holds this route open past the patience of whatever
+        # polls it, and a lane that is up and serving is published as a dead one.
+        monkeypatch.setattr(
+            LaneService, "_bounded_identity_health", lambda self, reader: reader()
+        )
+
+    elif mode == "version_is_not_checked":
+        # The health payload is read whatever version it declares. The value
+        # taken off it is then published as `measured` -- the half-read both
+        # contracts refuse, on the one payload two other readers refuse.
+        monkeypatch.setattr(LaneService, "_known_identity_schema", lambda self, version: True)
+
+    elif mode == "skew_never_recovers":
+        # The counts only ever go up. One skew and the code is `active` until
+        # the process restarts, however long ago the clock was fixed: a latch
+        # that reads like a state, and no `recovered` for a monitor to send.
+        original_guard = PlatformTransport._guarded
+
+        def never_resets(self, call):
+            skew, unnamed = self.skew_rejected, self.conflicts_unnamed
+            result = original_guard(self, call)
+            self.skew_rejected = max(self.skew_rejected, skew)
+            self.conflicts_unnamed = max(self.conflicts_unnamed, unnamed)
+            return result
+
+        monkeypatch.setattr(PlatformTransport, "_guarded", never_resets)
+
+    elif mode == "never_alarm_as_a_string":
+        # The flag ships as a string. Every non-empty string is truthy, so a
+        # reader that has not been told to require a boolean silences the code
+        # it is told `"false"` about -- the reassuring direction, with nothing
+        # anywhere reporting it.
+        from lane_controller.contract import HealthEntry
+
+        original_dict = HealthEntry.to_dict
+
+        def stringly(self):
+            row = original_dict(self)
+            row["never_alarm"] = str(row["never_alarm"]).lower()
+            return row
+
+        monkeypatch.setattr(HealthEntry, "to_dict", stringly)
+
+    elif mode in ("doc_set_missing_a_member", "enum_gained_a_member"):
+        # The two directions of the published closed sets. One drops a member
+        # from the DOCUMENT -- a lane an implementer cannot write. The other
+        # adds one to the CODE without adding it to the document, which is what
+        # every future round does the day it adds a malfunction code.
+        #
+        # Applied to the parsed block and to the derivation, so no tracked
+        # document is edited by a script.
+        import test_lane_contract
+
+        if mode == "doc_set_missing_a_member":
+            original_payloads = test_lane_contract.doc_payloads
+
+            def doctored():
+                doc = original_payloads()
+                doc["sets"]["malfunction_codes"] = doc["sets"]["malfunction_codes"][:-1]
+                return doc
+
+            monkeypatch.setattr(test_lane_contract, "doc_payloads", doctored)
+        else:
+            monkeypatch.setitem(
+                test_lane_contract.PUBLISHED_SETS,
+                "malfunction_codes",
+                lambda: [code.value for code in MalfunctionCode] + ["hatch_left_open"],
+            )
+
     else:
         raise RuntimeError(f"unknown BREAK_MEASURED_CODE mode: {mode}")

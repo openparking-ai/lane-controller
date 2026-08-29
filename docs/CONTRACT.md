@@ -130,8 +130,8 @@ thing as "nothing has ever happened here".
 
 ### `outcome` is CLOSED. `reason` is OPEN.
 
-`outcome` is one of the values of `decision.Outcome`, and that set will not
-grow without a version bump. A consumer has to be able to branch on what
+`outcome` is one of the values of `decision.Outcome` — **listed in full under
+The closed sets** — and that set will not grow without a version bump. A consumer has to be able to branch on what
 happened to the vehicle — admitted, refused, handed to a human, or nothing was
 there — and a lane that could invent a fifth would leave every consumer with a
 case it has no behaviour for.
@@ -170,8 +170,8 @@ and `null` from an identifier that does not name its reads.
 
 ### The transit
 
-`transit.state` is one of `contract.TransitState`, and `since` is `null`
-exactly when the state is `none`.
+`transit.state` is one of `contract.TransitState` — **listed in full under The
+closed sets** — and `since` is `null` exactly when the state is `none`.
 
 `held` is neither a confirmation nor a refutation, and is never folded into
 either: voiding it silently re-creates the abandoned-ticket fraud, and promoting
@@ -204,8 +204,15 @@ of an entry.
 One entry per member of `contract.MalfunctionCode`, and **every one of them
 ships on every response**. A payload missing a code is refused when it is built,
 because a code that is absent reads to a consumer exactly like a code that is
-fine. This document does not list the codes for the same reason it does not list
-the reasons.
+fine. The whole set is published below, under **The closed sets**.
+
+`never_alarm` is a **required JSON boolean on every entry**, and so is `state`.
+An implementer of this contract emits `true` or `false` for every code on every
+response — not a string, not a number, and never absent. A consumer may not
+guess what a missing one meant: absent, it could be a lane that has nothing to
+say or a lane whose serialiser dropped it, and the two point in opposite
+directions. One of them dispatches a technician because a car arrived
+(`reference_not_recognised`), and the other silences a real fault for ever.
 
 ### `state`, and why `unknown` is not `ok`
 
@@ -280,6 +287,26 @@ refuses a skew exactly as it refuses everything else, so this code answers
 `unknown` after one — never `ok`. It also answers `unknown` on a lane that has
 attempted no platform call at all: nothing was sent, so nothing could have been
 refused, and a clock nobody has had checked is not a clock found correct.
+
+**It recovers.** The next write the platform ACCEPTS clears both, so the code
+reads `ok` again once the clock is fixed and the lane is being taken. A code
+that could only ever go one way would be a latch that reads like a state:
+`active` for the life of the process however long ago the repair was made, with
+no recovery for a monitor to report.
+
+`identity_service_degraded` is read on the request, so this route waits on a
+process that is usually on another machine — and it waits **at most
+`[lane] identity_health_timeout_s`, which defaults to 1.0 second**. That bound
+is a **setting and an assumption**: nothing here measures how long a loaded
+identification service takes to answer its own health route. What it is drawn
+against is the other side of the seam. This route is polled by a monitor, and a
+monitor gives up on a target that does not answer — so a lane that blocked on a
+THIRD machine for as long as its own consumers are willing to wait would be
+published as a dead lane while it was up and serving, taking every real signal
+it publishes with it. **A hung identification service costs this one field, not
+this payload.** On timeout the entry is `unknown`: nobody measured, never `ok`
+and never `active`. A consumer of this route sets its own timeout comfortably
+above this one.
 
 `outbox_depth_growing` reads the outbox's PENDING DEPTH — every undelivered
 event, log entries and session actions alike — against a per-site threshold,
@@ -357,6 +384,83 @@ the vehicle is not on this contract at all.
 `detail` is opaque to this contract. It is whatever the lane recorded with the
 event, and a consumer ignores keys it does not recognise. **No plate text goes
 in it**, on any route of this contract.
+
+## The closed sets, in full
+
+Everything below is a set this contract declares CLOSED, published here so that
+a lane which is not ours can be written **from this document alone**. It used to
+say it did not list them, on the reasoning that a hand-written copy of a set the
+code defines is the copy that goes wrong. The reasoning is right and the
+conclusion was wrong: withholding them did not remove the second copy, it moved
+it into every implementer's guess — and the stub in this repository that exists
+to prove a stranger can take this seat had to import our Python package for
+exactly these four sets.
+
+So they are published, and the copy is held to the code by a test:
+`tests/test_lane_contract.py` compares every member below against the enum it
+comes from, in both directions. Dropping one from this block goes red, and so
+does adding one to the enum without adding it here.
+
+<!--payload:sets-->
+```json
+{
+  "malfunction_codes": [
+    "boom_did_not_rise",
+    "boom_did_not_close",
+    "vend_relay_fault",
+    "arming_loop_stuck_occupied",
+    "arming_loops_disagree",
+    "closing_loops_never_firing",
+    "camera_feed_lost",
+    "camera_feed_frozen",
+    "lens_obstructed_or_dark",
+    "reference_not_recognised",
+    "identity_service_down",
+    "identity_service_degraded",
+    "identity_service_unmeasured_weights",
+    "platform_unreachable",
+    "lane_gone_quiet",
+    "outbox_depth_growing",
+    "session_actions_dead_lettered",
+    "intercom_registration_lost",
+    "controller_on_battery",
+    "disk_nearly_full",
+    "clock_skew_rejected"
+  ],
+  "outcomes": [
+    "allow",
+    "deny",
+    "fallback",
+    "no_vehicle"
+  ],
+  "transit_states": [
+    "pending",
+    "confirmed",
+    "held",
+    "backed_out",
+    "unconfirmable",
+    "none"
+  ],
+  "never_alarm": [
+    "reference_not_recognised"
+  ]
+}
+```
+
+- **`malfunction_codes`** — every member of `contract.MalfunctionCode`. One
+  entry per member ships on every `GET /v1/lane/health`, with a `state`, a
+  `source`, a boolean `never_alarm` and a `caveat`.
+- **`outcomes`** — every member of `decision.Outcome`, the CLOSED set on
+  `GET /v1/lane/state`. A consumer branches on all four.
+- **`transit_states`** — every member of `contract.TransitState`.
+- **`never_alarm`** — the codes a monitor must never page a human on, and the
+  reason each is here travels on the wire in that code's `caveat`.
+
+`reason` and `cause` are **not** here, and that is not an oversight: `reason` is
+an OPEN string with a required closed subset, and a lane that is not ours emits
+its own vocabulary in it. What a consumer must do with one it does not
+recognise — escalate to a human, never map it onto the nearest thing it knows —
+is stated above and is the behaviour that makes the openness safe.
 
 ## Running it
 
