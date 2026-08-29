@@ -138,7 +138,7 @@ for us, and `tests/test_vehicle_id_boundary.py` fails if this package ever
 imports anything from that one except its public contract.
 
 ```sh
-# in the vehicle-id repository, on the same device or the same LAN
+# in the vehicle-id repository, on the same device
 vehicle-id serve
 ```
 
