@@ -36,6 +36,20 @@ server_url = "https://platform.example/api/lane-events"
 # site that wants to hear about a five-minute outage lowers it.
 outbox_depth_threshold = 1000
 
+# How long `GET /v1/lane/health` may wait for the identification service's own
+# health route before answering `unknown` for `identity_service_degraded`.
+#
+# A PER-SITE SETTING AND AN ASSUMPTION -- nothing here measures how long a
+# loaded identification service takes to answer. What it IS drawn against is the
+# other side of the seam: this route is polled by a monitor, and a lane that
+# blocked on a THIRD machine for as long as its own consumers are willing to
+# wait would be published as a dead lane while it was up and serving. A hung
+# identification service costs this one field, not the whole payload.
+#
+# On timeout the entry is `unknown` -- nobody measured. Never `ok`, never
+# `active`.
+identity_health_timeout_s = 1.0
+
 [camera]
 id               = "cam-1"
 # RTSP and PoE are required for any camera on this platform.
