@@ -186,7 +186,6 @@ class LaneController:
         self.events.record(
             "vehicle_identified",
             lane,
-            plate=identity.plate,
             confidence=identity.confidence,
             make=identity.make,
             model=identity.model,
@@ -209,7 +208,7 @@ class LaneController:
 
         if decision.should_vend:
             self.vend.vend(decision.reason)
-            self.events.record("vended", lane, reason=decision.reason, plate=identity.plate)
+            self.events.record("vended", lane, reason=decision.reason)
 
             # The vend is where the ticket comes out, and the ticket is NOT the
             # entry. What goes on the queue here is a PENDING entry; the loops
@@ -253,7 +252,6 @@ class LaneController:
                 lane,
                 reason=decision.reason,
                 fallback=decision.fallback.value if decision.fallback else None,
-                plate=identity.plate,
                 confidence=identity.confidence,
             )
 
@@ -306,7 +304,6 @@ class LaneController:
         self.events.record(
             names.pending,
             lane,
-            plate=identity.plate,
             plate_region=identity.plate_region,
             at=at,
             geometry_assumed=geometry,
