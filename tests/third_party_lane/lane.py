@@ -47,6 +47,10 @@ class ThirdPartyLane:
             # No loops, so nothing to publish. Not `null` and not our five
             # keys: this lane has no geometry, and says so with an empty one.
             "geometry": {},
+            # This vendor keeps a two-event window, and says so. The number is
+            # a property of THEIR window, not of ours -- which is the reason
+            # the contract publishes it instead of documenting one value.
+            "event_window_depth": 2,
             "capabilities": {
                 "confirms_entry": False,
                 "has_identity_service": False,

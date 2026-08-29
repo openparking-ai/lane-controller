@@ -40,10 +40,10 @@ class EventTransport(Protocol):
 #: Kinds that move money. These are never dropped to make room.
 SESSION_KINDS = frozenset({"session_open", "session_close"})
 
-#: How many recent events the read contract's cursor can still serve. A
-#: consumer that falls further behind than this has a bigger problem than a
-#: cursor. Same shape and same size as the Vehicle ID service's read history,
-#: so one consumer holds one policy for both.
+#: How many recent LOG events the read contract's cursor can still serve. A
+#: consumer that falls further behind than this is told so -- `reset` -- rather
+#: than served a short answer. Same shape and same size as the Vehicle ID
+#: service's read history, so one consumer holds one policy for both.
 DEFAULT_HISTORY = 256
 
 
@@ -84,7 +84,18 @@ class EventQueue:
         # words: a catch-up window for a consumer that blinked, not a record of
         # anything. This package still has no state store and this does not
         # become one.
+        #
+        # LOG EVENTS ONLY. A session action is not a log event: it becomes
+        # POST /lane/sessions/open or /close, it carries the plate, and the
+        # platform is the ledger that holds it. Putting it here would publish
+        # the plate to every consumer of a READ contract -- which is a
+        # different exposure from the one this window exists for, and one
+        # nothing on this contract declares. What happened at the lane is
+        # answered by the log events and by `GET /v1/lane/state`.
         self._history: deque[tuple[int, LaneEvent]] = deque(maxlen=history)
+        # The cursor counts what this window SERVES, so it stays contiguous and
+        # a consumer cannot infer, from a gap in it, that a session action it
+        # is not being shown happened.
         self._cursor = 0
 
     @property
@@ -94,11 +105,12 @@ class EventQueue:
 
     def record(self, kind: str, lane_id: str, **detail: Any) -> LaneEvent:
         event = LaneEvent(kind=kind, lane_id=lane_id, at=time.time(), detail=detail)
-        self._cursor += 1
-        self._history.append((self._cursor, event))
         if kind in SESSION_KINDS:
+            # Outbox only. Not the read window -- see `_history`.
             self._sessions.append(event)
             return event
+        self._cursor += 1
+        self._history.append((self._cursor, event))
         if self._log.maxlen is not None and len(self._log) == self._log.maxlen:
             self.dropped += 1
         self._log.append(event)
@@ -145,6 +157,28 @@ class EventQueue:
     def cursor(self) -> int:
         """Monotonic within one run, and not durable across a restart."""
         return self._cursor
+
+    @property
+    def history_depth(self) -> int:
+        """How many log events the read window can hold, from the deque itself.
+
+        Published on `GET /v1/lane` so a consumer can size its polling against
+        the real bound rather than against a number in a document. Read off
+        `maxlen`, so a lane built with a different window says so instead of
+        repeating a constant.
+        """
+        return self._history.maxlen or 0
+
+    @property
+    def oldest(self) -> int | None:
+        """The lowest cursor still held, or None when the window is empty.
+
+        This is what makes an eviction visible. `since` cannot distinguish
+        "nothing followed your cursor" from "everything that followed it has
+        been evicted" -- both are an empty list -- so the caller compares
+        against this and says `reset`.
+        """
+        return self._history[0][0] if self._history else None
 
     def since(self, cursor: int) -> list[tuple[int, LaneEvent]]:
         """Everything still held whose cursor is greater than `cursor`."""

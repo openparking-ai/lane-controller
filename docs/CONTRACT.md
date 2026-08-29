@@ -60,6 +60,7 @@ states, in the same words, so one consumer can hold one policy for both.
     "closing_spacing_m": 1.5,
     "confirmation_window_seconds": 10.0
   },
+  "event_window_depth": 256,
   "capabilities": {
     "confirms_entry": true,
     "has_identity_service": true,
@@ -79,6 +80,12 @@ controller does one or the other, never both.
 geometry, because a second rendering is a second thing to go stale. Every value
 in it is a **per-site setting and an assumption** — nothing in this package
 measures a spacing.
+
+`event_window_depth` is how many events `GET /v1/lane/events` can still serve
+behind the current cursor. Fall further behind than this and you are told
+**`reset`**, not served a short page. It is published rather than described
+here because it is a property of *this* lane's window, and a document can only
+describe one lane's.
 
 ### The capability set
 
@@ -245,6 +252,14 @@ Where the `not_measured` signals live today, so nobody has to go looking:
   this list: a lane whose clock runs fast has its session opens and closes
   dead-lettered, and the money record loses them.
 
+`outbox_depth_growing` reads the outbox's PENDING DEPTH — every undelivered
+event, log entries and session actions alike — against a per-site threshold,
+`[lane] outbox_depth_threshold`, which defaults to **1000**. That threshold is a
+**setting and an assumption**, not a measurement: nothing here measures how deep
+a healthy lane's outbox gets. It is drawn well below the point at which the
+bounded log begins discarding entries, so the code reads `active` while a human
+can still act on it rather than after events have already been lost.
+
 ### `never_alarm`
 
 `never_alarm` and `caveat` come from one mapping (`contract.NEVER_ALARM`), so a
@@ -290,12 +305,29 @@ policy for both surfaces.
   process restarted and your saved position no longer refers to anything. An
   empty list without that flag would be indistinguishable from "nothing
   happened", which is how a consumer silently misses everything after a restart.
-- `dropped` is the lane's count of **log** events discarded because the bounded
-  log reached its limit. **Session actions are never dropped.** It is published
-  because a gap nobody knows about is worse than one that is counted.
+- `since` **behind the oldest event still held** also sets `reset`. The window
+  is bounded — `event_window_depth` on `GET /v1/lane` says by how much — and a
+  consumer that has fallen further behind than that would otherwise receive a
+  page with the evicted events simply absent from it, which looks exactly like
+  a complete one. The Vehicle ID service does not have to report this, because
+  its contract tells a consumer that needs guaranteed delivery to use push and
+  it has push. **This contract has no push path**, so the eviction is reported
+  here or it is not reported at all.
+- `dropped` is the lane's count of **log** events the OUTBOX discarded because
+  it reached its limit. That is a different queue with a different bound from
+  the read window above, and it is published because a gap nobody knows about
+  is worse than one that is counted.
+
+**This route serves LOG events.** Session actions — a session opened, a session
+closed — are not on it. They are the ledger's: they become
+`POST /lane/sessions/open` and `/close` on the platform this lane reports to,
+they carry the plate, and the platform is the durable record of them. What
+happened at the lane is answered here and by `GET /v1/lane/state`; who was in
+the vehicle is not on this contract at all.
 
 `detail` is opaque to this contract. It is whatever the lane recorded with the
-event, and a consumer ignores keys it does not recognise.
+event, and a consumer ignores keys it does not recognise. **No plate text goes
+in it**, on any route of this contract.
 
 ## Running it
 
@@ -307,7 +339,7 @@ Binds `127.0.0.1:8090`. **Local by design** — this is meant to run on the same
 device as the lane it describes.
 
 **Off loopback it refuses to start without a credential.** `--host` anything but
-loopback requires `--token-file`, and with a token every route requires
+loopback requires `--auth-token-file`, and with a token every route requires
 `Authorization: Bearer <token>` and answers `401` without it. The exposure that
 rule exists for is real: on a lane's own LAN this publishes where a vehicle was,
 when it was there, and what the lane decided about it.

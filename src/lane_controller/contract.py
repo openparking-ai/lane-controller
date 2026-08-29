@@ -157,6 +157,12 @@ class LaneDescription:
     direction: str
     geometry: dict
     capabilities: Capabilities
+    #: How many events `GET /v1/lane/events` can still serve behind the current
+    #: cursor. A consumer that falls further behind than this is told `reset`
+    #: rather than served a short page, and this is the number that says how
+    #: far "further behind" is. Published because it is a property of THIS
+    #: lane's window: a document could only describe one lane's.
+    event_window_depth: int = 0
     contract_version: int = CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -166,6 +172,11 @@ class LaneDescription:
             raise ValueError(f"direction must be 'entry' or 'exit', got {self.direction!r}")
         if not isinstance(self.capabilities, Capabilities):
             raise ValueError("capabilities must be a Capabilities")
+        if not isinstance(self.event_window_depth, int) or self.event_window_depth < 0:
+            raise ValueError(
+                f"event_window_depth must be a non-negative integer, "
+                f"got {self.event_window_depth!r}"
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -178,6 +189,7 @@ class LaneDescription:
             # the geometry is a second thing to go stale, and the record the
             # lane writes on every vehicle already carries this exact dict.
             "geometry": self.geometry,
+            "event_window_depth": self.event_window_depth,
             "capabilities": self.capabilities.to_dict(),
         }
 
@@ -536,10 +548,21 @@ class EventPage:
         happened", which is how a consumer silently misses everything after a
         restart.
 
-    `dropped` is the lane's own count of LOG events discarded because the
-    bounded log reached its limit. Session actions are never dropped. It is
-    published because a gap nobody knows about is worse than one that is
-    counted.
+    And one thing the Vehicle ID service does not have to do, because its
+    contract tells a consumer that needs guaranteed delivery to use push and it
+    HAS push:
+
+      * `since` behind the OLDEST event still held also sets `reset`. The
+        window is bounded -- `event_window_depth` on `GET /v1/lane` says by how
+        much -- and a consumer that falls further behind than that gets a page
+        with the evicted events simply absent from it, which looks exactly like
+        a complete one. There is no push path on this contract, so the eviction
+        is reported here or it is not reported at all.
+
+    `dropped` is the lane's own count of LOG events the OUTBOX discarded
+    because it reached its limit. That is a different queue with a different
+    bound, and it is published because a gap nobody knows about is worse than
+    one that is counted.
     """
 
     cursor: int
