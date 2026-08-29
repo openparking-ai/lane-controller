@@ -37,6 +37,20 @@ class Fallback(StrEnum):
     NO_PLATE_READ = "no_plate_read"
     UNKNOWN_VEHICLE = "unknown_vehicle"
     STALE_RULES = "stale_rules"
+    #: No read was obtained AT ALL: the identification engine was not reached,
+    #: did not answer in time, answered with something this build cannot read,
+    #: or was never asked because there was nothing to send it.
+    #:
+    #: A DEAD ENGINE IS NOT A MARGINAL READ. Both used to arrive here as
+    #: confidence 0.0 and leave as `low_confidence`, so an operator surface --
+    #: and the intercom agent that will read these codes -- could not tell a
+    #: driver whose plate needs wiping from a service that is switched off, and
+    #: would tell the second one to wipe their plate.
+    #:
+    #: WHICH failure is in the event detail, not in a second enum member: the
+    #: lane's response is the same for all of them (a human, never a guess) and
+    #: a member per cause would be a set of codes nobody can act on differently.
+    ENGINE_UNREACHABLE = "engine_unreachable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,11 +127,12 @@ def decide(
 ) -> Decision:
     """Turn an identification into a decision, or into an honest refusal.
 
-    The ordering here is the safety property. Presence is checked before
-    confidence, and confidence before the plate is ever used to look anything
-    up -- so nothing that was not there can be identified, and a low-confidence
-    read cannot match a rule by accident and open a barrier for the wrong
-    vehicle.
+    The ordering here is the safety property. Presence is checked first, then
+    whether a read was obtained at all, then confidence, and confidence before
+    the plate is ever used to look anything up -- so nothing that was not there
+    can be identified, a failure to identify cannot be reported as an unsure
+    identification, and a low-confidence read cannot match a rule by accident
+    and open a barrier for the wrong vehicle.
     """
     if identity.presence is False:
         # Note `is False`, not `not identity.presence`. The latter reads
@@ -127,6 +142,23 @@ def decide(
             outcome=Outcome.NO_VEHICLE,
             reason="no vehicle present; refusing to transact",
             identity=identity,
+        )
+
+    if identity.unavailable is not None:
+        # BEFORE the confidence comparison, and that position is the whole
+        # fix. Below this line `identity.confidence` is a number the engine
+        # produced; above it, it is the 0.0 that is left when there is no
+        # engine to have produced anything, and comparing it against a
+        # threshold answers a question nobody measured.
+        #
+        # The outcome is unchanged -- FALLBACK, a human, a driver at the
+        # barrier who still gets served. Only the REASON changes, and it
+        # changes from one that is wrong to one that is true.
+        return Decision(
+            outcome=Outcome.FALLBACK,
+            reason=f"no read was obtained: {identity.unavailable}",
+            identity=identity,
+            fallback=Fallback.ENGINE_UNREACHABLE,
         )
 
     if identity.confidence < confidence_threshold:

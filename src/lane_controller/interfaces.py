@@ -141,6 +141,10 @@ class VehicleIdentity:
     read it" are different events with opposite correct responses: the first
     must produce no transaction at all, the second must produce a ticket and a
     human.
+
+    `unavailable` is the third, and it is not folded into `confidence` either.
+    A read that was never obtained is not a read the engine was unsure about,
+    and the two used to arrive at the decision stage as the same number.
     """
 
     plate: str | None
@@ -156,6 +160,19 @@ class VehicleIdentity:
     #: behave exactly as it did before this field existed -- NOT refuse
     #: everybody.
     presence: bool | None = None
+    #: Why the lane has NO READ AT ALL, or None when it has one. This is the
+    #: third question, and it is as separate from the other two as they are
+    #: from each other: "nothing was there", "something was there and I could
+    #: not read it", and "nobody asked, or nobody answered".
+    #:
+    #: A `confidence` of 0.0 is what a failed request leaves behind, and it is
+    #: not a measurement -- the engine did not look at a plate and find it
+    #: marginal, the engine was not reached. Reading the two as one code tells
+    #: a driver at the barrier to wipe a plate while the identification service
+    #: is switched off. The string names WHICH failure; the constants are in
+    #: `vehicle_id_client`, and this is the only place that detail survives
+    #: once the exception has been logged and swallowed.
+    unavailable: str | None = None
 
 
 class VehicleIdentifier(Protocol):
