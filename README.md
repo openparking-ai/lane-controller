@@ -59,14 +59,6 @@ event behind it. It does not pick the most likely plate and open the gate.
 Confidence is checked *before* the plate is used to look anything up, so a
 low-confidence read cannot match a rule by accident.
 
-**A read that was never obtained is `ENGINE_UNREACHABLE`, not `LOW_CONFIDENCE`.**
-The identification engine being off, slow, or answering with something this
-build cannot read leaves a confidence of 0.0 behind, and 0.0 is below every
-threshold — so all four of those used to arrive as "the plate was hard to make
-out". They are a different event with a different repair, so they get their own
-code, checked before the threshold comparison, with which failure it was in the
-event detail. The outcome is the same either way: a fallback, and a human.
-
 ## Talking to the platform
 
 The lane syncs its rules from the platform and reports back to it, and does
