@@ -238,19 +238,48 @@ would hide which of those an operator is waiting for.
 
 Where the `not_measured` signals live today, so nobody has to go looking:
 
-- the arming and closing loop codes — the lane already writes an event per
-  vehicle (`arming_incomplete`, `entry_held` / `exit_held`); what does not exist
-  is the aggregation that turns a run of them into a fault;
-- the camera and reference codes — the identification engine's own
-  `GET /v1/health`, under `camera_faults`; this lane reads only
-  `threshold_applied` from that response;
-- `identity_service_degraded` — the same response's `status`;
+- `arming_loops_disagree` and `closing_loops_never_firing` — the lane already
+  writes an event per vehicle (`arming_incomplete`, `entry_held` / `exit_held`).
+  What does not exist is the aggregation that turns a RUN of them into a fault,
+  and nothing has measured how many in a row a run is. A threshold invented here
+  would be a number nobody measured, applied at every site;
+- `camera_feed_lost`, `lens_obstructed_or_dark` and `reference_not_recognised` —
+  the identification engine's own `GET /v1/health`, under `camera_faults`. That
+  field is a **count since that service started**, not a current state, and a
+  count is not a state: a camera that failed at 3am and was fixed at 4am reports
+  the same number for ever. Reading it as a state needs a rate over a window,
+  and what rate is a fault has not been measured either. So what is missing here
+  is a current-state SIGNAL, not a read of an existing one;
 - `lane_gone_quiet` — the platform writes `lane_devices.last_seen_at` on every
-  authenticated lane request and publishes it on no route;
-- `clock_skew_rejected` — the platform answers `409` and this lane counts it,
-  undifferentiated, with every other refusal. It is the most expensive code on
-  this list: a lane whose clock runs fast has its session opens and closes
-  dead-lettered, and the money record loses them.
+  authenticated lane request and publishes it on `GET /garages/:id/devices`.
+  This lane is not the thing that can read it: a lane that has gone quiet is
+  quiet, so the fault is only visible from the other end, and it is derived by
+  whatever watches both.
+
+Every code this build calls `not_measured` is named above, and no code it
+measures is — `tests/test_lane_contract.py` requires both directions against
+`contract.SOURCES`, so the list cannot fall behind the code in either.
+
+`identity_service_degraded` reads the identification engine's own `status`,
+which that service sets to `degraded` when a read was **lost** or when its queue
+held a line it could not read — the two cases where a record was answered and
+then existed nowhere. This lane asks the service when it is asked, rather than
+remembering the answer from the last vehicle: at a lane with no arrivals since
+midnight, the memory is the whole night old. A service that cannot be read
+answers `unknown` here, never `ok`.
+
+`clock_skew_rejected` reads the platform's own name for the refusal. A `409` is
+the platform's terminal refusal and seven different conditions produce one; six
+are ordinary and the seventh means every session open and close this lane sends
+is being **dead-lettered**, with the barrier still working and the money record
+silently losing the stay. The platform names each refusal in a `code` field, so
+this lane counts the named skew separately from every other conflict.
+
+An unnamed conflict counts as **neither**. A platform that predates that field
+refuses a skew exactly as it refuses everything else, so this code answers
+`unknown` after one — never `ok`. It also answers `unknown` on a lane that has
+attempted no platform call at all: nothing was sent, so nothing could have been
+refused, and a clock nobody has had checked is not a clock found correct.
 
 `outbox_depth_growing` reads the outbox's PENDING DEPTH — every undelivered
 event, log entries and session actions alike — against a per-site threshold,
@@ -361,6 +390,8 @@ There is no flag that turns any of that off.
   configuration file that exists today for a field nothing yet reads.
 - **No display.** `has_display` is `false` everywhere, because there is no
   display seam in this package.
-- **Health states for most codes.** Three are derived; the rest answer
-  `unknown` and say why in `source`. A monitor that turns these into alerts is
-  a separate process and is not this.
+- **Health states for most codes.** Some are derived; the rest answer
+  `unknown` and say why in `source`, which is the field that says which — a
+  count here would be a second copy of `contract.SOURCES` and the copy is the
+  one that goes stale. A monitor that turns these into alerts is a separate
+  process and is not this.

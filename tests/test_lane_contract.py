@@ -8,6 +8,7 @@ guards and requires this file to go red.
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import urllib.error
@@ -51,6 +52,7 @@ from lane_controller.contract import (
 )
 from lane_controller.events import DEFAULT_HISTORY, SESSION_KINDS
 from lane_controller.interfaces import ClosingSequence, Unavailable
+from lane_controller.platform_client import PlatformClient
 from lane_controller.service import (
     ACT_ROUTES,
     READ_ROUTES,
@@ -69,6 +71,7 @@ from lane_controller.simulated import (
     StubVehicleIdentifier,
 )
 from lane_controller.sync import SESSION_OPEN as SESSION_OPEN_KIND
+from lane_controller.sync import PlatformTransport
 from lane_controller.vehicle_id_client import VehicleIdClient
 from serving import serving
 
@@ -347,8 +350,9 @@ def test_reference_not_recognised_is_never_an_alarm():
 def test_the_measured_codes_actually_move():
     """A `measured` source that never changes state is not a measurement.
 
-    Each of the three carries its own control: the condition it names is
-    created, and the state must follow it.
+    Each carries its own control: the condition it names is created, and the
+    state must follow it. The two this round promoted have their own section
+    below, because each needs a service or a platform to answer it.
     """
     service = LaneService(full_lane())
     codes = lambda: {e["code"]: e for e in service.health().to_dict()["codes"]}  # noqa: E731
@@ -1218,3 +1222,313 @@ def test_the_plate_region_is_still_on_the_events_route_and_this_round_did_not_de
     )
     # And the plate itself is still absent, which is what guarantee 8 holds.
     assert PLATE_ON_THE_WIRE not in json.dumps(page)
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE 11 — the two codes this round CLOSED, and the ones it did not
+#
+# Closing a `not_measured` code is reading something that already exists.
+# `identity_service_degraded` is the identification service's own `status`;
+# `clock_skew_rejected` is the platform's own name for the refusal it already
+# sends. Neither invents a signal, and the codes this round could NOT close are
+# fenced by the test at the end of this section rather than left to a sentence.
+# ---------------------------------------------------------------------------
+
+
+class _AnIdentifierWithHealth:
+    """An identifier that publishes a health route, as the Vehicle ID one does.
+
+    Not a `VehicleIdClient`: the service asks by CAPABILITY, so a third party's
+    identifier publishing the same route is read exactly the way ours is. If
+    this had to be our class, the derivation would be a special case for us.
+    """
+
+    def __init__(self, body):
+        self.body = body
+
+    def identify(self, frames):
+        return VehicleIdentity(plate=None, confidence=0.0)
+
+    def identity_health(self):
+        return self.body
+
+
+def _health_of(controller):
+    return {e["code"]: e for e in LaneService(controller).health().to_dict()["codes"]}
+
+
+def test_the_derived_codes_are_exactly_the_ones_sources_calls_measured():
+    """The half of the invariant `HealthEntry` cannot see.
+
+    `HealthEntry` refuses a code that claims `ok` without being `measured`. The
+    reverse has no guard: a code promoted in `SOURCES` that nothing derives
+    answers `unknown` for ever, and `unknown` from a code labelled `measured`
+    reads as "asked, and could not tell" rather than as "never wired up".
+
+    Both sides are derived here -- the label from `SOURCES`, the derivation from
+    the service -- so neither can be a hand-written list of the other.
+    """
+    derived = set(LaneService(full_lane()).derived_states())
+    labelled = {code for code, source in SOURCES.items() if source is Source.MEASURED}
+
+    assert derived == labelled, (
+        f"derived but not labelled measured: {sorted(c.value for c in derived - labelled)}; "
+        f"labelled measured but not derived: {sorted(c.value for c in labelled - derived)}"
+    )
+    # The control: the comparison is not two empty sets agreeing.
+    assert derived
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"status": "degraded"}, "active"),
+        ({"status": "ok"}, "ok"),
+        # Unreadable, and unreadable is NOT a clean bill of health. Whether the
+        # service is unreachable is a different code from a different signal.
+        (None, "unknown"),
+        # It answered, and said nothing this build recognises.
+        ({}, "unknown"),
+        ({"status": "probably fine"}, "unknown"),
+        # A body that is not an object at all.
+        ("degraded", "unknown"),
+    ],
+)
+def test_identity_service_degraded_is_the_engines_own_status(body, expected):
+    """A straight read of the field that service already publishes.
+
+    `degraded` is set when a read was LOST -- it could not be written to the
+    push queue at all -- or when the queue held a line the engine could not
+    read. Both are records that were answered and then existed nowhere, and
+    until this round nothing on this side listened.
+    """
+    controller = full_lane()
+    controller.identifier = _AnIdentifierWithHealth(body)
+
+    entry = _health_of(controller)[MalfunctionCode.IDENTITY_SERVICE_DEGRADED.value]
+    assert entry["state"] == expected
+    assert entry["source"] == Source.MEASURED.value
+
+
+def test_an_identifier_with_no_health_route_leaves_the_code_unknown():
+    """The control for the case set above: the answer is not unconditional.
+
+    A lane identifying some other way has no such route to ask, and `unknown` is
+    the honest answer. Without this, a derivation hard-wired to `ok` would
+    satisfy every row of the table above that expects `ok`.
+    """
+    controller = full_lane()
+    assert not hasattr(controller.identifier, "identity_health")
+
+    entry = _health_of(controller)[MalfunctionCode.IDENTITY_SERVICE_DEGRADED.value]
+    assert entry["state"] == "unknown"
+
+
+# --- the platform's named refusal ------------------------------------------
+
+
+def _refusing_transport(status=409, body='{"error": "no", "code": "stale_exit"}'):
+    """A transport whose platform refuses everything, with a body we choose.
+
+    Built on the REAL `PlatformClient` and the real `PlatformTransport`, so the
+    refusal travels the path a refusal travels: `urllib` raises `HTTPError`, the
+    client classifies it and parses the body, and `_guarded` counts it. A fake
+    that raised `PlatformRejected` directly would skip the parsing, which is the
+    part this round added.
+    """
+
+    def opener(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, status, "refused", {}, io.BytesIO(body.encode("utf-8"))
+        )
+
+    return PlatformTransport(PlatformClient("http://platform.invalid", "t", opener=opener))
+
+
+def _a_lane_that_talked_to_a_platform(transport):
+    """A lane that has SENT something, so its outbox has attempted a delivery."""
+    controller = a_lane_that_saw_a_car(events=EventQueue(transport=transport))
+    controller.events.flush()
+    return controller
+
+
+def test_clock_skew_rejected_reads_the_platforms_own_name_for_the_refusal():
+    """`active` on the named skew, `ok` on a named refusal that is not one.
+
+    A 409 is the platform's terminal refusal and seven conditions produce one.
+    Six are ordinary. The seventh dead-letters every session open and close this
+    lane sends -- the barrier still works, the driver still gets in, and the
+    money record silently loses the stay.
+    """
+    skew = _a_lane_that_talked_to_a_platform(
+        _refusing_transport(body='{"error": "ahead of the clock", "code": "clock_skew"}')
+    )
+    assert _health_of(skew)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "active"
+    # One vehicle produces more than one platform call -- a session open and a
+    # batched log post -- and this refusal answers both, so the count is
+    # "at least one" rather than a number that depends on how many events a
+    # lane happened to have queued.
+    assert skew.events.transport.skew_rejected > 0
+
+    # The control, and the whole point of the field: another 409 is not this
+    # one. Without this row a code hard-wired to `active` on any refusal would
+    # pass the assertion above.
+    other = _a_lane_that_talked_to_a_platform(
+        _refusing_transport(body='{"error": "stale exit", "code": "stale_exit"}')
+    )
+    assert _health_of(other)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "ok"
+    assert other.events.transport.skew_rejected == 0
+    # It was still dead-lettered. `ok` here is about the CLOCK, not about the
+    # item, and the code that counts the loss is a different one.
+    assert other.events.transport.rejected > 0
+
+
+def test_a_conflict_the_platform_did_not_name_is_unknown_and_never_ok():
+    """A platform too old to name its refusals refuses a skew like everything else.
+
+    So the absence of a name may not be read as "not a skew". This is the row
+    that decides whether the code is honest on the deployment where the failure
+    is invisible, and `ok` there would be a healthy clock reported by something
+    that cannot see the clock.
+    """
+    unnamed = _a_lane_that_talked_to_a_platform(_refusing_transport(body='{"error": "no"}'))
+
+    assert _health_of(unnamed)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "unknown"
+    assert unnamed.events.transport.conflicts_unnamed > 0
+    assert unnamed.events.transport.skew_rejected == 0
+
+
+def test_a_refusal_that_is_not_a_conflict_does_not_muddy_the_clock():
+    """A 400 is a malformed request. It cannot be a skew and is not counted.
+
+    Without the status check, an ordinary bad request would be an unnamed
+    conflict, and the code would answer `unknown` -- a clock reported as
+    unmeasurable because a plate was missing from one call.
+    """
+    bad_request = _a_lane_that_talked_to_a_platform(
+        _refusing_transport(status=400, body='{"error": "plate is required"}')
+    )
+
+    assert _health_of(bad_request)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "ok"
+    assert bad_request.events.transport.conflicts_unnamed == 0
+    assert bad_request.events.transport.rejected > 0
+
+
+def test_the_code_comes_from_the_field_and_not_from_the_message():
+    """The message says `clock_skew` and the field says otherwise. The field wins.
+
+    Every failure classification in this package is decided from a structure
+    rather than from message text, because a message gets reworded and a check
+    keyed on its words goes quietly wrong. This is that rule, asserted where it
+    is newest.
+    """
+    lying = _a_lane_that_talked_to_a_platform(
+        _refusing_transport(body='{"error": "clock_skew clock skew!", "code": "stale_exit"}')
+    )
+
+    assert _health_of(lying)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "ok"
+    assert lying.events.transport.skew_rejected == 0
+
+
+def test_a_body_that_is_not_json_is_an_unnamed_conflict_and_never_an_exception():
+    """This parse runs on the failure path of every platform call.
+
+    A parse error here would replace a refusal the lane knows how to survive
+    with an exception it does not -- on the path that runs after the barrier has
+    already opened.
+    """
+    for body in ("<html>502 nope</html>", "", "[1, 2, 3]", '{"code": 7}'):
+        lane = _a_lane_that_talked_to_a_platform(_refusing_transport(body=body))
+        assert _health_of(lane)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "unknown"
+        assert lane.events.transport.conflicts_unnamed > 0
+
+
+def test_a_lane_that_has_attempted_nothing_has_not_measured_its_clock():
+    """Two lanes that have never been refused, and they are not the same lane.
+
+    One has sent nothing at all: nothing could have been refused, so nothing was
+    measured. `ok` there is a confident negative about a question nobody asked,
+    and it is the answer this code would have given without the attempt counter.
+    """
+    # Built and never run, so nothing has been handed to the platform at all.
+    # `a_lane_that_saw_a_car` flushes as part of handling the vehicle, which is
+    # the other lane in this test.
+    silent = full_lane(events=EventQueue(transport=_refusing_transport()))
+    assert silent.events.transport.attempted == 0
+    assert _health_of(silent)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "unknown"
+
+    # And a lane with no platform at all: nothing to be refused by.
+    standalone = full_lane()
+    assert standalone.events.transport is None
+    assert _health_of(standalone)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "unknown"
+
+
+# --- the deletion, proven ---------------------------------------------------
+
+
+def _not_measured_paragraph() -> str:
+    """The document's list of where the `not_measured` signals live.
+
+    The heading sentence and the bullet list under it -- two blocks, because a
+    Markdown list is separated from its own lead-in by a blank line and taking
+    only as far as the first one would return the heading and nothing else.
+    """
+    text = CONTRACT_DOC.read_text(encoding="utf-8")
+    marker = "Where the `not_measured` signals live today"
+    blocks = text[text.index(marker) :].split("\n\n")
+    return "\n\n".join(blocks[:2])
+
+
+def test_the_documents_not_measured_list_is_exactly_what_sources_says():
+    """Both directions, derived from `SOURCES`, against the list a reader uses.
+
+    The list exists to tell a reader what is waiting to be READ rather than
+    built. A code still on it after the read has been written sends somebody to
+    write code that is already there; a code missing from it is a signal nobody
+    can find. Both are the kind of stale sentence that survives every review,
+    because each was true when it was written.
+
+    Naming every code in the list rather than describing them in groups is what
+    makes this mechanical -- a group heading cannot be compared to an enum.
+    """
+    paragraph = _not_measured_paragraph()
+    named = {code for code in MalfunctionCode if code.value in paragraph}
+    listed = {code for code, source in SOURCES.items() if source is Source.NOT_MEASURED}
+
+    assert named == listed, (
+        f"named in docs/CONTRACT.md but not `not_measured`: "
+        f"{sorted(c.value for c in named - listed)}; "
+        f"`not_measured` but not named: {sorted(c.value for c in listed - named)}"
+    )
+    # The control: neither set is empty, so this is not two blanks agreeing.
+    assert named and listed
+
+
+def test_the_codes_this_round_did_not_close_are_still_unmeasured_and_say_why():
+    """A FACT, pinned so it goes red the day it changes. Not a guarantee.
+
+    Four codes were candidates this round and none of them could be closed by a
+    READ, each for a reason that is in the document beside it:
+
+      * `camera_feed_lost` and `lens_obstructed_or_dark` -- the engine publishes
+        `camera_faults`, which is a COUNT SINCE START. A count is not a state: a
+        camera that failed at 3am and was fixed at 4am reports the same number
+        for ever. Deriving `active` from it would need a rate over a window, and
+        nobody has measured what rate is a fault.
+      * `arming_loops_disagree` and `closing_loops_never_firing` -- the lane
+        writes an event per vehicle already; the fault is a RUN of them, and
+        nobody has measured how many in a row a run is.
+
+    If one of these is closed, this test is what tells you to come and say so.
+    """
+    still_open = {
+        MalfunctionCode.CAMERA_FEED_LOST,
+        MalfunctionCode.LENS_OBSTRUCTED_OR_DARK,
+        MalfunctionCode.ARMING_LOOPS_DISAGREE,
+        MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING,
+    }
+    for code in still_open:
+        assert SOURCES[code] is Source.NOT_MEASURED, (
+            f"{code.value} changed source. That is a decision -- record why it could be read, "
+            "and update this test with it, rather than letting it move"
+        )

@@ -209,12 +209,33 @@ class VehicleIdClient:
         engine actually deployed instead of a number copied into a config file
         months ago. None when the service cannot be reached.
         """
-        try:
-            body = self._open_health(f"{self.endpoint}/v1/health")
-        except Exception as exc:
-            log.warning("could not read the vehicle-id operating point: %s", exc)
+        body = self.identity_health()
+        if body is None:
             return None
         return body.get("threshold_applied")
+
+    def identity_health(self) -> dict | None:
+        """The identification service's whole `GET /v1/health`, or `None`.
+
+        `None` means the response could not be obtained or could not be read,
+        and it is deliberately the SAME answer for both: a consumer of this
+        method has nothing to say either way, and the code that says a service
+        is unreachable is a different one derived from a different signal.
+
+        Unauthenticated by that contract's own decision -- the route carries no
+        plate and no image, and requiring the read credential to ask whether a
+        process is alive is that credential in one more place.
+
+        Read WHOLE rather than reduced to the one field a caller wants. Two
+        callers now read two different fields off it, and returning a
+        pre-digested value would mean a second method, a second request and two
+        answers about one moment.
+        """
+        try:
+            return self._open_health(f"{self.endpoint}/v1/health")
+        except Exception as exc:
+            log.warning("could not read vehicle-id health: %s", exc)
+            return None
 
     def _open_health(self, url: str) -> dict:
         with urllib.request.urlopen(url, timeout=self.timeout) as response:

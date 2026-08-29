@@ -11,7 +11,12 @@ from datetime import UTC, datetime
 
 from .decision import DecisionCache, Rule
 from .events import EventTransport, LaneEvent
-from .platform_client import PlatformClient, PlatformRejected, PlatformUnreachable
+from .platform_client import (
+    CLOCK_SKEW_CODE,
+    PlatformClient,
+    PlatformRejected,
+    PlatformUnreachable,
+)
 
 log = logging.getLogger(__name__)
 
@@ -148,6 +153,20 @@ class PlatformTransport(EventTransport):
     def __init__(self, client: PlatformClient) -> None:
         self._client = client
         self.rejected = 0
+        #: Every platform call this transport has ATTEMPTED. Without it, a lane
+        #: that has never sent anything and a lane whose every send was accepted
+        #: are the same number, and `clock_skew_rejected` would answer `ok` --
+        #: a confident negative about a question nobody asked.
+        self.attempted = 0
+        #: Refusals whose named reason was the platform's clock-skew code. A
+        #: lane whose clock runs fast has its session opens and closes
+        #: dead-lettered, and the money record loses them.
+        self.skew_rejected = 0
+        #: CONFLICTS the platform did not name. A platform older than the field
+        #: answers every refusal this way, so this is the count that stops a
+        #: missing name being read as "not a skew". Separate from `rejected`,
+        #: which counts every terminal refusal whatever it was.
+        self.conflicts_unnamed = 0
         self.last_close: dict | None = None
 
     def send(self, events: list[LaneEvent]) -> bool:
@@ -240,9 +259,39 @@ class PlatformTransport(EventTransport):
         it. A terminal refusal is the difference between one lost item and a
         lane that never reports again.
         """
+        self.attempted += 1
         try:
             return call()
         except PlatformRejected as err:
             self.rejected += 1
+            self._classify(err)
             log.error("platform refused an item, dropping it: %s", err)
             return None
+
+    def _classify(self, err: PlatformRejected) -> None:
+        """Separate the one refusal that is a MALFUNCTION from the ordinary ones.
+
+        A 409 is the platform's terminal refusal and seven different conditions
+        produce one. Six are ordinary -- a wrong lane direction, a re-used event
+        id, a stale exit. The seventh is a clock skew, and it means every
+        session open and close this lane sends is being dropped: the barrier
+        still works, the driver still gets in, and the money record silently
+        loses the stay.
+
+        Only a 409 is looked at. A 400 is a malformed request and a 404 is a
+        session that is not there; neither can be a skew, and counting them here
+        would make an ordinary bad request read as a clock this build could not
+        classify.
+
+        An unnamed conflict is counted SEPARATELY and is never treated as "not a
+        skew". A platform that predates the `code` field refuses a skew exactly
+        as it refuses everything else, so reading the absence as a negative
+        would report a healthy clock on precisely the deployment where the
+        failure is invisible.
+        """
+        if err.status != 409:
+            return
+        if err.code == CLOCK_SKEW_CODE:
+            self.skew_rejected += 1
+        elif err.code is None:
+            self.conflicts_unnamed += 1
