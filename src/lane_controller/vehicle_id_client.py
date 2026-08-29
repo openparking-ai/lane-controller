@@ -126,7 +126,7 @@ class VehicleIdClient:
             # guess a decision the engine already made against measured data.
             return replace(NO_IDENTITY, presence=read.presence)
 
-        # The lane's own event log carries a plate and a confidence and nothing
+        # The lane's own event log carries a confidence and nothing
         # else, so without this line a wrong open has no read_id to trace, no
         # weights to blame and no operating point to check. It costs one log
         # record per vehicle and it is the only provenance that survives the

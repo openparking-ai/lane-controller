@@ -165,18 +165,18 @@ def decide(
         if cache.default_action == "allow":
             return Decision(
                 outcome=Outcome.ALLOW,
-                reason=f"no rule for plate {identity.plate}; garage default is allow",
+                reason="no rule for plate; garage default is allow",
                 identity=identity,
             )
         if cache.default_action == "deny":
             return Decision(
                 outcome=Outcome.DENY,
-                reason=f"no rule for plate {identity.plate}; garage default is deny",
+                reason="no rule for plate; garage default is deny",
                 identity=identity,
             )
         return Decision(
             outcome=Outcome.FALLBACK,
-            reason=f"no rule for plate {identity.plate}",
+            reason="no rule for plate",
             identity=identity,
             fallback=Fallback.UNKNOWN_VEHICLE,
         )
@@ -184,14 +184,14 @@ def decide(
     if not rule.allow:
         return Decision(
             outcome=Outcome.DENY,
-            reason=f"plate {identity.plate} is denied by rule",
+            reason="plate is denied by rule",
             identity=identity,
             rate_plan=rule.rate_plan,
         )
 
     return Decision(
         outcome=Outcome.ALLOW,
-        reason=f"plate {identity.plate} allowed by rule",
+        reason="plate allowed by rule",
         identity=identity,
         rate_plan=rule.rate_plan,
     )

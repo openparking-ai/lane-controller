@@ -13,6 +13,8 @@ one, and one that can quietly stop running is not one either.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from lane_controller import (
@@ -23,8 +25,10 @@ from lane_controller import (
     LaneController,
     LoopConfig,
     Outcome,
+    Rule,
     VehicleIdentity,
 )
+from lane_controller.events import SESSION_KINDS
 from lane_controller.interfaces import ClosingLoops, ClosingSequence
 from lane_controller.simulated import (
     CannedCameraFeed,
@@ -54,7 +58,8 @@ def build(
     identities=None,
     second_loop_occupied: bool = True,
     window: float = WINDOW,
-    default_action: str = "allow",
+    default_action: str | None = "allow",
+    rules=(),
     loops_impl: ClosingLoops | None = None,
     clock=None,
 ):
@@ -79,7 +84,7 @@ def build(
         ),
     )
     cache = DecisionCache()
-    cache.load([], default_action=default_action)
+    cache.load(list(rules), default_action=default_action)
     vend = RecordingVendOutput()
     if loops_impl is not None:
         loops = loops_impl
@@ -482,3 +487,93 @@ def test_the_same_unmeasured_presence_with_a_real_car_opens_exactly_one_session(
     assert vend.vend_count == 1
     assert kinds(controller).count(SESSION_OPEN) == 1
     assert detail(controller, SESSION_OPEN)["entry_confirmation"] == CONFIRMED
+
+
+# ---------------------------------------------------------------------------
+# The event log carries no plate text.
+#
+# `events` is append-only by grant on the platform, so the retention purge
+# cannot reach anything written into `events.detail`. A plate put there is
+# permanent. `test_controller.py` already asserts this for `arming_rejected`;
+# this asserts it for every OTHER kind the lane can put on that queue.
+#
+# The kind list is DERIVED, not typed: everything the queue does not treat as a
+# session action is a log event, and `SESSION_KINDS` is the one place that says
+# which is which. A kind added later is covered without this test being edited.
+#
+# The session actions are excluded because they are not log events at all: they
+# become POST /lane/sessions/open and /close, whose plate is the session row's
+# plate. Nothing they carry is written to `events.detail`.
+# ---------------------------------------------------------------------------
+
+PLATE_IN_THE_LOG = "PLATETEXT1"
+
+
+def _log_events(controller):
+    """Every queued event that is NOT a session action, per SESSION_KINDS."""
+    return [e for e in list(controller.events._queue) if e.kind not in SESSION_KINDS]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "entry_confirmed",
+        "entry_backed_out",
+        "entry_held",
+        "entry_unconfirmable",
+        "exit_confirmed",
+        "exit_held",
+        "arming_incomplete",
+        "low_confidence",
+        "no_plate_read",
+        "default_allow",
+        "default_deny",
+        "unknown_vehicle",
+        "allowed_by_rule",
+        "denied_by_rule",
+    ],
+)
+def test_no_log_event_carries_plate_text(case):
+    """One run per branch that reaches the log, and the plate is in none of them.
+
+    The last five are the DECISION branches. `Decision.reason` is written into
+    `decision`, `vended` and `fallback_needs_human` detail, so every branch that
+    composes a reason is a site for this, not only the `plate=` keywords.
+    """
+    seen = VehicleIdentity(plate=PLATE_IN_THE_LOG, confidence=0.97, presence=True)
+    allow_rule = Rule(plate=PLATE_IN_THE_LOG, allow=True, rate_plan="monthly")
+    deny_rule = Rule(plate=PLATE_IN_THE_LOG, allow=False)
+    settings = {
+        "entry_confirmed": dict(crossings=[(ClosingSequence.FORWARD, 3.0)]),
+        "entry_backed_out": dict(crossings=[(ClosingSequence.REVERSE, 3.0)]),
+        "entry_held": dict(crossings=[]),
+        "entry_unconfirmable": dict(closing_loops=0),
+        "exit_confirmed": dict(direction="exit", crossings=[(ClosingSequence.FORWARD, 3.0)]),
+        "exit_held": dict(direction="exit", crossings=[]),
+        "arming_incomplete": dict(arming_loops=2, second_loop_occupied=False),
+        "low_confidence": dict(
+            identities=[VehicleIdentity(plate=PLATE_IN_THE_LOG, confidence=0.10, presence=True)]
+        ),
+        "no_plate_read": dict(
+            identities=[VehicleIdentity(plate=None, confidence=0.0, presence=True)]
+        ),
+        "default_allow": dict(default_action="allow"),
+        "default_deny": dict(default_action="deny"),
+        "unknown_vehicle": dict(default_action=None),
+        "allowed_by_rule": dict(rules=[allow_rule]),
+        "denied_by_rule": dict(rules=[deny_rule]),
+    }[case]
+    settings.setdefault("identities", [seen])
+    settings.setdefault("crossings", [(ClosingSequence.FORWARD, 3.0)])
+    controller, _, _ = build(**settings)
+
+    controller.run_once()
+
+    logged = _log_events(controller)
+    assert logged, f"{case} produced no log events, so this asserts nothing"
+    for event in logged:
+        rendered = json.dumps(event.as_dict()["detail"], default=str)
+        assert PLATE_IN_THE_LOG not in rendered, (
+            f"{event.kind} put plate text in events.detail, which the purge cannot reach: "
+            f"{rendered}"
+        )
