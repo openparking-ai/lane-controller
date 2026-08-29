@@ -25,7 +25,7 @@ class LoopConfig:
     """The lane's loop geometry: how many loops there are and how far apart.
 
     EVERY VALUE HERE IS A PER-SITE SETTING AND AN ASSUMPTION. Nothing in this
-    package measures a spacing or a crossing time, and nothing here is a
+    package measures a spacing, and nothing here is a
     constant. They are published with the events they govern, under the key
     `geometry_assumed`, so a reader of the record cannot mistake them for
     something this software established.

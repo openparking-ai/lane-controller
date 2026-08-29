@@ -41,7 +41,7 @@ vend_pulse_ms = 500
 # second window.
 #
 # EVERY VALUE HERE IS A PER-SITE SETTING AND AN ASSUMPTION -- nothing in this
-# package measures a spacing or a crossing time, and none of these is a
+# package measures a spacing, and none of these is a
 # constant. They are published with the events they govern, under
 # `geometry_assumed`, so nobody reading the record can mistake them for
 # something that was measured here.

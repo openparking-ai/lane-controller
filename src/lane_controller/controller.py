@@ -33,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .config import LaneConfig
+from .contract import TransitState
 from .decision import Decision, DecisionCache, Outcome, decide
 from .events import EventQueue
 from .interfaces import (
@@ -174,6 +175,19 @@ class LaneController:
         # Injected rather than reached for, so a lane can be built with no
         # platform at all and the tests need no network.
         self.session_lookup = session_lookup
+        # THE READ SIDE, and it is deliberately nothing more than this. The
+        # contract publishes the last decision and the current transit, and
+        # both live here, in memory, for exactly as long as this process does.
+        #
+        # No state store was added and none is intended: a restart returns
+        # `None` and `TransitState.NONE`, and `GET /v1/lane/state` says so
+        # honestly rather than reporting the last thing it happens to remember.
+        self.last_decision: Decision | None = None
+        self.last_decision_at: str | None = None
+        self.last_read_ref: str | None = None
+        self.last_cause: str | None = None
+        self.transit_state: str = TransitState.NONE.value
+        self.transit_since: str | None = None
 
     def handle_arrival(self) -> Decision:
         """One vehicle, from arming to vend. Assumes the loop has already armed."""
@@ -205,6 +219,14 @@ class LaneController:
             fallback=decision.fallback.value if decision.fallback else None,
             rate_plan=decision.rate_plan,
         )
+        # Held so the read contract can publish it. Taken here rather than
+        # reconstructed from the event queue, which `flush()` empties: a
+        # consumer asking what the lane last decided must not get a different
+        # answer depending on whether the platform happened to be reachable.
+        self.last_decision = decision
+        self.last_decision_at = to_iso(self._clock())
+        self.last_read_ref = identity.read_ref
+        self.last_cause = identity.unavailable.value if identity.unavailable else None
 
         if decision.should_vend:
             self.vend.vend(decision.reason)
@@ -306,6 +328,17 @@ class LaneController:
         """Both arming loops occupied together, or a lane that has only one."""
         return loop_b is None or loop_b.is_occupied()
 
+    def _transit(self, state: TransitState, at: str) -> None:
+        """Move the published transit, beside the event that says the same thing.
+
+        One call per outcome and never a shared one, for the reason every other
+        name in this file is unshared: an entry that was backed out of and one
+        that was merely never confirmed are different facts, and a helper that
+        collapsed them would be the first place they got confused.
+        """
+        self.transit_state = state.value
+        self.transit_since = at
+
     def _settle_transit(self, identity, at: str) -> None:
         """Record the pending entry, then let the closing loops decide its fate."""
         lane = self.config.lane_id
@@ -319,6 +352,7 @@ class LaneController:
             at=at,
             geometry_assumed=geometry,
         )
+        self._transit(TransitState.PENDING, at)
 
         if self.closing_loops is None:
             # No closing loops at this site, so nothing here can confirm or
@@ -333,6 +367,7 @@ class LaneController:
                 at=at,
                 geometry_assumed=geometry,
             )
+            self._transit(TransitState.UNCONFIRMABLE, at)
             self._record_session(identity, at, confirmation=UNCONFIRMABLE)
             return
 
@@ -353,6 +388,7 @@ class LaneController:
             self.events.record(
                 names.confirmed, lane, reason=REASON_FORWARD, at=at, geometry_assumed=geometry
             )
+            self._transit(TransitState.CONFIRMED, at)
             self._record_session(identity, at, confirmation=CONFIRMED)
             return
 
@@ -365,6 +401,7 @@ class LaneController:
             self.events.record(
                 names.reversed_out, lane, reason=REASON_REVERSE, at=at, geometry_assumed=geometry
             )
+            self._transit(TransitState.BACKED_OUT, at)
             return
 
         # No confirmation inside the window: nothing crossed, or a FORWARD
@@ -383,6 +420,7 @@ class LaneController:
         self.events.record(
             names.held, lane, reason=REASON_WINDOW_ELAPSED, at=at, geometry_assumed=geometry
         )
+        self._transit(TransitState.HELD, at)
         if self.config.direction == "exit":
             # AN EXIT IS THE OTHER WAY ROUND, and this is the one asymmetry in
             # the file. The vend at an exit IS the payment moment and the

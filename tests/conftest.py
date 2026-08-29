@@ -322,3 +322,146 @@ def _break_the_fallback_cause(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_FALLBACK_CAUSE mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the lane-contract fail-control.
+#
+# scripts/contract_fail_control.py sets BREAK_LANE_CONTRACT and requires the
+# contract suite to FAIL. Each mode breaks exactly one property the contract
+# exists to have -- the geometry being the lane's own, the health table being
+# complete, `unknown` not being `ok`, the read-only sweep, the derived
+# fallback, the cursor's reset flag -- so a control that passes says the suite
+# measures that property and not something beside it.
+#
+# The stub's own breaks live in `tests/third_party_lane/lane.py` under
+# BREAK_THIRD_PARTY_LANE, because a fixture that cannot be broken is a fixture
+# that measures nothing.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_lane_contract(monkeypatch):
+    mode = os.environ.get("BREAK_LANE_CONTRACT")
+    if not mode:
+        return
+
+    from lane_controller import contract as contract_module
+    from lane_controller import service as service_module
+    from lane_controller.config import LoopConfig
+    from lane_controller.contract import (
+        Capabilities,
+        HealthEntry,
+        HealthState,
+        LaneDescription,
+        LaneHealth,
+        MalfunctionCode,
+    )
+
+    if mode == "geometry_copy":
+        # The service renders its own geometry instead of publishing the
+        # lane's. Identical for a default lane and wrong for every other one,
+        # which is exactly how a second copy fails: not at once.
+        def copied(self):
+            return LaneDescription(
+                lane_id=self.controller.config.lane_id,
+                site_id=self.controller.config.site_id,
+                direction=self.controller.config.direction,
+                geometry=LoopConfig().as_published(),
+                capabilities=self.capabilities(),
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "describe", copied)
+
+    elif mode == "drop_code":
+        # One code left out of the payload. A consumer cannot tell an absent
+        # code from a healthy one, which is the whole reason the set is closed.
+        def short(self):
+            return LaneHealth(
+                entries=tuple(
+                    HealthEntry(code=code.value, state=HealthState.UNKNOWN.value)
+                    for code in list(MalfunctionCode)[:-1]
+                )
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "health", short)
+
+    elif mode == "unknown_is_ok":
+        # The invariant removed at the seam that enforces it AND at the seam
+        # that produces it: a code nothing measures reports a clean bill of
+        # health. This is "wrong silently" in one line.
+        def unchecked(self) -> None:
+            pass
+
+        monkeypatch.setattr(HealthEntry, "__post_init__", unchecked)
+
+        def cheerful(self):
+            return LaneHealth(
+                entries=tuple(
+                    HealthEntry(code=code.value, state=HealthState.OK.value)
+                    for code in MalfunctionCode
+                )
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "health", cheerful)
+
+    elif mode == "plant_post":
+        # A route that changes something, planted on the handler. The read-only
+        # sweep must find it -- this is the positive control for the guarantee
+        # that keeps the act surface a later round.
+        def do_POST(self):  # noqa: N802, N807
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        monkeypatch.setattr(service_module._Handler, "do_POST", do_POST)
+        monkeypatch.setattr(service_module, "ACT_ROUTES", ("/v1/lane/vend",))
+
+    elif mode == "vend_capability":
+        # The capability alone, without the route. A lane that ANNOUNCES it can
+        # vend when it cannot is the mirror of the mode above, and the two are
+        # broken separately because one derivation joins them.
+        original = service_module.LaneService.capabilities
+
+        def boastful(self):
+            return Capabilities(**{**original(self).to_dict(), "can_vend": True})
+
+        monkeypatch.setattr(service_module.LaneService, "capabilities", boastful)
+
+    elif mode == "stored_fallback":
+        # `fallback` stops being derived from `reason` and echoes whatever it
+        # is given. A third-party lane's own vocabulary then arrives looking
+        # like one of our codes, and a consumer maps a foreign reason onto a
+        # branch it has -- the guess the contract exists to prevent.
+        monkeypatch.setattr(
+            contract_module.LastDecision,
+            "fallback",
+            property(lambda self: self.reason),
+        )
+
+    elif mode == "no_reset":
+        # The cursor stops saying it restarted. An empty list then means both
+        # "nothing happened" and "you have missed everything".
+        original_events = service_module.LaneService.events
+
+        def blind(self, since):
+            page = original_events(self, since)
+            return contract_module.EventPage(
+                cursor=page.cursor, reset=False, dropped=page.dropped, events=page.events
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "events", blind)
+
+    elif mode == "extra_field":
+        # The code grows a field the document does not show. The doc/contract
+        # agreement test is the only thing that can see this, and it is the
+        # reason that test exists.
+        original_to_dict = contract_module.EventPage.to_dict
+
+        def wider(self):
+            return {**original_to_dict(self), "undocumented": True}
+
+        monkeypatch.setattr(contract_module.EventPage, "to_dict", wider)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_LANE_CONTRACT mode: {mode}")
