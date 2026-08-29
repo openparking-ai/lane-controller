@@ -564,3 +564,202 @@ def _break_the_lane_contract(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_LANE_CONTRACT mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the measured-codes fail-control.
+#
+# scripts/measured_codes_fail_control.py sets BREAK_MEASURED_CODE and requires
+# the contract suite to FAIL. Each mode removes exactly one thing that makes a
+# code a MEASUREMENT rather than a label -- not a fixture and not a stub -- so a
+# control that passes says the suite measures the derivation and not something
+# beside it.
+#
+# The reassuring direction is the one that matters here. Every break below turns
+# an honest `unknown` or a real `active` into a confident `ok`, which is a lane
+# reporting a clock nobody checked and an identification service nobody asked.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_measured_codes(monkeypatch):
+    mode = os.environ.get("BREAK_MEASURED_CODE")
+    if not mode:
+        return
+
+    from lane_controller.contract import SOURCES, HealthState, MalfunctionCode, Source
+    from lane_controller.platform_client import PlatformRejected
+    from lane_controller.service import LaneService
+    from lane_controller.sync import PlatformTransport
+
+    if mode == "degraded_is_ok":
+        # A service that cannot be READ reports a clean bill of health. This is
+        # the shape the whole surface exists to refuse: `unknown` folded into
+        # `ok` at the one seam an operator trusts.
+        original = LaneService._identity_service_degraded
+
+        def optimistic(self):
+            state = original(self)
+            return HealthState.OK if state is HealthState.UNKNOWN else state
+
+        monkeypatch.setattr(LaneService, "_identity_service_degraded", optimistic)
+
+    elif mode == "degraded_never_fires":
+        # It asks, and it never reports what it was told. A label with a
+        # derivation behind it that cannot answer `active` is not a measurement
+        # of anything -- and it reads exactly like a healthy service.
+        monkeypatch.setattr(
+            LaneService, "_identity_service_degraded", lambda self: HealthState.OK
+        )
+
+    elif mode == "degraded_is_remembered":
+        # The service is asked ONCE and the answer is kept. At a lane with no
+        # arrivals since midnight the memory is the whole night old, and a
+        # service that went degraded an hour ago still reads `ok`.
+        seen = {}
+
+        def cached(self):
+            reader = getattr(self.controller.identifier, "identity_health", None)
+            if not callable(reader):
+                return HealthState.UNKNOWN
+            if "body" not in seen:
+                seen["body"] = reader()
+            body = seen["body"]
+            if not isinstance(body, dict):
+                return HealthState.UNKNOWN
+            return HealthState.ACTIVE if body.get("status") == "degraded" else HealthState.OK
+
+        monkeypatch.setattr(LaneService, "_identity_service_degraded", cached)
+
+    elif mode == "skew_from_the_message":
+        # The refusal is classified by matching text in the message instead of
+        # reading the field. A platform that rewords its error goes silent, and
+        # a platform that mentions the words in another refusal goes loud.
+        def by_message(self, err: PlatformRejected) -> None:
+            if "clock" in err.body.lower():
+                self.skew_rejected += 1
+
+        monkeypatch.setattr(PlatformTransport, "_classify", by_message)
+
+    elif mode == "unnamed_is_not_a_skew":
+        # An unnamed conflict is treated as "not a skew". A platform that
+        # predates the field refuses a skew exactly as it refuses everything
+        # else, so this reports a healthy clock on the one deployment where the
+        # failure is invisible.
+        def named_only(self, err: PlatformRejected) -> None:
+            if err.status == 409 and err.code == "clock_skew":
+                self.skew_rejected += 1
+
+        monkeypatch.setattr(PlatformTransport, "_classify", named_only)
+
+    elif mode == "silence_is_ok":
+        # A lane that has attempted nothing reports its clock as fine. Nothing
+        # was sent, so nothing could have been refused: this is a confident
+        # negative about a question nobody asked.
+        original_skew = LaneService._clock_skew_rejected
+
+        def optimistic_skew(self):
+            state = original_skew(self)
+            if state is HealthState.UNKNOWN and self.controller.events.transport is not None:
+                return HealthState.OK
+            return state
+
+        monkeypatch.setattr(LaneService, "_clock_skew_rejected", optimistic_skew)
+
+    elif mode == "labelled_not_derived":
+        # A code marked `measured` in SOURCES with nothing deriving it. It then
+        # answers `unknown` for ever, which reads as "asked, and could not tell"
+        # rather than as "never wired up" -- the failure `HealthEntry` cannot
+        # see, because it only refuses the other direction.
+        monkeypatch.setitem(SOURCES, MalfunctionCode.DISK_NEARLY_FULL, Source.MEASURED)
+
+    elif mode == "doc_stale_list":
+        # The document still lists a code this build now READS among the ones
+        # waiting to be read. It was true when it was written, which is exactly
+        # why a stale list survives review.
+        #
+        # Applied to the PARSED paragraph, so no tracked document is edited by a
+        # script -- the same way the doc/value control does it.
+        import test_lane_contract
+
+        stale = (
+            "Where the `not_measured` signals live today, so nobody has to go looking:\n\n"
+            "- `clock_skew_rejected` -- the platform answers 409 and this lane counts it,\n"
+            "  undifferentiated, with every other refusal."
+        )
+        monkeypatch.setattr(test_lane_contract, "_not_measured_paragraph", lambda: stale)
+
+    elif mode == "health_blocks_on_the_service":
+        # The route waits on the identification service for as long as THAT
+        # client is willing to, instead of for as long as this lane said. A hung
+        # third machine then holds this route open past the patience of whatever
+        # polls it, and a lane that is up and serving is published as a dead one.
+        monkeypatch.setattr(
+            LaneService, "_bounded_identity_health", lambda self, reader: reader()
+        )
+
+    elif mode == "version_is_not_checked":
+        # The health payload is read whatever version it declares. The value
+        # taken off it is then published as `measured` -- the half-read both
+        # contracts refuse, on the one payload two other readers refuse.
+        monkeypatch.setattr(LaneService, "_known_identity_schema", lambda self, version: True)
+
+    elif mode == "skew_never_recovers":
+        # The counts only ever go up. One skew and the code is `active` until
+        # the process restarts, however long ago the clock was fixed: a latch
+        # that reads like a state, and no `recovered` for a monitor to send.
+        original_guard = PlatformTransport._guarded
+
+        def never_resets(self, call):
+            skew, unnamed = self.skew_rejected, self.conflicts_unnamed
+            result = original_guard(self, call)
+            self.skew_rejected = max(self.skew_rejected, skew)
+            self.conflicts_unnamed = max(self.conflicts_unnamed, unnamed)
+            return result
+
+        monkeypatch.setattr(PlatformTransport, "_guarded", never_resets)
+
+    elif mode == "never_alarm_as_a_string":
+        # The flag ships as a string. Every non-empty string is truthy, so a
+        # reader that has not been told to require a boolean silences the code
+        # it is told `"false"` about -- the reassuring direction, with nothing
+        # anywhere reporting it.
+        from lane_controller.contract import HealthEntry
+
+        original_dict = HealthEntry.to_dict
+
+        def stringly(self):
+            row = original_dict(self)
+            row["never_alarm"] = str(row["never_alarm"]).lower()
+            return row
+
+        monkeypatch.setattr(HealthEntry, "to_dict", stringly)
+
+    elif mode in ("doc_set_missing_a_member", "enum_gained_a_member"):
+        # The two directions of the published closed sets. One drops a member
+        # from the DOCUMENT -- a lane an implementer cannot write. The other
+        # adds one to the CODE without adding it to the document, which is what
+        # every future round does the day it adds a malfunction code.
+        #
+        # Applied to the parsed block and to the derivation, so no tracked
+        # document is edited by a script.
+        import test_lane_contract
+
+        if mode == "doc_set_missing_a_member":
+            original_payloads = test_lane_contract.doc_payloads
+
+            def doctored():
+                doc = original_payloads()
+                doc["sets"]["malfunction_codes"] = doc["sets"]["malfunction_codes"][:-1]
+                return doc
+
+            monkeypatch.setattr(test_lane_contract, "doc_payloads", doctored)
+        else:
+            monkeypatch.setitem(
+                test_lane_contract.PUBLISHED_SETS,
+                "malfunction_codes",
+                lambda: [code.value for code in MalfunctionCode] + ["hatch_left_open"],
+            )
+
+    else:
+        raise RuntimeError(f"unknown BREAK_MEASURED_CODE mode: {mode}")

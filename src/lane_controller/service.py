@@ -45,6 +45,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from vehicle_id.contract import SCHEMA_VERSION
+
 from .contract import (
     CONTRACT_VERSION,
     Capabilities,
@@ -138,6 +140,31 @@ def bearer(header: str | None) -> str | None:
     return value.strip()
 
 
+class _BoundedRead:
+    """One call to somebody else's health route, with a flag for "it came back".
+
+    `body` is `None` for every failure, exactly as `identity_health` already
+    answers for one: the caller has nothing to say either way, and a read that
+    raised and a read that could not be parsed are the same fact to it.
+    """
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.body = None
+
+    def run(self, reader) -> None:
+        try:
+            self.body = reader()
+        except Exception as exc:  # noqa: BLE001
+            # An identifier this package did not write may raise anything at
+            # all. Letting it out of this thread would kill it silently and
+            # leave `done` unset, which reads to the caller as a hang.
+            log.warning("the identification service health read raised: %s", exc)
+            self.body = None
+        finally:
+            self.done.set()
+
+
 class LaneService:
     """A `LaneController`, read through the contract.
 
@@ -150,6 +177,17 @@ class LaneService:
     def __init__(self, controller) -> None:
         self.controller = controller
         self._lock = threading.Lock()
+        #: The one identification-service health read that may be outstanding.
+        #: See `_bounded_identity_health` -- it is what keeps a service that
+        #: never answers from leaving one thread behind per poll.
+        self._identity_read: _BoundedRead | None = None
+        self._identity_read_lock = threading.Lock()
+        #: Whether the unreadable-version refusal below has already been said.
+        #: It is a property of the service on the other end, not of one request,
+        #: and this route is polled -- so it is said once rather than on every
+        #: poll for as long as that service stays on a version this build does
+        #: not know.
+        self._identity_version_refused = False
 
     # --- GET /v1/lane -----------------------------------------------------
 
@@ -236,17 +274,18 @@ class LaneService:
     def health(self) -> LaneHealth:
         """Every code in the table, with the state this build can stand behind.
 
-        Three codes are DERIVED here and the rest answer `unknown`. That is not
+        Some codes are DERIVED here and the rest answer `unknown`. That is not
         a placeholder: `HealthEntry` refuses any state but `unknown` for a code
         whose source is not `measured`, so the surface cannot grow a confident
-        `ok` for a signal nothing produces. Closing the rest is the monitor
-        round, and it is instrumentation, not alerting.
+        `ok` for a signal nothing produces.
+
+        How many is not written down anywhere, here or in the document:
+        `contract.SOURCES` is the one copy, and `tests/test_lane_contract.py`
+        requires `derived_states()` to answer for exactly the codes it marks
+        `measured`. A code promoted in one place and forgotten in the other
+        fails there rather than becoming a sentence that is quietly wrong.
         """
-        derived = {
-            MalfunctionCode.IDENTITY_SERVICE_DOWN: self._identity_service_down(),
-            MalfunctionCode.OUTBOX_DEPTH_GROWING: self._outbox_depth_growing(),
-            MalfunctionCode.SESSION_ACTIONS_DEAD_LETTERED: self._dead_lettered(),
-        }
+        derived = self.derived_states()
         # Built by walking the enum, so a code added to the contract appears
         # here without anything being remembered, and appears as `unknown`
         # until somebody derives it.
@@ -256,6 +295,25 @@ class LaneService:
                 for code in MalfunctionCode
             )
         )
+
+    def derived_states(self) -> dict[MalfunctionCode, HealthState]:
+        """The codes this build derives, and what each of them reads right now.
+
+        Split out of `health()` so the SET is inspectable rather than being an
+        expression inside a payload builder. The half of the invariant that
+        `HealthEntry` cannot enforce is this one: it refuses a code that claims
+        `ok` without being `measured`, but nothing stops the reverse -- a code
+        marked `measured` in `SOURCES` that nothing here derives would answer
+        `unknown` for ever, and `unknown` from a code labelled `measured` reads
+        as "asked, and could not tell" rather than as "never wired up".
+        """
+        return {
+            MalfunctionCode.IDENTITY_SERVICE_DOWN: self._identity_service_down(),
+            MalfunctionCode.IDENTITY_SERVICE_DEGRADED: self._identity_service_degraded(),
+            MalfunctionCode.OUTBOX_DEPTH_GROWING: self._outbox_depth_growing(),
+            MalfunctionCode.SESSION_ACTIONS_DEAD_LETTERED: self._dead_lettered(),
+            MalfunctionCode.CLOCK_SKEW_REJECTED: self._clock_skew_rejected(),
+        }
 
     def _identity_service_down(self) -> HealthState:
         """From the last decision's cause. `unknown` until a vehicle arrives.
@@ -276,6 +334,187 @@ class LaneService:
         # It is not evidence that the service is down, and it is not evidence
         # that it is up either.
         return HealthState.UNKNOWN
+
+    def _identity_service_degraded(self) -> HealthState:
+        """The identification service's own `status`, read from its health route.
+
+        A straight read of a field that already exists. The engine sets
+        `degraded` when a read was LOST -- it could not even be written to the
+        push queue, a full disk or a permissions change -- or when the queue held
+        a line it could not read. Those are the two cases where a record was
+        answered and then existed nowhere, which is why that service says it out
+        loud, and until now nothing on this side listened.
+
+        This CONTACTS the service, on the request. It is a check and not a
+        memory: a cached answer from the last vehicle would report a service
+        that was fine an hour ago as fine now, and at a lane that has had no
+        arrivals since midnight the memory is the whole night old.
+
+        Three answers and none of them guesses:
+
+          * the service could not be read, did not answer within this lane's
+            own bound, answered on a `schema_version` this build does not know,
+            or answered no `status` this build recognises -- `unknown`. NOT
+            `ok`: a service that cannot be asked has not been found healthy.
+            Whether it is unreachable is `identity_service_down`, derived from a
+            different signal.
+          * `degraded` -- `active`.
+          * `ok` -- `ok`, and that is a real measurement: it was asked and it
+            answered.
+
+        An identifier that is not a health-publishing service -- a stub, a lane
+        identifying some other way -- has no method to call and answers
+        `unknown`. Asked by capability rather than by type, so a third party's
+        identifier that publishes the same route is read the same way ours is.
+        """
+        reader = getattr(self.controller.identifier, "identity_health", None)
+        if not callable(reader):
+            return HealthState.UNKNOWN
+        body = self._bounded_identity_health(reader)
+        if not isinstance(body, dict):
+            return HealthState.UNKNOWN
+        if not self._known_identity_schema(body.get("schema_version")):
+            return HealthState.UNKNOWN
+        status = body.get("status")
+        if status == "degraded":
+            return HealthState.ACTIVE
+        if status == "ok":
+            return HealthState.OK
+        return HealthState.UNKNOWN
+
+    def _known_identity_schema(self, version) -> bool:
+        """The version refusal, COPIED from the reader of the same payload.
+
+        `Read.from_dict` refuses an unrecognised `schema_version` rather than
+        guessing which fields still mean what they used to, and both contracts
+        state that policy in the same words: *an unrecognised version is
+        refused, not partially read*. This is the same payload from the same
+        service, and it was being read regardless -- with the value taken off it
+        published as `measured`. One payload, one repository, two policies.
+
+        A missing version is refused too. A payload that does not say which
+        contract it is is not a payload this build can place, and reading it
+        anyway is the half-read both contracts forbid.
+
+        A `bool` is refused explicitly, for the reason `Read.from_dict` refuses
+        it: `True == 1`, so `schema_version: true` would otherwise read as
+        version 1.
+
+        The answer for an unreadable one is the answer this method already has
+        for every other unreadable case -- `unknown`, never `ok`.
+        """
+        if not isinstance(version, bool) and isinstance(version, int) and version == SCHEMA_VERSION:
+            return True
+        if not self._identity_version_refused:
+            self._identity_version_refused = True
+            log.warning(
+                "the identification service's health declares schema_version %r; this build "
+                "understands %d. Refusing to guess which fields still mean what they used to: "
+                "identity_service_degraded is unknown.",
+                version,
+                SCHEMA_VERSION,
+            )
+        return False
+
+    def _bounded_identity_health(self, reader):
+        """The identification service's health, or `None`, within OUR OWN bound.
+
+        **This route must not block on another machine for longer than its own
+        bounded read.** The identification service runs in a different process,
+        usually on a different box, and a HUNG one -- a socket that accepts and
+        never answers -- used to hold this route open for that client's whole
+        timeout. The monitor polling this lane gave up first and published
+        `lane_unreachable`: a lane that is up, serving, and answering correctly,
+        reported as a dead lane, with every real signal it was publishing
+        retired at the same moment. A slow third machine became a fault
+        attributed to this one.
+
+        So the bound is the LANE'S, `[lane] identity_health_timeout_s`, and it is
+        applied here rather than left to whatever the identifier's own client
+        happens to use: an identifier this package did not write has a timeout
+        this package did not choose, and the route's promise is the route's to
+        keep.
+
+        On timeout the answer is `None`, which the caller reads as `unknown` --
+        nobody measured. A hung service is not the same fact as a refused one.
+
+        **One read at a time.** The reader runs on a daemon thread so a service
+        that never answers cannot hold this route or the interpreter's exit, and
+        while one is still outstanding a second is not started: it would be one
+        more thread per poll, for ever, against a machine that is not answering.
+        A poll that arrives during an outstanding read is told `unknown`, which
+        is exactly what it is.
+        """
+        with self._identity_read_lock:
+            outstanding = self._identity_read
+            if outstanding is not None and not outstanding.done.is_set():
+                log.warning(
+                    "the identification service has not answered the previous health read; "
+                    "not starting a second"
+                )
+                return None
+            read = _BoundedRead()
+            self._identity_read = read
+
+        threading.Thread(
+            target=read.run, args=(reader,), name="identity-health", daemon=True
+        ).start()
+        if not read.done.wait(self.controller.config.identity_health_timeout_s):
+            log.warning(
+                "the identification service did not answer its health route within %.3fs; "
+                "identity_service_degraded is unknown",
+                self.controller.config.identity_health_timeout_s,
+            )
+            return None
+        return read.body
+
+    def _clock_skew_rejected(self) -> HealthState:
+        """`active` once the platform has refused an item for clock skew.
+
+        The most expensive code on the table, and it is a READ: the platform
+        already answers a lane time it will not accept with a `409`, and this
+        lane already counts that refusal -- undifferentiated, with six other
+        conditions that produce the same status. What was missing was the name,
+        which the platform now carries in the refusal body.
+
+        A lane whose clock runs fast has its session opens and closes
+        DEAD-LETTERED. The barrier still works, the driver still gets in, and
+        the money record silently loses the stay. Nothing anywhere reported it.
+
+        `unknown` in three situations, each of which is a different thing from
+        `ok` and none of which is folded into it:
+
+          * no transport -- a standalone lane has no platform to be refused by;
+          * nothing has been ATTEMPTED yet, so nothing could have been refused.
+            Without this a fresh lane that has never spoken to a platform would
+            report a clock it has never had checked as fine;
+          * a conflict arrived that the platform did not NAME. That is what a
+            platform older than the field answers for every refusal, including
+            a skew, so reading the absence as a negative would report a healthy
+            clock on exactly the deployment where the failure is invisible.
+
+        AND IT COMES BACK. Both counts are cleared by the next write the
+        platform ACCEPTS, so this reads `ok` again once the clock is fixed and
+        the lane is being taken. Without that it was a latch that read like a
+        state: `active` for the life of the process, the operator's repair
+        invisible, and `recovered` unable to fire at whatever is watching.
+        """
+        transport = self.controller.events.transport
+        if transport is None:
+            return HealthState.UNKNOWN
+        counts = [
+            getattr(transport, name, None)
+            for name in ("attempted", "skew_rejected", "conflicts_unnamed")
+        ]
+        if not all(isinstance(count, int) for count in counts):
+            # A wired transport that keeps no such counts has not measured this.
+            return HealthState.UNKNOWN
+        attempted, skew, unnamed = counts
+        if skew:
+            return HealthState.ACTIVE
+        if not attempted or unnamed:
+            return HealthState.UNKNOWN
+        return HealthState.OK
 
     def _outbox_depth_growing(self) -> HealthState:
         """`active` while the outbox holds more than this site's threshold.

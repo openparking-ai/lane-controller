@@ -96,7 +96,7 @@ const problems = scanRepo();
 if (problems.length > 0) {
   console.error('\nREAL DATA IN THE REPOSITORY\n');
   for (const p of problems) console.error(`  ${p.file}: ${p.value}  (${p.why})`);
-  console.error('\nFixtures, tests and docs use invented values. See docs/DATA_RETENTION.md.\n');
+  console.error('\nFixtures, tests and docs use invented values.\n');
   process.exit(1);
 }
 console.log(`${trackedFiles().length} tracked file(s) scanned; no real personal data.`);
