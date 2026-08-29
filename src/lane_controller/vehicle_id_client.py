@@ -8,7 +8,7 @@ public record shape and nothing else. `tests/test_vehicle_id_boundary.py`
 enforces that, and fails if it is ever untrue.
 
 Local, not remote. The default address is loopback, because identification runs
-on the same device or the same LAN and the lane has to work with the internet
+on the same device and the lane has to work with the internet
 down. A hostname pointing at anything else is a deployment mistake, not a
 feature.
 
@@ -126,7 +126,7 @@ class VehicleIdClient:
             # guess a decision the engine already made against measured data.
             return replace(NO_IDENTITY, presence=read.presence)
 
-        # The lane's own event log carries a plate and a confidence and nothing
+        # The lane's own event log carries a confidence and nothing
         # else, so without this line a wrong open has no read_id to trace, no
         # weights to blame and no operating point to check. It costs one log
         # record per vehicle and it is the only provenance that survives the
