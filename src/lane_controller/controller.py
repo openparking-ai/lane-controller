@@ -253,6 +253,17 @@ class LaneController:
                 reason=decision.reason,
                 fallback=decision.fallback.value if decision.fallback else None,
                 confidence=identity.confidence,
+                # WHICH failure, when the fallback is `engine_unreachable`, and
+                # None for every fallback that did get a read. One code says
+                # what the lane did; this says what somebody has to go and fix,
+                # and a code with nothing behind it would send whoever answers
+                # the intercom to look at the wrong thing.
+                #
+                # Note what it sits beside: on this branch `confidence` is 0.0
+                # and is NOT a measurement -- nothing measured it -- so a
+                # reader that takes the number without this field is reading a
+                # marginal plate that does not exist.
+                cause=identity.unavailable,
             )
 
         # Best effort, and after the barrier has already been told what to do.

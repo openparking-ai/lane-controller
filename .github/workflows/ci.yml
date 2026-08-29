@@ -69,3 +69,11 @@ jobs:
         # quietly stopped being collected would pass intact and then fail to
         # fail under every break, and this reports that.
         run: python scripts/confirmation_fail_control.py
+
+      - name: Fallback-cause fail-control
+        # Merges the cause back into the confidence comparison on purpose --
+        # at the decision, at the client, and in the record -- and requires the
+        # engine-unreachable suite to fail each time. A dead engine reported as
+        # a marginal read is the defect this suite exists for, and a suite that
+        # cannot go red on it is not evidence that it does not happen.
+        run: python scripts/fallback_cause_fail_control.py

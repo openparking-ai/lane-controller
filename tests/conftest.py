@@ -196,3 +196,129 @@ def _break_the_confirmation(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_CONFIRMATION mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the fallback-cause fail-control.
+#
+# scripts/fallback_cause_fail_control.py sets BREAK_FALLBACK_CAUSE and requires
+# the engine-unreachable suite to FAIL. Each mode breaks exactly one point that
+# carries the guarantee -- the ordering in `decide`, the classification in the
+# client, or the cause reaching the record -- so a control that passes says the
+# suite measures that point and not something beside it.
+#
+# The last mode is the one facing the other way: a change that reported EVERY
+# fallback as an unreachable engine would satisfy every assertion about a dead
+# engine, and is the same defect with the arrow reversed.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_fallback_cause(monkeypatch):
+    mode = os.environ.get("BREAK_FALLBACK_CAUSE")
+    if not mode:
+        return
+
+    from dataclasses import replace
+
+    from lane_controller import decision as decision_module
+    from lane_controller import vehicle_id_client as client_module
+    from lane_controller.decision import Fallback
+    from lane_controller.events import EventQueue
+    from lane_controller.interfaces import VehicleIdentity
+
+    original_decide = decision_module.decide
+
+    def patch_decide(replacement):
+        # `decide` is bound by name in every module that imported it -- the
+        # module that defines it, `controller`, the package's `__init__`, and
+        # each test module -- and rebinding one of them leaves the others
+        # holding the original function object.
+        #
+        # Found the hard way on this control's first run: patching `decision`
+        # and `controller` still turned the suite red, on ONE test, through the
+        # lane rather than through the break this describes. A check that
+        # passes for the wrong reason has failed. So the bindings are DERIVED
+        # -- every one that is the original object is replaced -- rather than
+        # listed, because a list cannot notice the next importer.
+        import sys
+
+        for module in list(sys.modules.values()):
+            if getattr(module, "decide", None) is original_decide:
+                monkeypatch.setattr(module, "decide", replacement)
+
+    if mode == "merge":
+        # The ordering in `decide` is gone: `unavailable` is set on the
+        # identity and nothing looks at it, so the 0.0 left behind by a failed
+        # request is compared against a threshold again. This is the defect
+        # exactly as it stood.
+        def blind_decide(identity, cache, **kwargs):
+            return original_decide(replace(identity, unavailable=None), cache, **kwargs)
+
+        patch_decide(blind_decide)
+
+    elif mode == "blind":
+        # A different point, and one `merge` cannot reach: the CLIENT stops
+        # saying which failure it had, so there is nothing for the ordering to
+        # find. Two lines carry this guarantee and each is broken on its own.
+        original_identify = client_module.VehicleIdClient.identify
+
+        def forgetful_identify(self, frames):
+            return replace(original_identify(self, frames), unavailable=None)
+
+        monkeypatch.setattr(client_module.VehicleIdClient, "identify", forgetful_identify)
+
+    elif mode == "swallow":
+        # The arrow reversed: every fallback becomes an unreachable engine, so
+        # a plate the engine looked at and would not vouch for is reported as a
+        # service being down. Only the control catches this one.
+        def greedy_decide(identity, cache, **kwargs):
+            outcome = original_decide(identity, cache, **kwargs)
+            if outcome.fallback is not None:
+                return replace(outcome, fallback=Fallback.ENGINE_UNREACHABLE)
+            return outcome
+
+        patch_decide(greedy_decide)
+
+    elif mode == "onecause":
+        # One code for what the lane did is the design; one CAUSE for every
+        # failure is not. A camera that handed over nothing, a service that is
+        # off and a service that is slow are three repairs, and this collapses
+        # them into a record nobody can act on.
+        monkeypatch.setattr(client_module, "_cause", lambda exc: client_module.CAUSE_UNREACHABLE)
+
+    elif mode == "above_presence":
+        # The other ordering the round created, and the one the five breaks
+        # above cannot reach: `unavailable` looked at BEFORE presence. Nothing
+        # was there, the engine is also down, and the lane issues a ticket for
+        # a car that does not exist. Expressed by dropping presence whenever a
+        # cause is set, which is what moving the check above it does.
+        def presence_last_decide(identity, cache, **kwargs):
+            if identity.unavailable is not None:
+                return original_decide(replace(identity, presence=None), cache, **kwargs)
+            return original_decide(identity, cache, **kwargs)
+
+        patch_decide(presence_last_decide)
+
+    elif mode == "freetext":
+        # The seam stops constraining `unavailable`, so an identifier's own
+        # string travels into `Decision.reason` and into `events.detail`, which
+        # the retention purge cannot reach. This is the state the branch was in
+        # before the closed set, and the plate-leak cases that plant a member
+        # of that set cannot see it.
+        monkeypatch.setattr(VehicleIdentity, "__post_init__", lambda self: None)
+
+    elif mode == "nodetail":
+        # The cause is measured and never leaves the process. Whoever answers
+        # the intercom sees a code and no reason for it.
+        original_record = EventQueue.record
+
+        def silent_record(self, kind, lane_id, **detail):
+            if kind == "fallback_needs_human":
+                detail.pop("cause", None)
+            return original_record(self, kind, lane_id, **detail)
+
+        monkeypatch.setattr(EventQueue, "record", silent_record)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_FALLBACK_CAUSE mode: {mode}")

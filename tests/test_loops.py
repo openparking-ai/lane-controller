@@ -20,6 +20,7 @@ import pytest
 from lane_controller import (
     CameraConfig,
     DecisionCache,
+    Fallback,
     GateConfig,
     LaneConfig,
     LaneController,
@@ -60,6 +61,7 @@ def build(
     window: float = WINDOW,
     default_action: str | None = "allow",
     rules=(),
+    rules_max_age: float | None = None,
     loops_impl: ClosingLoops | None = None,
     clock=None,
 ):
@@ -83,7 +85,9 @@ def build(
             confirmation_window_seconds=window,
         ),
     )
-    cache = DecisionCache()
+    cache = (
+        DecisionCache() if rules_max_age is None else DecisionCache(max_age_seconds=rules_max_age)
+    )
     cache.load(list(rules), default_action=default_action)
     vend = RecordingVendOutput()
     if loops_impl is not None:
@@ -514,25 +518,46 @@ def _log_events(controller):
     return [e for e in list(controller.events._queue) if e.kind not in SESSION_KINDS]
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        "entry_confirmed",
-        "entry_backed_out",
-        "entry_held",
-        "entry_unconfirmable",
-        "exit_confirmed",
-        "exit_held",
-        "arming_incomplete",
-        "low_confidence",
-        "no_plate_read",
-        "default_allow",
-        "default_deny",
-        "unknown_vehicle",
-        "allowed_by_rule",
-        "denied_by_rule",
-    ],
-)
+#: One name per branch that reaches the log, plus one for the branch that can
+#: reach it with a string the lane did not choose. The last six are the
+#: DECISION branches, and `test_every_fallback_branch_is_in_that_list` below
+#: derives the fallback half of this list from `Fallback` rather than trusting
+#: it: a hand-written list cannot notice a code added after it was written,
+#: which is exactly what this round adds.
+PLATE_LEAK_CASES = [
+    "entry_confirmed",
+    "entry_backed_out",
+    "entry_held",
+    "entry_unconfirmable",
+    "exit_confirmed",
+    "exit_held",
+    "arming_incomplete",
+    "low_confidence",
+    "no_plate_read",
+    "engine_unreachable",
+    "engine_unreachable_free_text",
+    "stale_rules",
+    "default_allow",
+    "default_deny",
+    "unknown_vehicle",
+    "allowed_by_rule",
+    "denied_by_rule",
+]
+
+
+def test_every_fallback_branch_is_in_that_list():
+    """The control on the list above, derived from the enum and not from a copy.
+
+    A new `Fallback` code is a new branch composing a new `reason` into
+    `decision` and `fallback_needs_human` detail, and a parametrised list that
+    was typed out cannot notice one. This fails when a code is added and the
+    case is not.
+    """
+    missing = {code.value for code in Fallback} - set(PLATE_LEAK_CASES)
+    assert not missing, f"fallback code(s) with no plate-leak case: {sorted(missing)}"
+
+
+@pytest.mark.parametrize("case", PLATE_LEAK_CASES)
 def test_no_log_event_carries_plate_text(case):
     """One run per branch that reaches the log, and the plate is in none of them.
 
@@ -557,6 +582,33 @@ def test_no_log_event_carries_plate_text(case):
         "no_plate_read": dict(
             identities=[VehicleIdentity(plate=None, confidence=0.0, presence=True)]
         ),
+        # No read was obtained at all. The plate is planted anyway -- the point
+        # of this matrix is that no branch renders one, not that no branch has
+        # one to render.
+        "engine_unreachable": dict(
+            identities=[
+                VehicleIdentity(
+                    plate=PLATE_IN_THE_LOG, confidence=0.0, presence=True, unavailable="unreachable"
+                )
+            ]
+        ),
+        # The same branch, reached by an identifier that is not this package's
+        # client. `unavailable` is written into `events.detail` verbatim, so
+        # the case above -- which plants a member of the cause set -- measures a
+        # path on which the field is already safe. This one plants the plate
+        # INSIDE the field, which is the only version of this case that can go
+        # red, and it does when the seam stops constraining the value.
+        "engine_unreachable_free_text": dict(
+            identities=[
+                VehicleIdentity(
+                    plate=PLATE_IN_THE_LOG,
+                    confidence=0.0,
+                    presence=True,
+                    unavailable=f"engine refused the read for {PLATE_IN_THE_LOG}",
+                )
+            ]
+        ),
+        "stale_rules": dict(rules_max_age=0.0),
         "default_allow": dict(default_action="allow"),
         "default_deny": dict(default_action="deny"),
         "unknown_vehicle": dict(default_action=None),

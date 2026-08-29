@@ -21,9 +21,13 @@ The translation this class performs is small and deliberate:
     plate is dropped with it -- an identity the engine would not vouch for must
     not be available to match a rule.
   * Anything that goes wrong -- the service down, a timeout, a malformed body,
-    a schema this build does not understand -- becomes a zero-confidence
-    identity, not an exception. A car is at the barrier; the lane needs an
-    outcome it can act on, and its fallback path is that outcome.
+    a schema this build does not understand -- becomes an identity with
+    `unavailable` set, not an exception. A car is at the barrier; the lane
+    needs an outcome it can act on, and its fallback path is that outcome.
+    **The zero confidence such an identity carries is not a measurement**, and
+    `unavailable` is what says so: without it the decision stage compares that
+    0.0 against a threshold and reports a marginal read, which is a different
+    event with a different thing to tell the driver.
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ from datetime import UTC, datetime
 
 from vehicle_id.contract import Read
 
-from .interfaces import Frame, VehicleIdentity
+from .interfaces import Frame, Unavailable, VehicleIdentity
 
 log = logging.getLogger(__name__)
 
@@ -61,8 +65,35 @@ MAX_RESPONSE_BYTES = 1 << 20
 
 #: What the lane hands `decide()` when it has no usable identification. Named
 #: once so that every failure path below returns the same thing, rather than
-#: three subtly different empties.
+#: three subtly different empties. Every path that means "no read was obtained"
+#: sets `unavailable` on top of it; the one path that does not is the engine's
+#: own `fallback`, which IS a read.
 NO_IDENTITY = VehicleIdentity(plate=None, confidence=0.0)
+
+# ---------------------------------------------------------------------------
+# WHY no read was obtained.
+#
+# One `Fallback` code covers all of these, because the lane does the same thing
+# for every one of them -- a human, never a guess. The difference is what an
+# operator has to go and fix, and that difference is worth nothing unless it
+# reaches the record, so it travels as `VehicleIdentity.unavailable` and is
+# written into the event detail.
+#
+# Every one is decided from the EXCEPTION TYPE. None is decided by matching
+# text in a message: a message is not a structure, and the day someone rewords
+# one, a check keyed on it goes quietly wrong.
+#
+# The names below ARE `interfaces.Unavailable`, which is where the set is
+# defined and what the type on `VehicleIdentity` refuses to hold anything
+# outside of. They are bound here because this client is where each one is
+# decided, and the docstring for each is on the member.
+# ---------------------------------------------------------------------------
+
+CAUSE_NO_FRAMES = Unavailable.NO_FRAMES
+CAUSE_UNREACHABLE = Unavailable.UNREACHABLE
+CAUSE_TIMEOUT = Unavailable.TIMEOUT
+CAUSE_SERVICE_ERROR = Unavailable.SERVICE_ERROR
+CAUSE_BAD_RESPONSE = Unavailable.BAD_RESPONSE
 
 
 class VehicleIdClient:
@@ -80,7 +111,10 @@ class VehicleIdClient:
 
     def identify(self, frames: Sequence[Frame]) -> VehicleIdentity:
         if not frames:
-            return NO_IDENTITY
+            # Nothing to send, so nothing was asked and nothing was measured.
+            # This used to leave as a bare zero confidence, which the decision
+            # stage read as a plate it could almost make out.
+            return replace(NO_IDENTITY, unavailable=CAUSE_NO_FRAMES)
 
         request_id = uuid.uuid4().hex
         payload = {
@@ -108,8 +142,15 @@ class VehicleIdClient:
             # Includes an unrecognised schema_version. Refusing to guess which
             # fields still mean what they used to is the contract's rule, and
             # for a lane the consequence of refusing is a fallback, not a crash.
-            log.warning("vehicle-id unavailable or unusable (%s); falling back", exc)
-            return NO_IDENTITY
+            #
+            # WHICH failure is carried on the identity from here on. Before it
+            # was, this whole branch and a genuinely marginal plate arrived at
+            # `decide()` as the same thing.
+            cause = _cause(exc)
+            log.warning(
+                "vehicle-id gave no read (%s: %s); falling back", cause, exc
+            )
+            return replace(NO_IDENTITY, unavailable=cause)
 
         if read.presence is False:
             # A different thing from a read the engine would not stand behind,
@@ -172,6 +213,29 @@ class VehicleIdClient:
     def _open_health(self, url: str) -> dict:
         with urllib.request.urlopen(url, timeout=self.timeout) as response:
             return json.loads(response.read(MAX_RESPONSE_BYTES + 1))
+
+
+def _cause(exc: BaseException) -> Unavailable:
+    """Which failure stopped the lane getting a read, from the exception TYPE.
+
+    The order is the classification, and two of the tests are only ordered
+    correctly by accident if it changes: `HTTPError` is a subclass of
+    `URLError`, which is a subclass of `OSError`, so the specific ones have to
+    be asked first or everything answers `unreachable`.
+
+    A timeout arrives in two shapes depending on whether it fired connecting or
+    reading -- `URLError(reason=TimeoutError())` and a bare `TimeoutError` --
+    and both are the same fault to whoever has to fix it.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return CAUSE_SERVICE_ERROR
+    if isinstance(exc, TimeoutError):
+        return CAUSE_TIMEOUT
+    if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError):
+        return CAUSE_TIMEOUT
+    if isinstance(exc, (urllib.error.URLError, OSError)):
+        return CAUSE_UNREACHABLE
+    return CAUSE_BAD_RESPONSE
 
 
 def _utc(captured_at: float) -> str:
