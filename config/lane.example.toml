@@ -23,6 +23,19 @@ rules_max_age_seconds = 86400
 # Where events are reported when connectivity allows. Never on the hot path.
 server_url = "https://platform.example/api/lane-events"
 
+# How many UNDELIVERED events the outbox may hold before the health surface
+# reports `outbox_depth_growing` as `active`. A lane that cannot reach the
+# platform keeps working and keeps queueing; this is the depth at which that
+# stops being normal for this site.
+#
+# A PER-SITE SETTING AND AN ASSUMPTION -- nothing in this package measures how
+# deep a healthy lane's outbox gets, and this is not a measurement of one. It is
+# drawn well below the point at which the bounded log starts discarding entries,
+# so the code fires while a human can still act on it rather than after events
+# are already lost. A site whose link is normally down for hours raises it; a
+# site that wants to hear about a five-minute outage lowers it.
+outbox_depth_threshold = 1000
+
 [camera]
 id               = "cam-1"
 # RTSP and PoE are required for any camera on this platform.
@@ -41,7 +54,7 @@ vend_pulse_ms = 500
 # second window.
 #
 # EVERY VALUE HERE IS A PER-SITE SETTING AND AN ASSUMPTION -- nothing in this
-# package measures a spacing or a crossing time, and none of these is a
+# package measures a spacing, and none of these is a
 # constant. They are published with the events they govern, under
 # `geometry_assumed`, so nobody reading the record can mistake them for
 # something that was measured here.

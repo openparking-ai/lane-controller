@@ -159,13 +159,15 @@ class VehicleIdClient:
             # vend. The contract already guarantees such a record carries no
             # identity.
             log.info("vehicle-id reports no vehicle present (read %s)", read.read_id)
-            return VehicleIdentity(plate=None, confidence=0.0, presence=False)
+            return VehicleIdentity(
+                plate=None, confidence=0.0, presence=False, read_ref=read.read_id
+            )
 
         if not read.is_answer:
             # The engine measured a confidence and declined to stand behind it.
             # Passing that number on would let the lane's own threshold second-
             # guess a decision the engine already made against measured data.
-            return replace(NO_IDENTITY, presence=read.presence)
+            return replace(NO_IDENTITY, presence=read.presence, read_ref=read.read_id)
 
         # The lane's own event log carries a confidence and nothing
         # else, so without this line a wrong open has no read_id to trace, no
@@ -194,6 +196,10 @@ class VehicleIdClient:
             marks=tuple(identity.marks),
             confidence=read.confidence,
             presence=read.presence,
+            # The engine's own id for this identification, carried instead of
+            # only logged. A consumer told the lane fell back can now ask which
+            # read it fell back on; before this it could not.
+            read_ref=read.read_id,
         )
 
     def operating_threshold(self) -> float | None:

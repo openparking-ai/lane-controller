@@ -508,6 +508,14 @@ def test_the_same_unmeasured_presence_with_a_real_car_opens_exactly_one_session(
 # The session actions are excluded because they are not log events at all: they
 # become POST /lane/sessions/open and /close, whose plate is the session row's
 # plate. Nothing they carry is written to `events.detail`.
+#
+# That premise is about the QUEUE, and round 2 put an HTTP surface in front of
+# it. A sweep whose kind list derives from SESSION_KINDS cannot, by
+# construction, notice a session action reaching a route -- it passes,
+# correctly, about a different question. The same question asked of the
+# SURFACE is `test_lane_contract.py`'s guarantee 8, which serialises all four
+# routes and looks for the plate in what a consumer receives. Both are needed;
+# neither covers the other.
 # ---------------------------------------------------------------------------
 
 PLATE_IN_THE_LOG = "PLATETEXT1"

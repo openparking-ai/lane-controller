@@ -322,3 +322,245 @@ def _break_the_fallback_cause(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_FALLBACK_CAUSE mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the lane-contract fail-control.
+#
+# scripts/contract_fail_control.py sets BREAK_LANE_CONTRACT and requires the
+# contract suite to FAIL. Each mode breaks exactly one property the contract
+# exists to have -- the geometry being the lane's own, the health table being
+# complete, `unknown` not being `ok`, the read-only sweep, the derived
+# fallback, the cursor's reset flag -- so a control that passes says the suite
+# measures that property and not something beside it.
+#
+# The stub's own breaks live in `tests/third_party_lane/lane.py` under
+# BREAK_THIRD_PARTY_LANE, because a fixture that cannot be broken is a fixture
+# that measures nothing.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_lane_contract(monkeypatch):
+    mode = os.environ.get("BREAK_LANE_CONTRACT")
+    if not mode:
+        return
+
+    import test_lane_contract as test_module
+    from lane_controller import contract as contract_module
+    from lane_controller import service as service_module
+    from lane_controller.config import LoopConfig
+    from lane_controller.contract import (
+        Capabilities,
+        HealthEntry,
+        HealthState,
+        LaneDescription,
+        LaneHealth,
+        MalfunctionCode,
+    )
+
+    if mode == "geometry_copy":
+        # The service renders its own geometry instead of publishing the
+        # lane's. Identical for a default lane and wrong for every other one,
+        # which is exactly how a second copy fails: not at once.
+        def copied(self):
+            return LaneDescription(
+                lane_id=self.controller.config.lane_id,
+                site_id=self.controller.config.site_id,
+                direction=self.controller.config.direction,
+                geometry=LoopConfig().as_published(),
+                capabilities=self.capabilities(),
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "describe", copied)
+
+    elif mode == "drop_code":
+        # One code left out of the payload. A consumer cannot tell an absent
+        # code from a healthy one, which is the whole reason the set is closed.
+        def short(self):
+            return LaneHealth(
+                entries=tuple(
+                    HealthEntry(code=code.value, state=HealthState.UNKNOWN.value)
+                    for code in list(MalfunctionCode)[:-1]
+                )
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "health", short)
+
+    elif mode == "unknown_is_ok":
+        # The invariant removed at the seam that enforces it AND at the seam
+        # that produces it: a code nothing measures reports a clean bill of
+        # health. This is "wrong silently" in one line.
+        def unchecked(self) -> None:
+            pass
+
+        monkeypatch.setattr(HealthEntry, "__post_init__", unchecked)
+
+        def cheerful(self):
+            return LaneHealth(
+                entries=tuple(
+                    HealthEntry(code=code.value, state=HealthState.OK.value)
+                    for code in MalfunctionCode
+                )
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "health", cheerful)
+
+    elif mode == "plant_post":
+        # A route that changes something, planted on the handler. The read-only
+        # sweep must find it -- this is the positive control for the guarantee
+        # that keeps the act surface a later round.
+        def do_POST(self):  # noqa: N802, N807
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        monkeypatch.setattr(service_module._Handler, "do_POST", do_POST)
+        monkeypatch.setattr(service_module, "ACT_ROUTES", ("/v1/lane/vend",))
+
+    elif mode == "vend_capability":
+        # The capability alone, without the route. A lane that ANNOUNCES it can
+        # vend when it cannot is the mirror of the mode above, and the two are
+        # broken separately because one derivation joins them.
+        original = service_module.LaneService.capabilities
+
+        def boastful(self):
+            return Capabilities(**{**original(self).to_dict(), "can_vend": True})
+
+        monkeypatch.setattr(service_module.LaneService, "capabilities", boastful)
+
+    elif mode == "stored_fallback":
+        # `fallback` stops being derived from `reason` and echoes whatever it
+        # is given. A third-party lane's own vocabulary then arrives looking
+        # like one of our codes, and a consumer maps a foreign reason onto a
+        # branch it has -- the guess the contract exists to prevent.
+        monkeypatch.setattr(
+            contract_module.LastDecision,
+            "fallback",
+            property(lambda self: self.reason),
+        )
+
+    elif mode == "no_reset":
+        # The cursor stops saying it restarted. An empty list then means both
+        # "nothing happened" and "you have missed everything".
+        original_events = service_module.LaneService.events
+
+        def blind(self, since):
+            page = original_events(self, since)
+            return contract_module.EventPage(
+                cursor=page.cursor, reset=False, dropped=page.dropped, events=page.events
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "events", blind)
+
+    elif mode == "extra_field":
+        # The code grows a field the document does not show. The doc/contract
+        # agreement test is the only thing that can see this, and it is the
+        # reason that test exists.
+        original_to_dict = contract_module.EventPage.to_dict
+
+        def wider(self):
+            return {**original_to_dict(self), "undocumented": True}
+
+        monkeypatch.setattr(contract_module.EventPage, "to_dict", wider)
+
+    elif mode == "session_actions_on_the_wire":
+        # THE DEFECT THIS ROUND DELETES. `record` puts every event in the read
+        # history, session actions included -- so `GET /v1/lane/events`
+        # publishes `session_open {plate: ...}` to every consumer of a READ
+        # contract, in a `detail` the contract declares OPAQUE and the
+        # retention purge cannot reach.
+        from lane_controller.events import EventQueue
+
+        original_record = EventQueue.record
+
+        def indiscriminate(self, kind, lane_id, **detail):
+            event = original_record(self, kind, lane_id, **detail)
+            from lane_controller.events import SESSION_KINDS
+
+            if kind in SESSION_KINDS:
+                self._cursor += 1
+                self._history.append((self._cursor, event))
+            return event
+
+        monkeypatch.setattr(EventQueue, "record", indiscriminate)
+
+    elif mode == "plate_in_a_log_event":
+        # The same exposure by a different door, and the one the mode above
+        # cannot prove: an ORDINARY LOG EVENT carrying plate text. The route
+        # sweep must find it whether it arrives on a session action or not --
+        # otherwise the sweep is a test of `SESSION_KINDS`, not of the surface.
+        from lane_controller.controller import LaneController
+
+        original_session = LaneController._record_session
+
+        def photographs_the_plate(self, identity, at, *, confirmation):
+            self.events.record("entry_photo_taken", self.config.lane_id, plate=identity.plate)
+            return original_session(self, identity, at, confirmation=confirmation)
+
+        monkeypatch.setattr(LaneController, "_record_session", photographs_the_plate)
+
+    elif mode == "evicted_reset":
+        # The eviction comparison removed, leaving `since > current` -- exactly
+        # the Vehicle ID semantics, which are honest THERE because that
+        # contract has push and this one does not. A consumer 50 events behind
+        # a 256-deep window is served 256 of them and told `reset: false`.
+        original_events = service_module.LaneService.events
+
+        def only_ahead(self, since):
+            page = original_events(self, since)
+            with self._lock:
+                current = self.controller.events.cursor
+            return contract_module.EventPage(
+                cursor=page.cursor,
+                reset=since > current,
+                dropped=page.dropped,
+                events=page.events,
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "events", only_ahead)
+
+    elif mode == "depth_blind":
+        # `outbox_depth_growing` reads `dropped` again: the count of events
+        # ALREADY LOST rather than the depth its own name promises. Nine
+        # thousand undelivered events read `ok`, with `source: measured`, so
+        # the HealthEntry guard cannot see it -- the entry genuinely IS
+        # measured, of something else.
+        def dropping(self):
+            return (
+                contract_module.HealthState.ACTIVE
+                if self.controller.events.dropped
+                else contract_module.HealthState.OK
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "_outbox_depth_growing", dropping)
+
+    elif mode == "doc_values":
+        # The document publishes the OPPOSITE of what the code enforces, in the
+        # three places the L3 found it could: a lane that cannot vend saying it
+        # can, a version nobody would recognise, and a never-alarm code
+        # rewritten into a measured, healthy, page-a-technician one.
+        #
+        # Applied to the PARSED examples rather than to the file, so it runs in
+        # CI without editing a tracked document. The equivalent edits to
+        # docs/CONTRACT.md itself turn the same tests red -- the receipt runs
+        # them that way.
+        from lane_controller.contract import MalfunctionCode as _Code
+
+        original_payloads = test_module.doc_payloads
+
+        def doctored():
+            doc = original_payloads()
+            doc["lane"]["capabilities"]["can_vend"] = True
+            doc["state"]["contract_version"] = 99
+            for row in doc["health"]["codes"]:
+                if row["code"] == _Code.REFERENCE_NOT_RECOGNISED.value:
+                    row["source"] = "measured"
+                    row["never_alarm"] = False
+                    row["caveat"] = "PAGE A TECHNICIAN. The reference view is not recognised."
+            return doc
+
+        monkeypatch.setattr(test_module, "doc_payloads", doctored)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_LANE_CONTRACT mode: {mode}")
