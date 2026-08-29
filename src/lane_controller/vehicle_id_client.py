@@ -44,7 +44,7 @@ from datetime import UTC, datetime
 
 from vehicle_id.contract import Read
 
-from .interfaces import Frame, VehicleIdentity
+from .interfaces import Frame, Unavailable, VehicleIdentity
 
 log = logging.getLogger(__name__)
 
@@ -82,34 +82,18 @@ NO_IDENTITY = VehicleIdentity(plate=None, confidence=0.0)
 # Every one is decided from the EXCEPTION TYPE. None is decided by matching
 # text in a message: a message is not a structure, and the day someone rewords
 # one, a check keyed on it goes quietly wrong.
+#
+# The names below ARE `interfaces.Unavailable`, which is where the set is
+# defined and what the type on `VehicleIdentity` refuses to hold anything
+# outside of. They are bound here because this client is where each one is
+# decided, and the docstring for each is on the member.
 # ---------------------------------------------------------------------------
 
-#: The camera handed us nothing, so the engine was never asked. Not the
-#: engine's fault and named so it cannot be read as one.
-CAUSE_NO_FRAMES = "no_frames"
-
-#: The request could not be completed at all -- nothing listening, no route,
-#: DNS. The usual case is that the engine is not running.
-CAUSE_UNREACHABLE = "unreachable"
-
-#: It is listening and it did not answer inside `timeout`. A different repair
-#: from "it is not running", which is the only reason to separate them.
-CAUSE_TIMEOUT = "timeout"
-
-#: It answered with an error STATUS. The service is up and said no.
-CAUSE_SERVICE_ERROR = "service_error"
-
-#: It answered, and this build cannot use the answer: an unparseable body, a
-#: missing `read`, a record the contract refuses, or a `schema_version` this
-#: build does not understand.
-#:
-#: THOSE ARE NOT SPLIT FURTHER, and that is a decision. Telling the version
-#: refusal apart from the others means either matching the contract's message
-#: text or keeping a second copy here of which versions this build understands
-#: -- a copy that would drift the day the contract's answer changes. The
-#: contract's own reason is on the WARNING line below, next to the read that
-#: produced it.
-CAUSE_BAD_RESPONSE = "bad_response"
+CAUSE_NO_FRAMES = Unavailable.NO_FRAMES
+CAUSE_UNREACHABLE = Unavailable.UNREACHABLE
+CAUSE_TIMEOUT = Unavailable.TIMEOUT
+CAUSE_SERVICE_ERROR = Unavailable.SERVICE_ERROR
+CAUSE_BAD_RESPONSE = Unavailable.BAD_RESPONSE
 
 
 class VehicleIdClient:
@@ -231,7 +215,7 @@ class VehicleIdClient:
             return json.loads(response.read(MAX_RESPONSE_BYTES + 1))
 
 
-def _cause(exc: BaseException) -> str:
+def _cause(exc: BaseException) -> Unavailable:
     """Which failure stopped the lane getting a read, from the exception TYPE.
 
     The order is the classification, and two of the tests are only ordered

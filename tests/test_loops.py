@@ -518,11 +518,12 @@ def _log_events(controller):
     return [e for e in list(controller.events._queue) if e.kind not in SESSION_KINDS]
 
 
-#: One name per branch that reaches the log. The last six are the DECISION
-#: branches, and `test_every_fallback_branch_is_in_that_list` below derives the
-#: fallback half of this list from `Fallback` rather than trusting it: a
-#: hand-written list cannot notice a code added after it was written, which is
-#: exactly what this round adds.
+#: One name per branch that reaches the log, plus one for the branch that can
+#: reach it with a string the lane did not choose. The last six are the
+#: DECISION branches, and `test_every_fallback_branch_is_in_that_list` below
+#: derives the fallback half of this list from `Fallback` rather than trusting
+#: it: a hand-written list cannot notice a code added after it was written,
+#: which is exactly what this round adds.
 PLATE_LEAK_CASES = [
     "entry_confirmed",
     "entry_backed_out",
@@ -534,6 +535,7 @@ PLATE_LEAK_CASES = [
     "low_confidence",
     "no_plate_read",
     "engine_unreachable",
+    "engine_unreachable_free_text",
     "stale_rules",
     "default_allow",
     "default_deny",
@@ -587,6 +589,22 @@ def test_no_log_event_carries_plate_text(case):
             identities=[
                 VehicleIdentity(
                     plate=PLATE_IN_THE_LOG, confidence=0.0, presence=True, unavailable="unreachable"
+                )
+            ]
+        ),
+        # The same branch, reached by an identifier that is not this package's
+        # client. `unavailable` is written into `events.detail` verbatim, so
+        # the case above -- which plants a member of the cause set -- measures a
+        # path on which the field is already safe. This one plants the plate
+        # INSIDE the field, which is the only version of this case that can go
+        # red, and it does when the seam stops constraining the value.
+        "engine_unreachable_free_text": dict(
+            identities=[
+                VehicleIdentity(
+                    plate=PLATE_IN_THE_LOG,
+                    confidence=0.0,
+                    presence=True,
+                    unavailable=f"engine refused the read for {PLATE_IN_THE_LOG}",
                 )
             ]
         ),

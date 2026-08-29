@@ -21,6 +21,14 @@ something next to it.
              say whether to go and look at a camera or a service.
   nodetail   the cause is measured and never written to the event, so it does
              not leave the process.
+  above_presence
+             `unavailable` is looked at BEFORE presence, so a lane that
+             measured nothing there while the engine was also down issues a
+             ticket for a car that does not exist. The other ordering the round
+             created, and the five breaks above all leave it green.
+  freetext   the seam stops constraining `unavailable`, so an identifier that
+             is not this package's client writes its own string into
+             `events.detail`, which the retention purge cannot reach.
 
 This also proves the suite RUNS. A guarantee that can quietly stop being
 collected is not a guarantee -- and a suite that never ran would pass control A
@@ -40,6 +48,8 @@ BREAKAGES = [
     ("swallow", "every fallback is reported as an unreachable engine"),
     ("onecause", "every failure reports the same cause"),
     ("nodetail", "the cause never reaches the event"),
+    ("above_presence", "`unavailable` is checked before presence"),
+    ("freetext", "the seam stops constraining `unavailable`"),
 ]
 
 
