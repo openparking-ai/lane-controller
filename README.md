@@ -40,7 +40,7 @@ being impossible rather than on us being careful.
 
 **Every loop count, spacing and window is a per-site setting** in `[loops]`, and
 every one of them is an ASSUMPTION until a site measures it — nothing here
-measures a spacing or a crossing time. A site with one arming loop and no
+measures a spacing. A site with one arming loop and no
 closing loops runs exactly as it always did; what it does not get is named in
 the record on every vehicle rather than described in a document.
 
@@ -53,11 +53,28 @@ past their configured age, the lane falls back rather than acting on pricing it
 no longer trusts.
 
 When identification is not confident enough, the
-lane takes an explicit fallback path — `LOW_CONFIDENCE`, `NO_PLATE_READ`,
-`UNKNOWN_VEHICLE` or `STALE_RULES` — each of which is a named outcome with an
+lane takes an explicit fallback path — the `Fallback` members in
+`decision.py` — each of which is a named outcome with an
 event behind it. It does not pick the most likely plate and open the gate.
 Confidence is checked *before* the plate is used to look anything up, so a
 low-confidence read cannot match a rule by accident.
+
+## The lane's contract
+
+Everything outside this process reads the lane through one versioned contract —
+[docs/CONTRACT.md](docs/CONTRACT.md). Our own intercom agent will be an ordinary
+client of it, and a lane that is not ours can take the same seat:
+`tests/third_party_lane/` is a minimal one, and the same consumer code reads
+both.
+
+```sh
+lane-controller serve --config lane.toml
+```
+
+Loopback by default; off loopback it refuses to start without a token.
+
+**This contract version is read only.** No route on it opens a barrier, closes a
+session, or changes anything at all.
 
 ## Talking to the platform
 
@@ -127,6 +144,7 @@ pytest
 ruff check .
 python scripts/offline_fail_control.py       # breaks the outbox, requires the tests to fail
 python scripts/confirmation_fail_control.py  # breaks the confirmation, same requirement
+python scripts/contract_fail_control.py      # breaks the read contract, same requirement
 ```
 
 ## Vehicle ID

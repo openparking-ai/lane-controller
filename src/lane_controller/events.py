@@ -40,6 +40,12 @@ class EventTransport(Protocol):
 #: Kinds that move money. These are never dropped to make room.
 SESSION_KINDS = frozenset({"session_open", "session_close"})
 
+#: How many recent events the read contract's cursor can still serve. A
+#: consumer that falls further behind than this has a bigger problem than a
+#: cursor. Same shape and same size as the Vehicle ID service's read history,
+#: so one consumer holds one policy for both.
+DEFAULT_HISTORY = 256
+
 
 class EventQueue:
     """Bounded for the log, unbounded for the money.
@@ -58,12 +64,28 @@ class EventQueue:
     """
 
     def __init__(
-        self, transport: EventTransport | None = None, *, max_events: int = 10_000
+        self,
+        transport: EventTransport | None = None,
+        *,
+        max_events: int = 10_000,
+        history: int = DEFAULT_HISTORY,
     ) -> None:
         self._log: deque[LaneEvent] = deque(maxlen=max_events)
         self._sessions: deque[LaneEvent] = deque()
         self._transport = transport
         self.dropped = 0
+        # The READ side of the contract, and it is NOT the outbox. `flush()`
+        # clears the outbox because those items have been delivered; a consumer
+        # reading `GET /v1/lane/events` has not, and clearing what it has not
+        # collected yet would make the cursor mean nothing.
+        #
+        # In memory, bounded, and lost on a restart -- which is the same thing
+        # the Vehicle ID service says about its own read store, in the same
+        # words: a catch-up window for a consumer that blinked, not a record of
+        # anything. This package still has no state store and this does not
+        # become one.
+        self._history: deque[tuple[int, LaneEvent]] = deque(maxlen=history)
+        self._cursor = 0
 
     @property
     def _queue(self) -> list[LaneEvent]:
@@ -72,6 +94,8 @@ class EventQueue:
 
     def record(self, kind: str, lane_id: str, **detail: Any) -> LaneEvent:
         event = LaneEvent(kind=kind, lane_id=lane_id, at=time.time(), detail=detail)
+        self._cursor += 1
+        self._history.append((self._cursor, event))
         if kind in SESSION_KINDS:
             self._sessions.append(event)
             return event
@@ -104,3 +128,24 @@ class EventQueue:
     @property
     def pending(self) -> int:
         return len(self._log) + len(self._sessions)
+
+    # --- the read side of the contract ------------------------------------
+
+    @property
+    def transport(self) -> EventTransport | None:
+        """Where the outbox drains to, or None for a lane with no platform.
+
+        Read by the contract to answer `has_platform`, so that capability is
+        the WIRING rather than a flag somebody set. Standalone is a supported
+        mode, and a lane in it should not have to declare itself one.
+        """
+        return self._transport
+
+    @property
+    def cursor(self) -> int:
+        """Monotonic within one run, and not durable across a restart."""
+        return self._cursor
+
+    def since(self, cursor: int) -> list[tuple[int, LaneEvent]]:
+        """Everything still held whose cursor is greater than `cursor`."""
+        return [(seq, event) for seq, event in self._history if seq > cursor]

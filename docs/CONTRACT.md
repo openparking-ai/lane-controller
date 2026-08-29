@@ -1,0 +1,334 @@
+# The lane contract
+
+This is the lane's public surface. Everything else in the repository is an
+implementation detail that may be rewritten; this is not.
+
+Open Parking AI's own software integrates through exactly what is described
+here. There is no private path, no second mode and no in-process shortcut
+reserved for us — so if this contract is inadequate, we find out first.
+
+**A lane that is not ours can take this seat.** `tests/third_party_lane/` is a
+minimal lane that implements this contract and nothing else — no loops, no
+confirmation, reasons outside our vocabulary — and the same consumer code reads
+it and reads ours. If that test ever needs a special case for either lane, this
+contract is wrong.
+
+---
+
+## This version is READ ONLY
+
+Four routes, all `GET`. There is **no vend route and no resolve route**: nothing
+here opens a barrier, closes a session, or changes anything at all. Every other
+method is answered `405` with `Allow: GET`.
+
+That is not an omission to be filled in quietly. The act surface is a later
+round, deliberately after the display and the agent, because it is the first
+thing that can open a barrier — and a new route to a vend is the boundary every
+outside reviewer of this project has named. `capabilities.can_vend` exists so a
+consumer can **ask**, and it is `false` here.
+
+## Compatibility
+
+`contract_version` is `1`, and every payload carries it.
+
+- **Additive changes do not bump it.** New fields may appear. Ignore fields you
+  do not recognise rather than rejecting the payload.
+- **Anything a consumer could notice bumps it** — a field removed, renamed, or
+  changed in meaning or type.
+- **An unrecognised version is refused, not partially read.** Half-understanding
+  a payload about a vehicle is worse than admitting you cannot read it.
+
+This is the same policy the [Vehicle ID
+contract](https://github.com/openparking-ai/vehicle-id/blob/main/docs/CONTRACT.md)
+states, in the same words, so one consumer can hold one policy for both.
+
+---
+
+## `GET /v1/lane` — who this lane is, and what it can do
+
+<!--payload:lane-->
+```json
+{
+  "lane_id": "lane-1",
+  "site_id": "site-1",
+  "direction": "entry",
+  "contract_version": 1,
+  "geometry": {
+    "arming_loops": 2,
+    "arming_spacing_m": 1.5,
+    "closing_loops": 2,
+    "closing_spacing_m": 1.5,
+    "confirmation_window_seconds": 10.0
+  },
+  "capabilities": {
+    "confirms_entry": true,
+    "has_identity_service": true,
+    "has_platform": true,
+    "has_display": false,
+    "can_vend": false
+  }
+}
+```
+
+`direction` is `entry` or `exit` — a physical lane runs in one direction, and a
+controller does one or the other, never both.
+
+`geometry` is **exactly** what the lane writes on every vehicle under
+`geometry_assumed`: the same dict, from the same method
+(`LoopConfig.as_published()`). It is not a second rendering of the loop
+geometry, because a second rendering is a second thing to go stale. Every value
+in it is a **per-site setting and an assumption** — nothing in this package
+measures a spacing.
+
+### The capability set
+
+Each of these is derived from the lane it describes — its declared geometry,
+its wiring, its route table — and none is a flag somebody set.
+
+| | |
+|---|---|
+| `confirms_entry` | Two loops after the barrier can say whether a vehicle actually went through. **`false` is an ordinary lane, not a broken one**, and a consumer must have a case for a lane that cannot confirm anything, because a third-party lane usually cannot. |
+| `has_identity_service` | This lane is wired to an identification service. `false` means identity comes from somewhere else, or from nowhere. |
+| `has_platform` | This lane reports to a platform. **`false` is standalone, which is a supported mode and not a degraded one.** |
+| `has_display` | A display this lane can put a per-arrival code on. `false` until a display seam exists; derived from the wiring, so the day one is wired this follows it. |
+| `can_vend` | Whether this lane exposes a route that opens a barrier. `false` for the whole of this contract version, derived from the service's own act-route table — so a vend route cannot be added without this answer changing with it. |
+
+## `GET /v1/lane/state` — the last decision, and the current transit
+
+<!--payload:state-->
+```json
+{
+  "contract_version": 1,
+  "decision": {
+    "outcome": "fallback",
+    "reason": "engine_unreachable",
+    "fallback": "engine_unreachable",
+    "cause": "unreachable",
+    "presence": true,
+    "at": "2026-08-30T14:03:11.482913+00:00",
+    "read_ref": null
+  },
+  "transit": {
+    "state": "pending",
+    "since": "2026-08-30T14:03:11.482913+00:00"
+  }
+}
+```
+
+**`decision` is `null` until this lane has decided something.** It lives in
+memory for as long as the process does; this package has no state store and
+this contract does not add one. After a restart `decision` is `null` and
+`transit.state` is `none` — which is the honest answer, and is not the same
+thing as "nothing has ever happened here".
+
+### `outcome` is CLOSED. `reason` is OPEN.
+
+`outcome` is one of the values of `decision.Outcome`, and that set will not
+grow without a version bump. A consumer has to be able to branch on what
+happened to the vehicle — admitted, refused, handed to a human, or nothing was
+there — and a lane that could invent a fifth would leave every consumer with a
+case it has no behaviour for.
+
+`reason` is where a lane's own vocabulary goes, and it is an **open string with
+a required closed subset**. The subset is `contract.REQUIRED_REASONS`, derived
+from `decision.Fallback` — this document does not list it, because a
+hand-written copy of a set the code defines is the copy that goes wrong.
+
+**A lane that is not ours may emit a reason outside that subset, and will.** A
+consumer that does not recognise a reason **escalates** — it hands the vehicle
+to a human. It does not map the reason onto the nearest thing it knows, and it
+does not treat it as a fallback it understands. Guessing here is the standing
+acceptance of this project broken at the seam it matters most.
+
+`fallback` is **derived from `reason`**, not stored beside it: it carries the
+value when the reason is a member of our closed subset and `null` when it is
+not. So the two cannot come to disagree, and `"fallback": null` on an outcome of
+`fallback` is precisely the signal to escalate.
+
+`cause` says **which** failure stopped the lane getting a read at all, and is
+`null` when it got one. Open in the same way, with `contract.REQUIRED_CAUSES`
+— derived from `interfaces.Unavailable` — as the subset a consumer may assume.
+It exists because a dead identification engine and a marginal plate read used
+to arrive as the same code, and an agent reading that code would tell a driver
+to wipe a plate while the service was switched off.
+
+`presence` is `true`, `false`, or `null` for **not measured**. A consumer that
+reads `null` as `false` turns every lane without a reference view into one that
+refuses every customer.
+
+`read_ref` is the identification this decision was made from, when the
+identifier names one — Vehicle ID's `read_id`, which is unique per
+identification and stable across re-delivery. `null` when no read was obtained,
+and `null` from an identifier that does not name its reads.
+
+### The transit
+
+`transit.state` is one of `contract.TransitState`, and `since` is `null`
+exactly when the state is `none`.
+
+`held` is neither a confirmation nor a refutation, and is never folded into
+either: voiding it silently re-creates the abandoned-ticket fraud, and promoting
+it to a session is the phantom occupant that fills a garage on paper before it
+fills in concrete.
+
+`backed_out` means the loops saw the crossing go the other way. **Read it with
+`direction`** — at an `exit` lane that is a vehicle that reversed back inside,
+which is a different fact about different money from a vehicle that backed out
+of an entry.
+
+## `GET /v1/lane/health` — every malfunction code, every time
+
+<!--payload:health-->
+```json
+{
+  "contract_version": 1,
+  "codes": [
+    {
+      "code": "reference_not_recognised",
+      "state": "unknown",
+      "source": "not_measured",
+      "never_alarm": true,
+      "caveat": "NOT an alarm. This code originates in the identification engine, which publishes what the one reason covers in its own `camera_faults_caveat` -- read that, not this. One of the causes it covers is an ordinary car arriving, so paging a human on this code is the failure the caveat exists to prevent."
+    }
+  ]
+}
+```
+
+One entry per member of `contract.MalfunctionCode`, and **every one of them
+ships on every response**. A payload missing a code is refused when it is built,
+because a code that is absent reads to a consumer exactly like a code that is
+fine. This document does not list the codes for the same reason it does not list
+the reasons.
+
+### `state`, and why `unknown` is not `ok`
+
+| | |
+|---|---|
+| `ok` | Somebody measured, and found nothing wrong. |
+| `active` | The malfunction is happening. |
+| `unknown` | **Nobody measured.** |
+
+**A consumer may never read `unknown` as `ok`.** At a lane, `false` is not a
+safe default and neither is a clean bill of health: the value that means "I
+cannot tell" is its own value, and it is this one.
+
+That is enforced rather than asked for. `ok` and `active` are claims about a
+measurement, and `contract.HealthEntry` **refuses** either from a code whose
+source is not `measured`.
+
+### `source`, and why a health surface needs one
+
+| | |
+|---|---|
+| `measured` | This build derives a state for the code from something it observes. |
+| `not_measured` | A signal exists — named below — but this build does not read it, so it has nothing to say. |
+| `no_source` | Nothing in this system produces this signal at all. It stays `unknown` until something is built that can answer it. |
+
+The distinction is the difference between the two kinds of work: closing a
+`not_measured` code is **reading something that already exists**, and closing a
+`no_source` code is **building it**. A surface that reported them the same way
+would hide which of those an operator is waiting for.
+
+Where the `not_measured` signals live today, so nobody has to go looking:
+
+- the arming and closing loop codes — the lane already writes an event per
+  vehicle (`arming_incomplete`, `entry_held` / `exit_held`); what does not exist
+  is the aggregation that turns a run of them into a fault;
+- the camera and reference codes — the identification engine's own
+  `GET /v1/health`, under `camera_faults`; this lane reads only
+  `threshold_applied` from that response;
+- `identity_service_degraded` — the same response's `status`;
+- `lane_gone_quiet` — the platform writes `lane_devices.last_seen_at` on every
+  authenticated lane request and publishes it on no route;
+- `clock_skew_rejected` — the platform answers `409` and this lane counts it,
+  undifferentiated, with every other refusal. It is the most expensive code on
+  this list: a lane whose clock runs fast has its session opens and closes
+  dead-lettered, and the money record loses them.
+
+### `never_alarm`
+
+`never_alarm` and `caveat` come from one mapping (`contract.NEVER_ALARM`), so a
+code cannot be published as safe in one payload and alarmed on in the next.
+
+`reference_not_recognised` is on it. That code originates in the identification
+engine, whose own `camera_faults_caveat` says what the one reason covers — and
+one of the causes it covers is **an ordinary car arriving**. A gate that pages a
+technician because a car arrived is the failure that caveat exists to prevent,
+so a monitor built on this surface must not page a human on it.
+
+## `GET /v1/lane/events?since=N` — the cursor
+
+<!--payload:events-->
+```json
+{
+  "contract_version": 1,
+  "cursor": 7,
+  "reset": false,
+  "dropped": 0,
+  "events": [
+    {
+      "cursor": 7,
+      "event_id": "9f2c1a7d-4e8b-40c2-a1f6-d3b8e5c07a91",
+      "kind": "decision",
+      "lane_id": "lane-1",
+      "occurred_at": "2026-08-30T14:03:11.482913+00:00",
+      "detail": {}
+    }
+  ]
+}
+```
+
+Deliberately the same shape and the same semantics as the Vehicle ID service's
+`GET /v1/reads?since=N`, field for field, so one consumer can hold one cursor
+policy for both surfaces.
+
+- The cursor is **monotonic within one run** and is **not durable across a
+  restart**. It is a catch-up window for a consumer that blinked, not a record of
+  anything. The durable copy of what happened at a lane belongs to the platform
+  it reports to.
+- `since` ahead of the lane's own cursor sets **`reset`**. That means the
+  process restarted and your saved position no longer refers to anything. An
+  empty list without that flag would be indistinguishable from "nothing
+  happened", which is how a consumer silently misses everything after a restart.
+- `dropped` is the lane's count of **log** events discarded because the bounded
+  log reached its limit. **Session actions are never dropped.** It is published
+  because a gap nobody knows about is worse than one that is counted.
+
+`detail` is opaque to this contract. It is whatever the lane recorded with the
+event, and a consumer ignores keys it does not recognise.
+
+## Running it
+
+```sh
+lane-controller serve --config lane.toml
+```
+
+Binds `127.0.0.1:8090`. **Local by design** — this is meant to run on the same
+device as the lane it describes.
+
+**Off loopback it refuses to start without a credential.** `--host` anything but
+loopback requires `--token-file`, and with a token every route requires
+`Authorization: Bearer <token>` and answers `401` without it. The exposure that
+rule exists for is real: on a lane's own LAN this publishes where a vehicle was,
+when it was there, and what the lane decided about it.
+
+**The token is read from a FILE, never from a flag value.** A value on the
+command line is readable by every user on the box for as long as the process
+runs.
+
+There is no flag that turns any of that off.
+
+## What is NOT here, stated rather than left to be discovered
+
+- **No act surface.** No vend, no resolve, no route that changes anything.
+- **No state store.** `decision` and `transit` are lost on a restart and the
+  contract says so, rather than reporting the last thing it happened to
+  remember.
+- **No SIP identity.** Which lane an intercom call belongs to is unbound. It
+  belongs with the agent, and binding it here would mean refusing every
+  configuration file that exists today for a field nothing yet reads.
+- **No display.** `has_display` is `false` everywhere, because there is no
+  display seam in this package.
+- **Health states for most codes.** Three are derived; the rest answer
+  `unknown` and say why in `source`. A monitor that turns these into alerts is
+  a separate process and is not this.
