@@ -17,8 +17,8 @@ arming loops ─▶ grab frames ─▶ identify ─▶ decide ─▶ vend ─▶
 **The ticket is not the entry.** A driver can pull up, take a ticket and drive
 away; a vend with nothing behind it is not an arrival. So the vend creates a
 PENDING entry, and two loops after the barrier, crossed in order inside the
-confirmation window, promote it to a session. Nothing counts toward occupancy
-or billing until it is promoted. An entry that is never confirmed is HELD and
+confirmation window, promote it to a session.
+An entry that is never confirmed is HELD and
 flagged — never voided silently, and never turned into a session.
 
 **It narrows the fraud rather than closing it**: a ticket with no car becomes a
@@ -52,7 +52,7 @@ afterwards; the barrier never waits on a network call. If the rules go stale
 past their configured age, the lane falls back rather than acting on pricing it
 no longer trusts.
 
-**It is never wrong silently.** When identification is not confident enough, the
+When identification is not confident enough, the
 lane takes an explicit fallback path — `LOW_CONFIDENCE`, `NO_PLATE_READ`,
 `UNKNOWN_VEHICLE` or `STALE_RULES` — each of which is a named outcome with an
 event behind it. It does not pick the most likely plate and open the gate.
