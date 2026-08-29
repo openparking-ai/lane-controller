@@ -8,14 +8,17 @@ guards and requires this file to go red.
 
 from __future__ import annotations
 
+import io
 import json
 import re
+import socket
+import time
 import urllib.error
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from vehicle_id.contract import ANSWER, Engine, Identity, Read
+from vehicle_id.contract import ANSWER, SCHEMA_VERSION, Engine, Identity, Read
 
 from lane_consumer import LaneConsumer
 from lane_controller import (
@@ -31,7 +34,10 @@ from lane_controller import (
     VehicleIdentity,
 )
 from lane_controller.cli import build_parser
-from lane_controller.config import DEFAULT_OUTBOX_DEPTH_THRESHOLD
+from lane_controller.config import (
+    DEFAULT_IDENTITY_HEALTH_TIMEOUT_S,
+    DEFAULT_OUTBOX_DEPTH_THRESHOLD,
+)
 from lane_controller.contract import (
     CONTRACT_VERSION,
     FALLBACK_REASONS,
@@ -49,8 +55,9 @@ from lane_controller.contract import (
     Transit,
     TransitState,
 )
-from lane_controller.events import DEFAULT_HISTORY, SESSION_KINDS
+from lane_controller.events import DEFAULT_HISTORY, SESSION_KINDS, LaneEvent
 from lane_controller.interfaces import ClosingSequence, Unavailable
+from lane_controller.platform_client import PlatformClient
 from lane_controller.service import (
     ACT_ROUTES,
     READ_ROUTES,
@@ -69,6 +76,7 @@ from lane_controller.simulated import (
     StubVehicleIdentifier,
 )
 from lane_controller.sync import SESSION_OPEN as SESSION_OPEN_KIND
+from lane_controller.sync import PlatformTransport
 from lane_controller.vehicle_id_client import VehicleIdClient
 from serving import serving
 
@@ -137,6 +145,13 @@ def bare_lane():
 # ---------------------------------------------------------------------------
 
 
+#: The blocks in the document that are a ROUTE's payload. `sets` is in the same
+#: marked-block mechanism and is deliberately not one of them: it publishes the
+#: closed sets a third party needs in order to implement this contract at all,
+#: and it is compared against the ENUMS rather than against a live response.
+ROUTE_PAYLOADS = {"lane", "state", "health", "events"}
+
+
 def doc_payloads() -> dict[str, dict]:
     """Every `<!--payload:NAME-->` example in `docs/CONTRACT.md`, parsed."""
     text = CONTRACT_DOC.read_text(encoding="utf-8")
@@ -175,9 +190,10 @@ def test_the_document_shows_exactly_the_payloads_the_code_builds():
     against it, so a field added, renamed or dropped in either one goes red.
     """
     doc = doc_payloads()
-    assert set(doc) == {"lane", "state", "health", "events"}, (
-        "every route in the contract has a payload example, and every example "
-        f"belongs to a route. Found {sorted(doc)}"
+    assert set(doc) == ROUTE_PAYLOADS | {"sets"}, (
+        "every route in the contract has a payload example, every example "
+        "belongs to a route, and `sets` is the closed-set block that is not a "
+        f"route. Found {sorted(doc)}"
     )
 
     controller = full_lane()
@@ -194,7 +210,8 @@ def test_the_document_shows_exactly_the_payloads_the_code_builds():
     # The doc's health example shows ONE entry; the live payload carries every
     # code. Comparing shapes handles that -- a list reduces to its first
     # element -- and completeness is guarantee 3's job, not this one.
-    for name, example in doc.items():
+    for name in sorted(ROUTE_PAYLOADS):
+        example = doc[name]
         assert shape(example) == shape(live[name]), (
             f"docs/CONTRACT.md's `{name}` example does not have the shape "
             f"`contract.py` builds.\n  doc:  {shape(example)}\n  code: {shape(live[name])}"
@@ -347,8 +364,9 @@ def test_reference_not_recognised_is_never_an_alarm():
 def test_the_measured_codes_actually_move():
     """A `measured` source that never changes state is not a measurement.
 
-    Each of the three carries its own control: the condition it names is
-    created, and the state must follow it.
+    Each carries its own control: the condition it names is created, and the
+    state must follow it. The two this round promoted have their own section
+    below, because each needs a service or a platform to answer it.
     """
     service = LaneService(full_lane())
     codes = lambda: {e["code"]: e for e in service.health().to_dict()["codes"]}  # noqa: E731
@@ -989,11 +1007,16 @@ def live_payloads() -> dict[str, dict]:
 
 
 def test_the_documents_contract_version_is_the_codes():
-    """Every example carries it, and it is the constant, not a number."""
-    doc = doc_payloads()
-    carried = {name: body["contract_version"] for name in doc for body in [doc[name]]}
+    """Every ROUTE example carries it, and it is the constant, not a number.
 
-    assert set(carried) == set(doc), "an example dropped contract_version"
+    The closed-set block is not a route's payload and carries no version: it
+    publishes the sets the routes are made of, and stamping a version on it
+    would be a second copy of one.
+    """
+    doc = doc_payloads()
+    carried = {name: doc[name]["contract_version"] for name in sorted(ROUTE_PAYLOADS)}
+
+    assert set(carried) == ROUTE_PAYLOADS, "an example dropped contract_version"
     assert len(carried) == 4, f"the sweep found {len(carried)} payloads, not four"
     for name, version in carried.items():
         assert version == CONTRACT_VERSION, (
@@ -1218,3 +1241,652 @@ def test_the_plate_region_is_still_on_the_events_route_and_this_round_did_not_de
     )
     # And the plate itself is still absent, which is what guarantee 8 holds.
     assert PLATE_ON_THE_WIRE not in json.dumps(page)
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE 11 — the two codes this round CLOSED, and the ones it did not
+#
+# Closing a `not_measured` code is reading something that already exists.
+# `identity_service_degraded` is the identification service's own `status`;
+# `clock_skew_rejected` is the platform's own name for the refusal it already
+# sends. Neither invents a signal, and the codes this round could NOT close are
+# fenced by the test at the end of this section rather than left to a sentence.
+# ---------------------------------------------------------------------------
+
+
+class _AnIdentifierWithHealth:
+    """An identifier that publishes a health route, as the Vehicle ID one does.
+
+    Not a `VehicleIdClient`: the service asks by CAPABILITY, so a third party's
+    identifier publishing the same route is read exactly the way ours is. If
+    this had to be our class, the derivation would be a special case for us.
+    """
+
+    def __init__(self, body):
+        self.body = body
+
+    def identify(self, frames):
+        return VehicleIdentity(plate=None, confidence=0.0)
+
+    def identity_health(self):
+        return self.body
+
+
+def _health_of(controller):
+    return {e["code"]: e for e in LaneService(controller).health().to_dict()["codes"]}
+
+
+def test_the_derived_codes_are_exactly_the_ones_sources_calls_measured():
+    """The half of the invariant `HealthEntry` cannot see.
+
+    `HealthEntry` refuses a code that claims `ok` without being `measured`. The
+    reverse has no guard: a code promoted in `SOURCES` that nothing derives
+    answers `unknown` for ever, and `unknown` from a code labelled `measured`
+    reads as "asked, and could not tell" rather than as "never wired up".
+
+    Both sides are derived here -- the label from `SOURCES`, the derivation from
+    the service -- so neither can be a hand-written list of the other.
+    """
+    derived = set(LaneService(full_lane()).derived_states())
+    labelled = {code for code, source in SOURCES.items() if source is Source.MEASURED}
+
+    assert derived == labelled, (
+        f"derived but not labelled measured: {sorted(c.value for c in derived - labelled)}; "
+        f"labelled measured but not derived: {sorted(c.value for c in labelled - derived)}"
+    )
+    # The control: the comparison is not two empty sets agreeing.
+    assert derived
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"status": "degraded", "schema_version": SCHEMA_VERSION}, "active"),
+        ({"status": "ok", "schema_version": SCHEMA_VERSION}, "ok"),
+        # Unreadable, and unreadable is NOT a clean bill of health. Whether the
+        # service is unreachable is a different code from a different signal.
+        (None, "unknown"),
+        # It answered, and said nothing this build recognises.
+        ({"schema_version": SCHEMA_VERSION}, "unknown"),
+        ({"status": "probably fine", "schema_version": SCHEMA_VERSION}, "unknown"),
+        # A body that is not an object at all.
+        ("degraded", "unknown"),
+    ],
+)
+def test_identity_service_degraded_is_the_engines_own_status(body, expected):
+    """A straight read of the field that service already publishes.
+
+    `degraded` is set when a read was LOST -- it could not be written to the
+    push queue at all -- or when the queue held a line the engine could not
+    read. Both are records that were answered and then existed nowhere, and
+    until this round nothing on this side listened.
+    """
+    controller = full_lane()
+    controller.identifier = _AnIdentifierWithHealth(body)
+
+    entry = _health_of(controller)[MalfunctionCode.IDENTITY_SERVICE_DEGRADED.value]
+    assert entry["state"] == expected
+    assert entry["source"] == Source.MEASURED.value
+
+
+def test_an_identifier_with_no_health_route_leaves_the_code_unknown():
+    """The control for the case set above: the answer is not unconditional.
+
+    A lane identifying some other way has no such route to ask, and `unknown` is
+    the honest answer. Without this, a derivation hard-wired to `ok` would
+    satisfy every row of the table above that expects `ok`.
+    """
+    controller = full_lane()
+    assert not hasattr(controller.identifier, "identity_health")
+
+    entry = _health_of(controller)[MalfunctionCode.IDENTITY_SERVICE_DEGRADED.value]
+    assert entry["state"] == "unknown"
+
+
+# --- the platform's named refusal ------------------------------------------
+
+
+def _refusing_transport(status=409, body='{"error": "no", "code": "stale_exit"}'):
+    """A transport whose platform refuses everything, with a body we choose.
+
+    Built on the REAL `PlatformClient` and the real `PlatformTransport`, so the
+    refusal travels the path a refusal travels: `urllib` raises `HTTPError`, the
+    client classifies it and parses the body, and `_guarded` counts it. A fake
+    that raised `PlatformRejected` directly would skip the parsing, which is the
+    part this round added.
+    """
+
+    def opener(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url, status, "refused", {}, io.BytesIO(body.encode("utf-8"))
+        )
+
+    return PlatformTransport(PlatformClient("http://platform.invalid", "t", opener=opener))
+
+
+def _a_lane_that_talked_to_a_platform(transport):
+    """A lane that has SENT something, so its outbox has attempted a delivery."""
+    controller = a_lane_that_saw_a_car(events=EventQueue(transport=transport))
+    controller.events.flush()
+    return controller
+
+
+def test_clock_skew_rejected_reads_the_platforms_own_name_for_the_refusal():
+    """`active` on the named skew, `ok` on a named refusal that is not one.
+
+    A 409 is the platform's terminal refusal and seven conditions produce one.
+    Six are ordinary. The seventh dead-letters every session open and close this
+    lane sends -- the barrier still works, the driver still gets in, and the
+    money record silently loses the stay.
+    """
+    skew = _a_lane_that_talked_to_a_platform(
+        _refusing_transport(body='{"error": "ahead of the clock", "code": "clock_skew"}')
+    )
+    assert _health_of(skew)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "active"
+    # One vehicle produces more than one platform call -- a session open and a
+    # batched log post -- and this refusal answers both, so the count is
+    # "at least one" rather than a number that depends on how many events a
+    # lane happened to have queued.
+    assert skew.events.transport.skew_rejected > 0
+
+    # The control, and the whole point of the field: another 409 is not this
+    # one. Without this row a code hard-wired to `active` on any refusal would
+    # pass the assertion above.
+    other = _a_lane_that_talked_to_a_platform(
+        _refusing_transport(body='{"error": "stale exit", "code": "stale_exit"}')
+    )
+    assert _health_of(other)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "ok"
+    assert other.events.transport.skew_rejected == 0
+    # It was still dead-lettered. `ok` here is about the CLOCK, not about the
+    # item, and the code that counts the loss is a different one.
+    assert other.events.transport.rejected > 0
+
+
+def test_a_conflict_the_platform_did_not_name_is_unknown_and_never_ok():
+    """A platform too old to name its refusals refuses a skew like everything else.
+
+    So the absence of a name may not be read as "not a skew". This is the row
+    that decides whether the code is honest on the deployment where the failure
+    is invisible, and `ok` there would be a healthy clock reported by something
+    that cannot see the clock.
+    """
+    unnamed = _a_lane_that_talked_to_a_platform(_refusing_transport(body='{"error": "no"}'))
+
+    assert _health_of(unnamed)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "unknown"
+    assert unnamed.events.transport.conflicts_unnamed > 0
+    assert unnamed.events.transport.skew_rejected == 0
+
+
+def test_a_refusal_that_is_not_a_conflict_does_not_muddy_the_clock():
+    """A 400 is a malformed request. It cannot be a skew and is not counted.
+
+    Without the status check, an ordinary bad request would be an unnamed
+    conflict, and the code would answer `unknown` -- a clock reported as
+    unmeasurable because a plate was missing from one call.
+    """
+    bad_request = _a_lane_that_talked_to_a_platform(
+        _refusing_transport(status=400, body='{"error": "plate is required"}')
+    )
+
+    assert _health_of(bad_request)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "ok"
+    assert bad_request.events.transport.conflicts_unnamed == 0
+    assert bad_request.events.transport.rejected > 0
+
+
+def test_the_code_comes_from_the_field_and_not_from_the_message():
+    """The message says `clock_skew` and the field says otherwise. The field wins.
+
+    Every failure classification in this package is decided from a structure
+    rather than from message text, because a message gets reworded and a check
+    keyed on its words goes quietly wrong. This is that rule, asserted where it
+    is newest.
+    """
+    lying = _a_lane_that_talked_to_a_platform(
+        _refusing_transport(body='{"error": "clock_skew clock skew!", "code": "stale_exit"}')
+    )
+
+    assert _health_of(lying)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "ok"
+    assert lying.events.transport.skew_rejected == 0
+
+
+def test_a_body_that_is_not_json_is_an_unnamed_conflict_and_never_an_exception():
+    """This parse runs on the failure path of every platform call.
+
+    A parse error here would replace a refusal the lane knows how to survive
+    with an exception it does not -- on the path that runs after the barrier has
+    already opened.
+    """
+    for body in ("<html>502 nope</html>", "", "[1, 2, 3]", '{"code": 7}'):
+        lane = _a_lane_that_talked_to_a_platform(_refusing_transport(body=body))
+        assert _health_of(lane)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "unknown"
+        assert lane.events.transport.conflicts_unnamed > 0
+
+
+def test_a_lane_that_has_attempted_nothing_has_not_measured_its_clock():
+    """Two lanes that have never been refused, and they are not the same lane.
+
+    One has sent nothing at all: nothing could have been refused, so nothing was
+    measured. `ok` there is a confident negative about a question nobody asked,
+    and it is the answer this code would have given without the attempt counter.
+    """
+    # Built and never run, so nothing has been handed to the platform at all.
+    # `a_lane_that_saw_a_car` flushes as part of handling the vehicle, which is
+    # the other lane in this test.
+    silent = full_lane(events=EventQueue(transport=_refusing_transport()))
+    assert silent.events.transport.attempted == 0
+    assert _health_of(silent)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "unknown"
+
+    # And a lane with no platform at all: nothing to be refused by.
+    standalone = full_lane()
+    assert standalone.events.transport is None
+    assert _health_of(standalone)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "unknown"
+
+
+# --- the deletion, proven ---------------------------------------------------
+
+
+def _not_measured_paragraph() -> str:
+    """The document's list of where the `not_measured` signals live.
+
+    The heading sentence and the bullet list under it -- two blocks, because a
+    Markdown list is separated from its own lead-in by a blank line and taking
+    only as far as the first one would return the heading and nothing else.
+    """
+    text = CONTRACT_DOC.read_text(encoding="utf-8")
+    marker = "Where the `not_measured` signals live today"
+    blocks = text[text.index(marker) :].split("\n\n")
+    return "\n\n".join(blocks[:2])
+
+
+def test_the_documents_not_measured_list_is_exactly_what_sources_says():
+    """Both directions, derived from `SOURCES`, against the list a reader uses.
+
+    The list exists to tell a reader what is waiting to be READ rather than
+    built. A code still on it after the read has been written sends somebody to
+    write code that is already there; a code missing from it is a signal nobody
+    can find. Both are the kind of stale sentence that survives every review,
+    because each was true when it was written.
+
+    Naming every code in the list rather than describing them in groups is what
+    makes this mechanical -- a group heading cannot be compared to an enum.
+    """
+    paragraph = _not_measured_paragraph()
+    named = {code for code in MalfunctionCode if code.value in paragraph}
+    listed = {code for code, source in SOURCES.items() if source is Source.NOT_MEASURED}
+
+    assert named == listed, (
+        f"named in docs/CONTRACT.md but not `not_measured`: "
+        f"{sorted(c.value for c in named - listed)}; "
+        f"`not_measured` but not named: {sorted(c.value for c in listed - named)}"
+    )
+    # The control: neither set is empty, so this is not two blanks agreeing.
+    assert named and listed
+
+
+def test_the_codes_this_round_did_not_close_are_still_unmeasured_and_say_why():
+    """A FACT, pinned so it goes red the day it changes. Not a guarantee.
+
+    Four codes were candidates this round and none of them could be closed by a
+    READ, each for a reason that is in the document beside it:
+
+      * `camera_feed_lost` and `lens_obstructed_or_dark` -- the engine publishes
+        `camera_faults`, which is a COUNT SINCE START. A count is not a state: a
+        camera that failed at 3am and was fixed at 4am reports the same number
+        for ever. Deriving `active` from it would need a rate over a window, and
+        nobody has measured what rate is a fault.
+      * `arming_loops_disagree` and `closing_loops_never_firing` -- the lane
+        writes an event per vehicle already; the fault is a RUN of them, and
+        nobody has measured how many in a row a run is.
+
+    If one of these is closed, this test is what tells you to come and say so.
+    """
+    still_open = {
+        MalfunctionCode.CAMERA_FEED_LOST,
+        MalfunctionCode.LENS_OBSTRUCTED_OR_DARK,
+        MalfunctionCode.ARMING_LOOPS_DISAGREE,
+        MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING,
+    }
+    for code in still_open:
+        assert SOURCES[code] is Source.NOT_MEASURED, (
+            f"{code.value} changed source. That is a decision -- record why it could be read, "
+            "and update this test with it, rather than letting it move"
+        )
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE 12 — THE CONTRACT IS IMPLEMENTABLE FROM THE DOCUMENT
+#
+# The document used to say it did not list the codes, on the reasoning that a
+# hand-written copy of a set the code defines is the copy that goes wrong. The
+# reasoning is right; the conclusion moved the copy into every implementer's
+# guess instead. Five of twenty-one codes appeared anywhere in it, none of the
+# four outcomes a consumer is told to branch on, and the stub in this repository
+# that exists to prove a stranger can take this seat imported our Python package
+# for exactly the sets the document withheld.
+#
+# So the sets are published, and the copy is held to the code HERE: every member
+# compared against its enum, in both directions. Dropping one from the document
+# goes red, and so does adding one to an enum without adding it to the document.
+# ---------------------------------------------------------------------------
+
+
+#: Every closed set the document publishes in full, keyed to where it comes
+#: from. Derived from the enums, never typed: a hand-written expectation here
+#: would be a third copy, and the third copy lies too.
+PUBLISHED_SETS = {
+    "malfunction_codes": lambda: [code.value for code in MalfunctionCode],
+    "outcomes": lambda: list(OUTCOMES),
+    "transit_states": lambda: [state.value for state in TransitState],
+    "never_alarm": lambda: [code.value for code in NEVER_ALARM],
+}
+
+
+def test_the_document_publishes_every_member_of_every_closed_set():
+    """Both directions, per set, against the enum the set comes from.
+
+    A missing member is a lane an implementer cannot write; an extra one is a
+    value the code would refuse, taught to somebody as though it arrived.
+    Compared as ORDERED lists, because the document is what a person reads and a
+    set that arrives shuffled every time it is regenerated produces a diff on
+    every touch.
+    """
+    published = doc_payloads()["sets"]
+
+    assert set(published) == set(PUBLISHED_SETS), (
+        "the document's closed-set block and the sets this test knows about have "
+        f"diverged: {sorted(published)} vs {sorted(PUBLISHED_SETS)}"
+    )
+    for name, from_the_code in PUBLISHED_SETS.items():
+        expected = from_the_code()
+        assert published[name] == expected, (
+            f"docs/CONTRACT.md publishes {name}={published[name]}; the code holds {expected}"
+        )
+        # The control for this row: the comparison is not two empty lists
+        # agreeing, which is what a renamed key would reduce it to.
+        assert expected, f"{name} is empty, so comparing it proves nothing"
+
+
+def test_the_published_code_set_is_the_one_every_health_payload_ships():
+    """The set in the document and the set on the wire are the same set.
+
+    The test above compares the document to an ENUM. This compares it to a
+    served payload, so a document that agreed with an enum nothing shipped would
+    still go red.
+    """
+    published = doc_payloads()["sets"]["malfunction_codes"]
+    served = [entry["code"] for entry in live_payloads()["health"]["codes"]]
+
+    assert sorted(published) == sorted(served)
+    assert len(served) == len(set(served)), "a code ships twice"
+
+
+def test_the_document_no_longer_withholds_the_code_list():
+    """The deletion, proven, with the control that the search can see this file.
+
+    An absence claim is a claim about a SEARCH. So the sentence that used to
+    withhold the codes is searched for and must be gone, and a sentence that is
+    still there is searched for with the same reader and must be found.
+    """
+    text = CONTRACT_DOC.read_text(encoding="utf-8")
+
+    assert "This document does not list the codes" not in text
+    # THE CONTROL: the same read of the same file finds text that IS there, so
+    # "not in text" is a fact about the document rather than about the read.
+    assert "One entry per member of `contract.MalfunctionCode`" in text
+    assert "<!--payload:sets-->" in text
+
+
+def test_never_alarm_is_a_boolean_on_every_entry_of_every_response():
+    """The field the monitor is now required to read as a boolean, from OUR lane.
+
+    The reader refuses a payload whose `never_alarm` is absent or is not a
+    boolean -- absent could be a lane with nothing to say or a serialiser that
+    dropped it, and the two point in opposite directions. This is the half of
+    that agreement that belongs here: our own lane emits one, of the right type,
+    on every entry of every response.
+    """
+    served = live_payloads()["health"]["codes"]
+    assert served, "the health payload carried no codes, so this asserts nothing"
+    for entry in served:
+        assert "never_alarm" in entry, f"{entry['code']} ships without never_alarm"
+        assert isinstance(entry["never_alarm"], bool), (
+            f"{entry['code']} ships never_alarm={entry['never_alarm']!r}, which is not a boolean"
+        )
+        assert isinstance(entry["state"], str)
+    # The control: both values of the flag really occur, so a payload that
+    # hard-coded one of them would not satisfy this.
+    assert {entry["never_alarm"] for entry in served} == {True, False}
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE 13 — THE HEALTH ROUTE'S OWN BOUND
+#
+# `identity_service_degraded` is read on the request, from a process that is
+# usually on another machine. Until this round the route waited for that
+# client's own timeout -- five seconds, the same number the monitor watching
+# this lane waits -- so a HUNG identification service was published as a DEAD
+# LANE, and every real signal this lane publishes was retired at the same
+# moment. A slow third machine, reported as a fault on this one.
+# ---------------------------------------------------------------------------
+
+
+def _a_socket_that_never_answers():
+    """A listener that accepts the connection and then says nothing, ever.
+
+    A HUNG service, which is a different fault from a refused one: a refused
+    connection returns immediately and this does not return at all. It is the
+    case a timeout exists for, and the one no test in this suite had.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    return sock
+
+
+def _lane_reading_a_hung_identity_service(sock, timeout_s=None):
+    controller = full_lane()
+    controller.identifier = VehicleIdClient(
+        endpoint=f"http://127.0.0.1:{sock.getsockname()[1]}"
+    )
+    if timeout_s is not None:
+        controller.config = replace(controller.config, identity_health_timeout_s=timeout_s)
+    return controller
+
+
+def test_the_health_route_does_not_wait_on_a_hung_service_for_longer_than_its_own_bound():
+    """The lane answers in about a second, and says `unknown` about that code.
+
+    `unknown` and not `ok`: nobody measured. `unknown` and not `active` either
+    -- a service that has not answered has not been found degraded, and folding
+    a hang into a degradation would page a human about the wrong machine.
+
+    The upper bound is what makes this a measurement rather than a restatement:
+    the identification client's own timeout is five seconds, so an answer inside
+    four proves the bound applied is THIS LANE'S and not that client's.
+    """
+    sock = _a_socket_that_never_answers()
+    try:
+        controller = _lane_reading_a_hung_identity_service(sock)
+        assert controller.config.identity_health_timeout_s == DEFAULT_IDENTITY_HEALTH_TIMEOUT_S
+
+        started = time.monotonic()
+        entry = _health_of(controller)[MalfunctionCode.IDENTITY_SERVICE_DEGRADED.value]
+        elapsed = time.monotonic() - started
+
+        assert entry["state"] == "unknown"
+        assert entry["source"] == Source.MEASURED.value
+        assert elapsed >= DEFAULT_IDENTITY_HEALTH_TIMEOUT_S, (
+            f"the route answered in {elapsed:.3f}s, which is less than the bound it claims to "
+            "apply -- it did not wait for the service at all"
+        )
+        assert elapsed < 4.0, (
+            f"the route waited {elapsed:.3f}s on a hung service. The bound applied is not this "
+            "lane's; it is whatever the identification client happens to use"
+        )
+        # And the rest of the payload is still there. A hung third machine costs
+        # this one field, not the response: every other code still ships, which
+        # is the whole difference between this and a lane that stops answering.
+        assert len(_health_of(controller)) == len(MalfunctionCode)
+    finally:
+        sock.close()
+
+
+def test_the_bound_is_the_sites_setting_and_moving_it_moves_the_answer():
+    """The control for the test above: it is a SETTING, not a constant.
+
+    Without this, a hard-coded one-second sleep would satisfy every assertion
+    there. A site that lowers it waits less, measurably, on the same hung
+    socket.
+    """
+    sock = _a_socket_that_never_answers()
+    try:
+        controller = _lane_reading_a_hung_identity_service(sock, timeout_s=0.2)
+
+        started = time.monotonic()
+        entry = _health_of(controller)[MalfunctionCode.IDENTITY_SERVICE_DEGRADED.value]
+        elapsed = time.monotonic() - started
+
+        assert entry["state"] == "unknown"
+        assert 0.2 <= elapsed < 1.0, (
+            f"the route waited {elapsed:.3f}s with the setting at 0.2s, so the number it honours "
+            "is not the site's"
+        )
+    finally:
+        sock.close()
+
+
+def test_a_timeout_that_is_not_a_positive_number_of_seconds_is_refused():
+    """Zero would be a lane that never asks, reporting `unknown` for ever."""
+    for bad in (0, -1.0, "1.0", True, None):
+        with pytest.raises(ValueError, match="identity_health_timeout_s"):
+            replace(full_lane().config, identity_health_timeout_s=bad)
+    # The control: the same construction with a real value builds.
+    assert replace(full_lane().config, identity_health_timeout_s=2.5)
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE 14 — THE HEALTH READ CHECKS THE VERSION IT IS READING
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        # The version this build understands -- taken from the ENGINE's own
+        # contract, so a lane that pinned a number of its own goes red here.
+        (SCHEMA_VERSION, "active"),
+        # A version it does not: refused, not partially read. Both contracts
+        # state that policy in the same words, and the read path already obeys
+        # it -- this is the same payload from the same service.
+        (99, "unknown"),
+        (0, "unknown"),
+        # `True == 1`, so a bool would otherwise read as version 1.
+        (True, "unknown"),
+        ("1", "unknown"),
+        # A payload that does not say which contract it is is not one this
+        # build can place.
+        (None, "unknown"),
+    ],
+)
+def test_the_health_read_refuses_a_schema_version_this_build_does_not_know(version, expected):
+    body = {"status": "degraded"}
+    if version is not None:
+        body["schema_version"] = version
+
+    controller = full_lane()
+    controller.identifier = _AnIdentifierWithHealth(body)
+
+    entry = _health_of(controller)[MalfunctionCode.IDENTITY_SERVICE_DEGRADED.value]
+    assert entry["state"] == expected
+    assert entry["source"] == Source.MEASURED.value
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE 15 — `clock_skew_rejected` COMES BACK
+#
+# It was a latch that read like a state: one skew and the code was `active`
+# until the process restarted, however long ago the clock was fixed. At a
+# monitor that means `recovered` could never fire for it -- the operator repairs
+# the clock, the money record starts recording again, and the surface stays red,
+# which is how a surface trains its reader to skim.
+# ---------------------------------------------------------------------------
+
+
+class _RefusesUntilTold:
+    """A platform that refuses every write, until a test says it accepts one."""
+
+    def __init__(self, body: str) -> None:
+        self.refusing = True
+        self.body = body
+
+    def __call__(self, request, timeout=None):
+        if self.refusing:
+            raise urllib.error.HTTPError(
+                request.full_url, 409, "refused", {}, io.BytesIO(self.body.encode("utf-8"))
+            )
+        return io.BytesIO(b"{}")
+
+
+def _a_lane_talking_to(opener):
+    transport = PlatformTransport(PlatformClient("http://platform.invalid", "t", opener=opener))
+    return full_lane(events=EventQueue(transport=transport)), transport
+
+
+def _one_log_event(controller):
+    """One ordinary event, delivered through the real transport and `_guarded`."""
+    return LaneEvent(kind="decision", lane_id=controller.config.lane_id, at=0.0, detail={})
+
+
+@pytest.mark.parametrize(
+    ("refusal", "raised_state"),
+    [
+        ('{"error": "ahead of the clock", "code": "clock_skew"}', "active"),
+        # The other half of the code: a platform too old to name its refusals.
+        # It leaves `unknown`, and it has to be able to leave that too.
+        ('{"error": "no"}', "unknown"),
+    ],
+)
+def test_clock_skew_rejected_recovers_on_the_next_write_the_platform_accepts(
+    refusal, raised_state
+):
+    opener = _RefusesUntilTold(refusal)
+    controller, transport = _a_lane_talking_to(opener)
+
+    transport.send([_one_log_event(controller)])
+    assert _health_of(controller)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == (
+        raised_state
+    )
+
+    # The clock is fixed, or the old platform is upgraded, and the next write
+    # goes through. That is the platform taking this lane's time.
+    opener.refusing = False
+    transport.send([_one_log_event(controller)])
+
+    assert _health_of(controller)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "ok"
+    assert transport.skew_rejected == 0
+    assert transport.conflicts_unnamed == 0
+    # And the refusal is not forgotten where it belongs: `rejected` counts every
+    # terminal refusal for the life of the process and is NOT cleared, because
+    # a dropped item is a gap in the money record whatever happened afterwards.
+    assert transport.rejected > 0
+
+
+def test_a_refusal_after_a_recovery_raises_the_code_again():
+    """The control: the reset is a reset, not a permanent silence.
+
+    A `skew_rejected = 0` written once and never reachable again would satisfy
+    the test above and would make this code answer `ok` through every skew that
+    followed -- the reassuring direction, on the code that says the money record
+    is being lost.
+    """
+    opener = _RefusesUntilTold('{"error": "ahead", "code": "clock_skew"}')
+    controller, transport = _a_lane_talking_to(opener)
+
+    transport.send([_one_log_event(controller)])
+    opener.refusing = False
+    transport.send([_one_log_event(controller)])
+    assert _health_of(controller)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "ok"
+
+    opener.refusing = True
+    transport.send([_one_log_event(controller)])
+    assert _health_of(controller)[MalfunctionCode.CLOCK_SKEW_REJECTED.value]["state"] == "active"
