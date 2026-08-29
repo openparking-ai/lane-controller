@@ -25,7 +25,7 @@ class LoopConfig:
     """The lane's loop geometry: how many loops there are and how far apart.
 
     EVERY VALUE HERE IS A PER-SITE SETTING AND AN ASSUMPTION. Nothing in this
-    package measures a spacing or a crossing time, and nothing here is a
+    package measures a spacing, and nothing here is a
     constant. They are published with the events they govern, under the key
     `geometry_assumed`, so a reader of the record cannot mistake them for
     something this software established.
@@ -140,6 +140,20 @@ def _declared_loops(raw: dict) -> dict:
     return loops
 
 
+#: The published default for `LaneConfig.outbox_depth_threshold`: how many
+#: undelivered events the outbox may hold before `outbox_depth_growing` reads
+#: `active`.
+#:
+#: A PER-SITE SETTING AND AN ASSUMPTION. Nothing in this package measures how
+#: deep a healthy lane's outbox gets, and this number is not a measurement of
+#: one -- it is a line drawn well below the point at which the bounded log
+#: starts discarding entries (`EventQueue`'s `max_events`, 10,000), so the code
+#: fires while a human can still act on it rather than after events are already
+#: lost. A site whose platform link is normally down for hours raises it; a
+#: site that wants to hear about a five-minute outage lowers it.
+DEFAULT_OUTBOX_DEPTH_THRESHOLD = 1_000
+
+
 @dataclass(frozen=True, slots=True)
 class LaneConfig:
     lane_id: str
@@ -161,10 +175,21 @@ class LaneConfig:
     confidence_threshold: float = 0.85
     rules_max_age_seconds: float = 86_400.0
     server_url: str | None = None
+    # How many undelivered events the outbox may hold before the health surface
+    # reports `outbox_depth_growing` as `active`. A per-site setting: see
+    # DEFAULT_OUTBOX_DEPTH_THRESHOLD above for what it is and is not.
+    outbox_depth_threshold: int = DEFAULT_OUTBOX_DEPTH_THRESHOLD
 
     def __post_init__(self) -> None:
         if self.direction not in ("entry", "exit"):
             raise ValueError(f"direction must be 'entry' or 'exit', got {self.direction!r}")
+        if not isinstance(self.outbox_depth_threshold, int) or self.outbox_depth_threshold < 1:
+            # Zero would make every lane report the fault permanently, which is
+            # the same thing as reporting nothing.
+            raise ValueError(
+                f"outbox_depth_threshold must be a positive integer, "
+                f"got {self.outbox_depth_threshold!r}"
+            )
 
     @classmethod
     def from_file(cls, path: str | Path) -> LaneConfig:
@@ -185,6 +210,9 @@ class LaneConfig:
             confidence_threshold=float(lane.get("confidence_threshold", 0.85)),
             rules_max_age_seconds=float(lane.get("rules_max_age_seconds", 86_400.0)),
             server_url=lane.get("server_url"),
+            outbox_depth_threshold=int(
+                lane.get("outbox_depth_threshold", DEFAULT_OUTBOX_DEPTH_THRESHOLD)
+            ),
             camera=CameraConfig(
                 camera_id=camera.get("id", "cam-1"),
                 rtsp_url=camera.get("rtsp_url", ""),

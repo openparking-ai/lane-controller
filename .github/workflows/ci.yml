@@ -70,6 +70,15 @@ jobs:
         # fail under every break, and this reports that.
         run: python scripts/confirmation_fail_control.py
 
+      - name: Lane-contract fail-control
+        # Breaks each property the read contract exists to have -- the geometry
+        # it publishes, the completeness of the health table, `unknown` not
+        # being `ok`, the read-only sweep, the derived fallback, the cursor's
+        # reset flag -- and breaks the third-party lane too, because a stub that
+        # satisfies every assertion is a fixture that measures nothing. Each
+        # break must turn the contract suite red.
+        run: python scripts/contract_fail_control.py
+
       - name: Fallback-cause fail-control
         # Merges the cause back into the confidence comparison on purpose --
         # at the decision, at the client, and in the record -- and requires the

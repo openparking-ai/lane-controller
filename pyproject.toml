@@ -25,6 +25,12 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.8"]
 
+[project.scripts]
+# The standalone face of the module: `lane-controller serve` publishes the
+# read contract in docs/CONTRACT.md. The library stays importable and
+# dependency-free; nothing here adds one.
+lane-controller = "lane_controller.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

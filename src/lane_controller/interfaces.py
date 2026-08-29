@@ -233,6 +233,19 @@ class VehicleIdentity:
     #: A MEMBER OF `Unavailable`, never free text: it is written into
     #: `events.detail`, which the retention purge cannot reach.
     unavailable: Unavailable | None = None
+    #: The identification this came from, when the identifier names one --
+    #: Vehicle ID's `read_id`, which is unique per identification and stable
+    #: across re-delivery. `None` when no read was obtained, and `None` from an
+    #: identifier that does not name its reads.
+    #:
+    #: Carried rather than only logged because the read contract publishes it:
+    #: a consumer that is told a lane fell back, and cannot ask which read it
+    #: fell back on, has no way to look at the thing that was decided.
+    #:
+    #: It is NOT an identity field and it is not a plate. It identifies the
+    #: READ, so it is safe in a record the retention purge cannot reach --
+    #: which is exactly why the plate itself is not put here.
+    read_ref: str | None = None
 
     def __post_init__(self) -> None:
         """The seam. Anything not in the set is refused, never carried.
