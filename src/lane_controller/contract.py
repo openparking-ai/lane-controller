@@ -418,7 +418,7 @@ SOURCES: dict[MalfunctionCode, Source] = {
     MalfunctionCode.LENS_OBSTRUCTED_OR_DARK: Source.NOT_MEASURED,
     MalfunctionCode.REFERENCE_NOT_RECOGNISED: Source.NOT_MEASURED,
     MalfunctionCode.IDENTITY_SERVICE_DOWN: Source.MEASURED,
-    MalfunctionCode.IDENTITY_SERVICE_DEGRADED: Source.NOT_MEASURED,
+    MalfunctionCode.IDENTITY_SERVICE_DEGRADED: Source.MEASURED,
     MalfunctionCode.IDENTITY_SERVICE_UNMEASURED_WEIGHTS: Source.NO_SOURCE,
     MalfunctionCode.PLATFORM_UNREACHABLE: Source.NO_SOURCE,
     MalfunctionCode.LANE_GONE_QUIET: Source.NOT_MEASURED,
@@ -427,7 +427,7 @@ SOURCES: dict[MalfunctionCode, Source] = {
     MalfunctionCode.INTERCOM_REGISTRATION_LOST: Source.NO_SOURCE,
     MalfunctionCode.CONTROLLER_ON_BATTERY: Source.NO_SOURCE,
     MalfunctionCode.DISK_NEARLY_FULL: Source.NO_SOURCE,
-    MalfunctionCode.CLOCK_SKEW_REJECTED: Source.NOT_MEASURED,
+    MalfunctionCode.CLOCK_SKEW_REJECTED: Source.MEASURED,
 }
 
 #: Codes a monitor must NOT page a human on, each with the caveat that says why.

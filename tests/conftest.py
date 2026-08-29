@@ -564,3 +564,130 @@ def _break_the_lane_contract(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_LANE_CONTRACT mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the measured-codes fail-control.
+#
+# scripts/measured_codes_fail_control.py sets BREAK_MEASURED_CODE and requires
+# the contract suite to FAIL. Each mode removes exactly one thing that makes a
+# code a MEASUREMENT rather than a label -- not a fixture and not a stub -- so a
+# control that passes says the suite measures the derivation and not something
+# beside it.
+#
+# The reassuring direction is the one that matters here. Every break below turns
+# an honest `unknown` or a real `active` into a confident `ok`, which is a lane
+# reporting a clock nobody checked and an identification service nobody asked.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_measured_codes(monkeypatch):
+    mode = os.environ.get("BREAK_MEASURED_CODE")
+    if not mode:
+        return
+
+    from lane_controller.contract import SOURCES, HealthState, MalfunctionCode, Source
+    from lane_controller.platform_client import PlatformRejected
+    from lane_controller.service import LaneService
+    from lane_controller.sync import PlatformTransport
+
+    if mode == "degraded_is_ok":
+        # A service that cannot be READ reports a clean bill of health. This is
+        # the shape the whole surface exists to refuse: `unknown` folded into
+        # `ok` at the one seam an operator trusts.
+        original = LaneService._identity_service_degraded
+
+        def optimistic(self):
+            state = original(self)
+            return HealthState.OK if state is HealthState.UNKNOWN else state
+
+        monkeypatch.setattr(LaneService, "_identity_service_degraded", optimistic)
+
+    elif mode == "degraded_never_fires":
+        # It asks, and it never reports what it was told. A label with a
+        # derivation behind it that cannot answer `active` is not a measurement
+        # of anything -- and it reads exactly like a healthy service.
+        monkeypatch.setattr(
+            LaneService, "_identity_service_degraded", lambda self: HealthState.OK
+        )
+
+    elif mode == "degraded_is_remembered":
+        # The service is asked ONCE and the answer is kept. At a lane with no
+        # arrivals since midnight the memory is the whole night old, and a
+        # service that went degraded an hour ago still reads `ok`.
+        seen = {}
+
+        def cached(self):
+            reader = getattr(self.controller.identifier, "identity_health", None)
+            if not callable(reader):
+                return HealthState.UNKNOWN
+            if "body" not in seen:
+                seen["body"] = reader()
+            body = seen["body"]
+            if not isinstance(body, dict):
+                return HealthState.UNKNOWN
+            return HealthState.ACTIVE if body.get("status") == "degraded" else HealthState.OK
+
+        monkeypatch.setattr(LaneService, "_identity_service_degraded", cached)
+
+    elif mode == "skew_from_the_message":
+        # The refusal is classified by matching text in the message instead of
+        # reading the field. A platform that rewords its error goes silent, and
+        # a platform that mentions the words in another refusal goes loud.
+        def by_message(self, err: PlatformRejected) -> None:
+            if "clock" in err.body.lower():
+                self.skew_rejected += 1
+
+        monkeypatch.setattr(PlatformTransport, "_classify", by_message)
+
+    elif mode == "unnamed_is_not_a_skew":
+        # An unnamed conflict is treated as "not a skew". A platform that
+        # predates the field refuses a skew exactly as it refuses everything
+        # else, so this reports a healthy clock on the one deployment where the
+        # failure is invisible.
+        def named_only(self, err: PlatformRejected) -> None:
+            if err.status == 409 and err.code == "clock_skew":
+                self.skew_rejected += 1
+
+        monkeypatch.setattr(PlatformTransport, "_classify", named_only)
+
+    elif mode == "silence_is_ok":
+        # A lane that has attempted nothing reports its clock as fine. Nothing
+        # was sent, so nothing could have been refused: this is a confident
+        # negative about a question nobody asked.
+        original_skew = LaneService._clock_skew_rejected
+
+        def optimistic_skew(self):
+            state = original_skew(self)
+            if state is HealthState.UNKNOWN and self.controller.events.transport is not None:
+                return HealthState.OK
+            return state
+
+        monkeypatch.setattr(LaneService, "_clock_skew_rejected", optimistic_skew)
+
+    elif mode == "labelled_not_derived":
+        # A code marked `measured` in SOURCES with nothing deriving it. It then
+        # answers `unknown` for ever, which reads as "asked, and could not tell"
+        # rather than as "never wired up" -- the failure `HealthEntry` cannot
+        # see, because it only refuses the other direction.
+        monkeypatch.setitem(SOURCES, MalfunctionCode.DISK_NEARLY_FULL, Source.MEASURED)
+
+    elif mode == "doc_stale_list":
+        # The document still lists a code this build now READS among the ones
+        # waiting to be read. It was true when it was written, which is exactly
+        # why a stale list survives review.
+        #
+        # Applied to the PARSED paragraph, so no tracked document is edited by a
+        # script -- the same way the doc/value control does it.
+        import test_lane_contract
+
+        stale = (
+            "Where the `not_measured` signals live today, so nobody has to go looking:\n\n"
+            "- `clock_skew_rejected` -- the platform answers 409 and this lane counts it,\n"
+            "  undifferentiated, with every other refusal."
+        )
+        monkeypatch.setattr(test_lane_contract, "_not_measured_paragraph", lambda: stale)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_MEASURED_CODE mode: {mode}")

@@ -86,3 +86,14 @@ jobs:
         # a marginal read is the defect this suite exists for, and a suite that
         # cannot go red on it is not evidence that it does not happen.
         run: python scripts/fallback_cause_fail_control.py
+
+      - name: Measured-codes fail-control
+        # Two malfunction codes moved from `not_measured` to `measured` this
+        # round, and a `measured` label is a claim that this build derives the
+        # state from something it observes. `HealthEntry` cannot check that
+        # direction -- it refuses a code claiming `ok` without the label, and
+        # says nothing about a code with the label that derives a constant. Each
+        # break removes one thing that makes the derivation a measurement, every
+        # one of them in the reassuring direction, and requires the contract
+        # suite to go red.
+        run: python scripts/measured_codes_fail_control.py

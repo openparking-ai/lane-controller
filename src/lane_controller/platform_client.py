@@ -22,6 +22,20 @@ class PlatformUnreachable(Exception):
     """Network failure, timeout, or a 5xx. Retryable -- keep the work queued."""
 
 
+#: The name the platform's clock-skew refusal carries in its error body.
+#:
+#: SOURCE: `platform/src/app.js`, `export const CLOCK_SKEW`. It is exported
+#: there rather than left inline precisely because this lane pins it: it is the
+#: one refusal a lane derives a MALFUNCTION from, so the string is part of that
+#: platform's published surface.
+#:
+#: A string and not a message match. `_cause()` below already decides every
+#: identification failure from a structure rather than from message text, for
+#: the reason that applies here too: a message gets reworded and a check keyed
+#: on its words goes quietly wrong.
+CLOCK_SKEW_CODE = "clock_skew"
+
+
 class PlatformRejected(Exception):
     """The platform understood us and did not do what we asked. Not retryable.
 
@@ -30,13 +44,22 @@ class PlatformRejected(Exception):
     request sent: a platform older than the lane accepts the call and silently
     drops what it does not know about, and re-sending that forever is no more
     useful than re-sending a 400.
+
+    `code` is the platform's own machine-readable name for the refusal, when it
+    gave one. `None` covers three different situations and they are NOT folded
+    together anywhere that reads it: this was not an HTTP refusal at all, or the
+    body carried no name, or the body was not JSON. A platform too old to name
+    its refusals answers `None` for every one of them, which is why a consumer
+    of this field may not read a missing name as "not the code I was looking
+    for".
     """
 
-    def __init__(self, status: int | None, body: str) -> None:
+    def __init__(self, status: int | None, body: str, code: str | None = None) -> None:
         where = f"HTTP {status}: " if status is not None else ""
         super().__init__(f"platform rejected the request: {where}{body}")
         self.status = status
         self.body = body
+        self.code = code
 
 
 class PlatformClient:
@@ -68,7 +91,7 @@ class PlatformClient:
                 # The platform is having a bad time. That is the same situation
                 # as it being unreachable, from the lane's point of view.
                 raise PlatformUnreachable(f"HTTP {err.code}: {body}") from err
-            raise PlatformRejected(err.code, body) from err
+            raise PlatformRejected(err.code, body, _refusal_code(body)) from err
         except (urllib.error.URLError, TimeoutError, OSError) as err:
             raise PlatformUnreachable(str(err)) from err
 
@@ -139,3 +162,25 @@ class PlatformClient:
         if session_id:
             body["session_id"] = session_id
         return self._request("POST", "/api/v1/lane/sessions/close", body)
+
+
+def _refusal_code(body: str) -> str | None:
+    """The platform's own name for a refusal, out of its error body.
+
+    `None` when the body is not JSON, is not an object, or carries no `code` --
+    and a `code` that is not a string is `None` too, because a number or an
+    object there is not a name and treating it as one is how a comparison
+    against a string quietly stops matching anything.
+
+    Never raises. This runs on the failure path of every platform call, and a
+    parse error here would replace a refusal the lane knows how to survive with
+    an exception it does not.
+    """
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    code = parsed.get("code")
+    return code if isinstance(code, str) and code else None
