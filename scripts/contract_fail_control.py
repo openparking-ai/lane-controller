@@ -28,6 +28,26 @@ than something next to it.
                   list means both "nothing happened" and "you missed it all".
   extra_field     the code grows a field the document does not show. Only the
                   doc/contract agreement test can see this.
+  session_actions_on_the_wire
+                  every event goes in the read history again, so
+                  `GET /v1/lane/events` publishes `session_open {plate: ...}`
+                  -- the plate, on a READ contract, in a `detail` the contract
+                  declares opaque and the retention purge cannot reach.
+  plate_in_a_log_event
+                  the same exposure through an ORDINARY log event, which the
+                  mode above cannot prove: without this, the route sweep could
+                  be a test of `SESSION_KINDS` rather than of the surface.
+  evicted_reset   the eviction comparison removed. A consumer behind a full
+                  256-deep window is served what survived and told `reset:
+                  false`, which is indistinguishable from a complete page.
+  depth_blind     `outbox_depth_growing` reads `dropped` -- events ALREADY LOST
+                  -- instead of the depth its name promises. The HealthEntry
+                  guard cannot catch it: the entry genuinely IS `measured`, of
+                  something else.
+  doc_values      the document publishes the opposite of what the code
+                  enforces: `can_vend: true`, `contract_version: 99`, and a
+                  rewritten `reference_not_recognised` row. The shape check
+                  passes all three, because it discards every leaf value.
 
 And the SEAT's own controls, on the third-party lane itself -- because a stub
 that satisfies every assertion is a fixture that measures nothing:
@@ -63,6 +83,11 @@ CONTRACT_BREAKS = [
     ("stored_fallback", "`fallback` echoes any reason instead of being derived"),
     ("no_reset", "the cursor stops saying the process restarted"),
     ("extra_field", "the code carries a field the document does not show"),
+    ("session_actions_on_the_wire", "a session action reaches the read contract"),
+    ("plate_in_a_log_event", "a log event carries plate text"),
+    ("evicted_reset", "an evicted cursor is not told it missed anything"),
+    ("depth_blind", "the outbox depth code reads the drop count instead"),
+    ("doc_values", "the document publishes values the code contradicts"),
 ]
 
 SEAT_BREAKS = [

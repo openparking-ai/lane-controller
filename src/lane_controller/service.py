@@ -123,7 +123,7 @@ def assert_bind_allowed(host: str, port: int, token: str | None) -> None:
     raise InsecureBind(
         f"refusing to bind {host or 'every interface'}:{port} with no token. Off loopback "
         "anything that can reach this port can read where a vehicle was, when it was there, "
-        "and what this lane decided about it. Configure a shared token with --token-file, "
+        "and what this lane decided about it. Configure a shared token with --auth-token-file, "
         "or bind 127.0.0.1."
     )
 
@@ -187,6 +187,14 @@ class LaneService:
             # geometry is a second thing to go stale, and this lane already
             # publishes `geometry_assumed` on every vehicle.
             geometry=controller.config.loops.as_published(),
+            # The read window's real depth, off the deque that holds it. A
+            # consumer polls `GET /v1/lane/events` and this is what tells it
+            # how far behind it may fall before it starts being told `reset`
+            # instead of being served. Published rather than documented,
+            # because a lane built with a different window would otherwise be
+            # described by a number in a document that is right about a
+            # different lane.
+            event_window_depth=controller.events.history_depth,
             capabilities=self.capabilities(),
         )
 
@@ -236,7 +244,7 @@ class LaneService:
         """
         derived = {
             MalfunctionCode.IDENTITY_SERVICE_DOWN: self._identity_service_down(),
-            MalfunctionCode.OUTBOX_DEPTH_GROWING: self._outbox_dropping(),
+            MalfunctionCode.OUTBOX_DEPTH_GROWING: self._outbox_depth_growing(),
             MalfunctionCode.SESSION_ACTIONS_DEAD_LETTERED: self._dead_lettered(),
         }
         # Built by walking the enum, so a code added to the contract appears
@@ -269,14 +277,27 @@ class LaneService:
         # that it is up either.
         return HealthState.UNKNOWN
 
-    def _outbox_dropping(self) -> HealthState:
-        """`active` once the bounded log has discarded an event.
+    def _outbox_depth_growing(self) -> HealthState:
+        """`active` while the outbox holds more than this site's threshold.
 
-        What is measured is exactly the counter: log events dropped because the
-        outbox reached its limit. Session actions are never dropped, so this
-        never speaks for the money record.
+        The code is called `outbox_depth_growing`, so what it reads is the
+        DEPTH: `EventQueue.pending`, which is every undelivered item -- log
+        events and session actions both. It used to read `dropped`, which is
+        the count of things ALREADY LOST, so a lane with nine thousand
+        undelivered events behind a dead platform answered `ok` right up to the
+        moment the log hit its bound and began throwing entries away. That is
+        the reassuring direction, on the one code an operator would use to find
+        out that a lane has stopped reporting.
+
+        `ok` is a real measurement here: the depth was read and it is under the
+        threshold. The threshold is a per-site SETTING and an assumption -- see
+        `LaneConfig.outbox_depth_threshold` -- not a measured property of
+        anything, which is why it is configurable and published rather than
+        being a constant in this file.
         """
-        return HealthState.ACTIVE if self.controller.events.dropped else HealthState.OK
+        pending = self.controller.events.pending
+        threshold = self.controller.config.outbox_depth_threshold
+        return HealthState.ACTIVE if pending > threshold else HealthState.OK
 
     def _dead_lettered(self) -> HealthState:
         """`active` once the transport has dropped an item the platform refused.
@@ -300,13 +321,26 @@ class LaneService:
             current = queue.cursor
             items = queue.since(since)
             dropped = queue.dropped
+            oldest = queue.oldest
         return EventPage(
             cursor=current,
-            # A cursor ahead of ours means this process restarted: the cursor
-            # is not durable and the consumer's saved position now refers to
-            # nothing. An empty list without this flag is indistinguishable
-            # from "nothing happened".
-            reset=since > current,
+            # TWO ways a saved position stops referring to anything, and both
+            # are `reset` because to a consumer they are the same fact: what
+            # you asked for is gone and you did not get it.
+            #
+            #   * AHEAD of ours -- this process restarted. The cursor is not
+            #     durable and the position now names nothing.
+            #   * BEHIND the oldest event still held -- the window has evicted
+            #     what you asked for. `since` returns what survived, which is
+            #     a SHORT answer that looks exactly like a complete one.
+            #
+            # The second is the one the Vehicle ID service does not need: its
+            # contract tells a consumer that needs guaranteed delivery to use
+            # push, and it has push. This surface has neither, so the eviction
+            # is reported here or it is not reported at all. `dropped` does not
+            # cover it -- that counts what the OUTBOX discarded, which is a
+            # different bound on a different queue.
+            reset=since > current or (oldest is not None and since + 1 < oldest),
             dropped=dropped,
             events=tuple(
                 {

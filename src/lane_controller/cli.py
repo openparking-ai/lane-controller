@@ -6,7 +6,7 @@ not a degraded one, and this is how somebody runs it:
     lane-controller serve --config lane.toml
 
 `serve` binds `127.0.0.1:8090` and publishes the read contract described in
-`docs/CONTRACT.md`. `--host` off loopback REQUIRES `--token-file`, and the
+`docs/CONTRACT.md`. `--host` off loopback REQUIRES `--auth-token-file`, and the
 service refuses to start without it.
 
 The lane it serves is built from the configuration file and the SIMULATED
@@ -52,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8090)
     serve.add_argument(
-        "--token-file",
+        "--auth-token-file",
         type=Path,
         help="a file holding the shared token every route must carry. Required for any "
              "--host that is not loopback. A FILE and not a value, because a value on the "
@@ -68,16 +68,16 @@ def _token(args) -> str | None:
     read as "no token configured" -- which would be a truncated file silently
     turning the credential off on the one bind that requires one.
     """
-    if not args.token_file:
+    if not args.auth_token_file:
         return None
     try:
-        raw = args.token_file.read_text(encoding="utf-8")
+        raw = args.auth_token_file.read_text(encoding="utf-8")
     except OSError as exc:
-        print(f"could not read {args.token_file}: {exc}", file=sys.stderr)
+        print(f"could not read {args.auth_token_file}: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     token = raw.strip()
     if not token:
-        print(f"{args.token_file} holds no token", file=sys.stderr)
+        print(f"{args.auth_token_file} holds no token", file=sys.stderr)
         raise SystemExit(2)
     return token
 
@@ -128,7 +128,7 @@ def cmd_serve(args) -> int:
     # the contract with no hardware behind it is the one thing an evaluator
     # could otherwise mistake for a working installation.
     print("  seams are SIMULATED: this serves the contract, it does not drive a barrier")
-    if args.token_file:
+    if args.auth_token_file:
         print("  every route requires the bearer token")
     try:
         server.serve_forever()

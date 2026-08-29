@@ -346,6 +346,7 @@ def _break_the_lane_contract(monkeypatch):
     if not mode:
         return
 
+    import test_lane_contract as test_module
     from lane_controller import contract as contract_module
     from lane_controller import service as service_module
     from lane_controller.config import LoopConfig
@@ -462,6 +463,104 @@ def _break_the_lane_contract(monkeypatch):
             return {**original_to_dict(self), "undocumented": True}
 
         monkeypatch.setattr(contract_module.EventPage, "to_dict", wider)
+
+    elif mode == "session_actions_on_the_wire":
+        # THE DEFECT THIS ROUND DELETES. `record` puts every event in the read
+        # history, session actions included -- so `GET /v1/lane/events`
+        # publishes `session_open {plate: ...}` to every consumer of a READ
+        # contract, in a `detail` the contract declares OPAQUE and the
+        # retention purge cannot reach.
+        from lane_controller.events import EventQueue
+
+        original_record = EventQueue.record
+
+        def indiscriminate(self, kind, lane_id, **detail):
+            event = original_record(self, kind, lane_id, **detail)
+            from lane_controller.events import SESSION_KINDS
+
+            if kind in SESSION_KINDS:
+                self._cursor += 1
+                self._history.append((self._cursor, event))
+            return event
+
+        monkeypatch.setattr(EventQueue, "record", indiscriminate)
+
+    elif mode == "plate_in_a_log_event":
+        # The same exposure by a different door, and the one the mode above
+        # cannot prove: an ORDINARY LOG EVENT carrying plate text. The route
+        # sweep must find it whether it arrives on a session action or not --
+        # otherwise the sweep is a test of `SESSION_KINDS`, not of the surface.
+        from lane_controller.controller import LaneController
+
+        original_session = LaneController._record_session
+
+        def photographs_the_plate(self, identity, at, *, confirmation):
+            self.events.record("entry_photo_taken", self.config.lane_id, plate=identity.plate)
+            return original_session(self, identity, at, confirmation=confirmation)
+
+        monkeypatch.setattr(LaneController, "_record_session", photographs_the_plate)
+
+    elif mode == "evicted_reset":
+        # The eviction comparison removed, leaving `since > current` -- exactly
+        # the Vehicle ID semantics, which are honest THERE because that
+        # contract has push and this one does not. A consumer 50 events behind
+        # a 256-deep window is served 256 of them and told `reset: false`.
+        original_events = service_module.LaneService.events
+
+        def only_ahead(self, since):
+            page = original_events(self, since)
+            with self._lock:
+                current = self.controller.events.cursor
+            return contract_module.EventPage(
+                cursor=page.cursor,
+                reset=since > current,
+                dropped=page.dropped,
+                events=page.events,
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "events", only_ahead)
+
+    elif mode == "depth_blind":
+        # `outbox_depth_growing` reads `dropped` again: the count of events
+        # ALREADY LOST rather than the depth its own name promises. Nine
+        # thousand undelivered events read `ok`, with `source: measured`, so
+        # the HealthEntry guard cannot see it -- the entry genuinely IS
+        # measured, of something else.
+        def dropping(self):
+            return (
+                contract_module.HealthState.ACTIVE
+                if self.controller.events.dropped
+                else contract_module.HealthState.OK
+            )
+
+        monkeypatch.setattr(service_module.LaneService, "_outbox_depth_growing", dropping)
+
+    elif mode == "doc_values":
+        # The document publishes the OPPOSITE of what the code enforces, in the
+        # three places the L3 found it could: a lane that cannot vend saying it
+        # can, a version nobody would recognise, and a never-alarm code
+        # rewritten into a measured, healthy, page-a-technician one.
+        #
+        # Applied to the PARSED examples rather than to the file, so it runs in
+        # CI without editing a tracked document. The equivalent edits to
+        # docs/CONTRACT.md itself turn the same tests red -- the receipt runs
+        # them that way.
+        from lane_controller.contract import MalfunctionCode as _Code
+
+        original_payloads = test_module.doc_payloads
+
+        def doctored():
+            doc = original_payloads()
+            doc["lane"]["capabilities"]["can_vend"] = True
+            doc["state"]["contract_version"] = 99
+            for row in doc["health"]["codes"]:
+                if row["code"] == _Code.REFERENCE_NOT_RECOGNISED.value:
+                    row["source"] = "measured"
+                    row["never_alarm"] = False
+                    row["caveat"] = "PAGE A TECHNICIAN. The reference view is not recognised."
+            return doc
+
+        monkeypatch.setattr(test_module, "doc_payloads", doctored)
 
     else:
         raise RuntimeError(f"unknown BREAK_LANE_CONTRACT mode: {mode}")
