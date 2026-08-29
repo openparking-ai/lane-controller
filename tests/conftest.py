@@ -225,6 +225,7 @@ def _break_the_fallback_cause(monkeypatch):
     from lane_controller import vehicle_id_client as client_module
     from lane_controller.decision import Fallback
     from lane_controller.events import EventQueue
+    from lane_controller.interfaces import VehicleIdentity
 
     original_decide = decision_module.decide
 
@@ -285,6 +286,27 @@ def _break_the_fallback_cause(monkeypatch):
         # off and a service that is slow are three repairs, and this collapses
         # them into a record nobody can act on.
         monkeypatch.setattr(client_module, "_cause", lambda exc: client_module.CAUSE_UNREACHABLE)
+
+    elif mode == "above_presence":
+        # The other ordering the round created, and the one the five breaks
+        # above cannot reach: `unavailable` looked at BEFORE presence. Nothing
+        # was there, the engine is also down, and the lane issues a ticket for
+        # a car that does not exist. Expressed by dropping presence whenever a
+        # cause is set, which is what moving the check above it does.
+        def presence_last_decide(identity, cache, **kwargs):
+            if identity.unavailable is not None:
+                return original_decide(replace(identity, presence=None), cache, **kwargs)
+            return original_decide(identity, cache, **kwargs)
+
+        patch_decide(presence_last_decide)
+
+    elif mode == "freetext":
+        # The seam stops constraining `unavailable`, so an identifier's own
+        # string travels into `Decision.reason` and into `events.detail`, which
+        # the retention purge cannot reach. This is the state the branch was in
+        # before the closed set, and the plate-leak cases that plant a member
+        # of that set cannot see it.
+        monkeypatch.setattr(VehicleIdentity, "__post_init__", lambda self: None)
 
     elif mode == "nodetail":
         # The cause is measured and never leaves the process. Whoever answers

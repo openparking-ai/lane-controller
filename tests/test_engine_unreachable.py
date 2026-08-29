@@ -38,12 +38,15 @@ from lane_controller import (
     LaneController,
     Outcome,
     Rule,
+    Unavailable,
+    VehicleIdentity,
     decide,
 )
 from lane_controller.simulated import (
     CannedCameraFeed,
     RecordingVendOutput,
     SimulatedLoopInput,
+    StubVehicleIdentifier,
 )
 from lane_controller.vehicle_id_client import (
     CAUSE_BAD_RESPONSE,
@@ -344,7 +347,13 @@ def test_no_vehicle_present_is_still_no_vehicle_and_not_a_fallback(engine, permi
 # ---------------------------------------------------------------------------
 
 
-def _lane(endpoint: str):
+def _lane_with(identifier):
+    """A whole lane driven by any implementation of the public protocol.
+
+    Taken as an argument rather than built here because the seam is the
+    interesting part: `VehicleIdClient` is one implementation and the tests
+    below are about what a DIFFERENT one can put into the record.
+    """
     config = LaneConfig(
         lane_id="lane-test",
         site_id="site-test",
@@ -359,9 +368,13 @@ def _lane(endpoint: str):
         loop=SimulatedLoopInput(arrivals=1),
         camera=CannedCameraFeed(),
         vend=RecordingVendOutput(),
-        identifier=VehicleIdClient(endpoint=endpoint, timeout=2.0),
+        identifier=identifier,
         cache=cache,
     )
+
+
+def _lane(endpoint: str):
+    return _lane_with(VehicleIdClient(endpoint=endpoint, timeout=2.0))
 
 
 def test_the_event_says_which_failure_it_was(engine):
@@ -435,3 +448,190 @@ def test_every_cause_is_distinct_so_the_detail_can_name_the_repair():
         CAUSE_BAD_RESPONSE,
     ]
     assert len(set(causes)) == len(causes)
+
+
+# ---------------------------------------------------------------------------
+# `unavailable` IS A CLOSED SET, NOT A STRING.
+#
+# `VehicleIdentity` is what the public `VehicleIdentifier` protocol returns, so
+# every field on it is supplied by an identifier this package does not own.
+# This one is interpolated into `Decision.reason` by `decision.py` and written
+# verbatim into `events.detail` by `controller.py`, and `events` is append-only
+# by grant on the platform -- the retention purge cannot reach it. An
+# unconstrained string here is a route by which a third party writes plate text
+# into a store nothing can clean.
+#
+# The value planted below is NOT a constant from the set. A fixture that plants
+# a member measures a path on which the field is already safe.
+# ---------------------------------------------------------------------------
+
+PLATE_AN_IDENTIFIER_MIGHT_LEAK = "PLATETEXT1"
+FREE_TEXT = f"engine refused the read for {PLATE_AN_IDENTIFIER_MIGHT_LEAK}"
+
+
+def test_an_identifier_cannot_put_free_text_on_the_identity():
+    """The type carries the guarantee, so every caller gets it.
+
+    Refused at construction rather than at each of the two places that publish
+    it: a check at a publishing site holds only until somebody adds a third.
+    """
+    leaked = VehicleIdentity(
+        plate=None, confidence=0.0, presence=True, unavailable=FREE_TEXT
+    )
+
+    assert leaked.unavailable is Unavailable.UNRECOGNISED_CAUSE
+    assert PLATE_AN_IDENTIFIER_MIGHT_LEAK not in str(leaked.unavailable)
+
+
+def test_the_causes_the_client_emits_pass_through_the_seam_unchanged():
+    """The control on the test above: the seam refuses, it does not swallow.
+
+    Derived from the client's own names rather than from a second list, so a
+    cause added there and not to the set fails here.
+    """
+    for cause in (
+        CAUSE_NO_FRAMES,
+        CAUSE_UNREACHABLE,
+        CAUSE_TIMEOUT,
+        CAUSE_SERVICE_ERROR,
+        CAUSE_BAD_RESPONSE,
+    ):
+        identity = VehicleIdentity(plate=None, confidence=0.0, unavailable=cause)
+        assert identity.unavailable is cause
+        assert identity.unavailable is not Unavailable.UNRECOGNISED_CAUSE
+
+
+def test_a_refused_cause_is_not_reported_as_the_engine_answering_badly():
+    """`unrecognised_cause` is its own name, and that is the point of it.
+
+    `bad_response` says the ENGINE answered unusably. This says the IDENTIFIER
+    is emitting a cause this build does not know -- a different repair, and an
+    operator sent to the engine by the first name would find nothing wrong.
+    """
+    refused = VehicleIdentity(plate=None, confidence=0.0, unavailable=FREE_TEXT)
+
+    assert refused.unavailable is not CAUSE_BAD_RESPONSE
+
+
+def test_the_decision_reason_never_carries_what_an_identifier_supplied(permit_list):
+    """`Decision.reason` is interpolated, and it reaches two event kinds."""
+    leaked = VehicleIdentity(
+        plate=None, confidence=0.0, presence=True, unavailable=FREE_TEXT
+    )
+
+    decision = decide(leaked, permit_list, confidence_threshold=THRESHOLD)
+
+    assert decision.fallback is Fallback.ENGINE_UNREACHABLE
+    assert PLATE_AN_IDENTIFIER_MIGHT_LEAK not in decision.reason
+
+
+def test_a_third_party_identifier_puts_no_plate_text_in_the_event_detail():
+    """The whole lane, driven by an ordinary implementation of the protocol.
+
+    This is the run the review made: a third-party identifier returning plate
+    text as `unavailable`, through the real controller, into the real queue.
+    """
+    controller = _lane_with(
+        StubVehicleIdentifier(
+            [
+                VehicleIdentity(
+                    plate=None,
+                    confidence=0.0,
+                    presence=True,
+                    unavailable=FREE_TEXT,
+                )
+            ]
+        )
+    )
+
+    controller.run_once()
+
+    queued = list(controller.events._queue)
+    assert queued, "no events, so this asserts nothing"
+    for event in queued:
+        rendered = json.dumps(event.as_dict()["detail"], default=str)
+        assert PLATE_AN_IDENTIFIER_MIGHT_LEAK not in rendered, (
+            f"{event.kind} put identifier-supplied text into events.detail, "
+            f"which the purge cannot reach: {rendered}"
+        )
+
+    fallback = next(e for e in queued if e.kind == "fallback_needs_human")
+    assert fallback.detail["cause"] == Unavailable.UNRECOGNISED_CAUSE.value
+
+
+# ---------------------------------------------------------------------------
+# THE ORDERING: PRESENCE IS CHECKED BEFORE `unavailable`.
+#
+# Moving the `unavailable` check ABOVE the presence check left the whole suite
+# green, so the position the round created was unguarded. The combination is
+# not reachable through `VehicleIdClient` today -- a killed engine yields
+# `presence=None`, and an engine that reports `presence=False` has answered --
+# but it becomes reachable the moment presence is measured outside the read,
+# which is what the reference markers and standalone mode both require. The
+# identity is therefore constructed directly, which is the only way to reach
+# the branch at this commit.
+#
+# Nothing was there. The engine's state is irrelevant to that, and a fallback
+# would be a ticket for a car that does not exist.
+# ---------------------------------------------------------------------------
+
+
+def test_nothing_present_beats_a_dead_engine(permit_list):
+    nothing_there = VehicleIdentity(
+        plate=None, confidence=0.0, presence=False, unavailable=CAUSE_UNREACHABLE
+    )
+
+    decision = decide(nothing_there, permit_list, confidence_threshold=THRESHOLD)
+
+    assert decision.outcome is Outcome.NO_VEHICLE
+    assert decision.fallback is None, (
+        "an unmeasurable engine must not turn 'nothing was there' into a "
+        "ticket: no car, no transaction"
+    )
+
+
+def test_an_unmeasured_presence_with_a_dead_engine_is_still_engine_unreachable(
+    permit_list,
+):
+    """The control on the test above.
+
+    Same dead engine, and the only difference is that presence was not
+    measured -- which is what a real lane with a killed engine produces. A
+    change that made presence win everywhere would satisfy the test above and
+    lose the round's whole guarantee; this is what stops it.
+    """
+    unmeasured = VehicleIdentity(
+        plate=None, confidence=0.0, presence=None, unavailable=CAUSE_UNREACHABLE
+    )
+
+    decision = decide(unmeasured, permit_list, confidence_threshold=THRESHOLD)
+
+    assert decision.outcome is Outcome.FALLBACK
+    assert decision.fallback is Fallback.ENGINE_UNREACHABLE
+
+
+def test_the_lane_records_arming_rejected_and_no_fallback_when_nothing_was_there():
+    """The ordering as it reaches the RECORD, which is what a consumer reads.
+
+    `arming_rejected` and `fallback_needs_human` are two different events with
+    two different responses, and the intercom agent keys on which one arrives.
+    """
+    controller = _lane_with(
+        StubVehicleIdentifier(
+            [
+                VehicleIdentity(
+                    plate=None,
+                    confidence=0.0,
+                    presence=False,
+                    unavailable=CAUSE_UNREACHABLE,
+                )
+            ]
+        )
+    )
+
+    controller.run_once()
+
+    kinds = [e.kind for e in list(controller.events._queue)]
+    assert "arming_rejected" in kinds
+    assert "fallback_needs_human" not in kinds
+    assert "vended" not in kinds

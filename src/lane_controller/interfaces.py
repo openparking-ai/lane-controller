@@ -15,10 +15,13 @@ Reference hardware, none of which is required to run this package:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +132,61 @@ class ClosingLoops(Protocol):
         ...
 
 
+class Unavailable(StrEnum):
+    """WHY no read was obtained -- a CLOSED SET, because it is published.
+
+    `VehicleIdentity` is the return type of the public `VehicleIdentifier`
+    protocol, so every value on it is supplied by an identifier this package
+    does not own, and this one is written verbatim into `events.detail` by
+    `controller.py`. `events` is append-only by grant on the platform, so the
+    retention purge cannot reach it: a plate put there is permanent. An
+    unconstrained string on this field is therefore a route by which a
+    third-party identifier can write plate text into a store nothing can clean.
+
+    The set is defined HERE rather than in `vehicle_id_client`, which is one
+    implementation of the protocol and not the contract. The client's
+    `CAUSE_*` names are this enum, so there is one copy and it is the one the
+    type checks against.
+    """
+
+    #: The camera handed us nothing, so the engine was never asked. Not the
+    #: engine's fault and named so it cannot be read as one.
+    NO_FRAMES = "no_frames"
+
+    #: The request could not be completed at all -- nothing listening, no
+    #: route, DNS. The usual case is that the engine is not running.
+    UNREACHABLE = "unreachable"
+
+    #: It is listening and it did not answer inside `timeout`. A different
+    #: repair from "it is not running", which is the only reason to separate
+    #: them.
+    TIMEOUT = "timeout"
+
+    #: It answered with an error STATUS. The service is up and said no.
+    SERVICE_ERROR = "service_error"
+
+    #: It answered, and this build cannot use the answer: an unparseable body,
+    #: a missing `read`, a record the contract refuses, or a `schema_version`
+    #: this build does not understand.
+    #:
+    #: THOSE ARE NOT SPLIT FURTHER, and that is a decision. Telling the version
+    #: refusal apart from the others means either matching the contract's
+    #: message text or keeping a second copy of which versions this build
+    #: understands -- a copy that would drift the day the contract's answer
+    #: changes. The contract's own reason is on the client's WARNING line, next
+    #: to the read that produced it.
+    BAD_RESPONSE = "bad_response"
+
+    #: NOT a cause an identifier may supply. This is what the seam substitutes
+    #: when one supplies something that is not in this set, and it is its own
+    #: name rather than `BAD_RESPONSE` because it is a different fault with a
+    #: different repair: `BAD_RESPONSE` says the ENGINE answered unusably, this
+    #: says the IDENTIFIER is emitting a cause this build does not know. An
+    #: operator sent to the engine by the first name would find nothing wrong
+    #: with it.
+    UNRECOGNISED_CAUSE = "unrecognised_cause"
+
+
 @dataclass(frozen=True, slots=True)
 class VehicleIdentity:
     """What the vision stage believes it saw, and how strongly.
@@ -169,10 +227,40 @@ class VehicleIdentity:
     #: not a measurement -- the engine did not look at a plate and find it
     #: marginal, the engine was not reached. Reading the two as one code tells
     #: a driver at the barrier to wipe a plate while the identification service
-    #: is switched off. The string names WHICH failure; the constants are in
-    #: `vehicle_id_client`, and this is the only place that detail survives
-    #: once the exception has been logged and swallowed.
-    unavailable: str | None = None
+    #: is switched off. It names WHICH failure, and this is the only place that
+    #: detail survives once the exception has been logged and swallowed.
+    #:
+    #: A MEMBER OF `Unavailable`, never free text: it is written into
+    #: `events.detail`, which the retention purge cannot reach.
+    unavailable: Unavailable | None = None
+
+    def __post_init__(self) -> None:
+        """The seam. Anything not in the set is refused, never carried.
+
+        This runs on EVERY construction, including one by an identifier that
+        is not `VehicleIdClient` -- which is the case that matters, because
+        the public protocol is the seam a third party sits on and
+        `decision.py` interpolates this value into `Decision.reason` while
+        `controller.py` writes it into `events.detail`.
+
+        The refused value is not logged. Naming what was rejected would copy
+        the very text this exists to keep out of anything the lane owns, and
+        the caller has its own value. The RECORD is not silent about it: it
+        carries `unrecognised_cause`, which is a different name from every
+        cause the engine can produce.
+        """
+        if self.unavailable is None:
+            return
+        try:
+            cause = Unavailable(self.unavailable)
+        except (ValueError, TypeError):
+            log.warning(
+                "an identifier supplied a cause that is not in `Unavailable`; "
+                "recording it as %s and dropping the value",
+                Unavailable.UNRECOGNISED_CAUSE.value,
+            )
+            cause = Unavailable.UNRECOGNISED_CAUSE
+        object.__setattr__(self, "unavailable", cause)
 
 
 class VehicleIdentifier(Protocol):
