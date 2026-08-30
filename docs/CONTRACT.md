@@ -385,6 +385,14 @@ the vehicle is not on this contract at all.
 event, and a consumer ignores keys it does not recognise. **No plate text goes
 in it**, on any route of this contract.
 
+**ADDED, and it was always what this lane served: `occurred_at` is ISO 8601 with
+an explicit UTC offset.** It was shown that way in the example above and never
+stated, so an implementer of this contract could read the example as one
+formatting of a local time — and a consumer subtracting a naive timestamp from
+its own clock gets an answer that is wrong by whatever the two machines'
+timezones differ by, with nothing anywhere saying so. A value test walks a served
+events page and refuses a timestamp with no offset.
+
 ## The closed sets, in full
 
 Everything below is a set this contract declares CLOSED, published here so that
