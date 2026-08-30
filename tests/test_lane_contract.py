@@ -15,6 +15,7 @@ import socket
 import time
 import urllib.error
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -449,6 +450,39 @@ def test_skipping_a_cursor_loses_the_events_in_between():
 
     skipped = service.events(total - 1).to_dict()
     assert len(skipped["events"]) == 1
+
+
+def test_every_occurred_at_on_a_served_page_carries_an_explicit_utc_offset():
+    """The document says ISO 8601 with an offset. This is that, by value.
+
+    A naive timestamp is not a moment a consumer can subtract from its own
+    clock: two machines in two timezones, and the answer is wrong by whatever
+    they differ by with nothing saying so. It was always what this lane served
+    and was never stated, so the sentence was added to the contract and this
+    holds the lane to it -- read off a page as a consumer receives it, not off
+    the writer.
+    """
+    service = LaneService(full_lane())
+    service.controller.run_once()
+    page = service.events(0).to_dict()
+    assert page["events"], "no event was served, so this asserts nothing"
+
+    for item in page["events"]:
+        moment = datetime.fromisoformat(item["occurred_at"])
+        assert moment.tzinfo is not None, (
+            f"{item['kind']} carries occurred_at={item['occurred_at']!r}, which has no UTC "
+            "offset. This contract says ISO 8601 with an explicit one."
+        )
+        assert moment.utcoffset() == timedelta(0), (
+            f"{item['kind']} carries a non-UTC offset: {item['occurred_at']!r}"
+        )
+
+    # The control: this check DOES fire. The same walk over a page whose
+    # timestamps have had their offsets stripped goes red -- so what passed
+    # above is the lane's own value and not a walk over nothing.
+    naive = [dict(item, occurred_at=item["occurred_at"][:19]) for item in page["events"]]
+    assert naive
+    assert all(datetime.fromisoformat(item["occurred_at"]).tzinfo is None for item in naive)
 
 
 def test_dropped_is_exposed_and_the_log_stays_bounded():
