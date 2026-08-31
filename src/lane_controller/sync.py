@@ -60,6 +60,12 @@ REASON_REVERSE = "closing_sequence_reverse"
 REASON_WINDOW_ELAPSED = "confirmation_window_elapsed"
 REASON_NO_CLOSING_LOOPS = "no_closing_loops_configured"
 REASON_ARMING_INCOMPLETE = "only_one_arming_loop_occupied"
+#: The closing-loop driver did not return inside the lane's own settle deadline
+#: -- the confirmation window plus `[lane] settle_grace_s`. NOT the same fact as
+#: `confirmation_window_elapsed`, which is the loops answering that nothing
+#: crossed: this is the loops not answering at all, and the two want different
+#: repairs.
+REASON_LOOP_DRIVER_TIMEOUT = "loop_driver_timeout"
 
 #: What the platform is told confirmed a session. `confirmed` means two loops
 #: after the gate saw a vehicle cross them forward. `unconfirmable` means this

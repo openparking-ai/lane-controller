@@ -168,12 +168,26 @@ class VendRefusal(StrEnum):
     #: before it arms, so an object that cannot span the gap cannot be
     #: completed into an open barrier either.
     GEOMETRY_INCOMPLETE = "geometry_incomplete"
+    #: `decision_at` is AHEAD of this lane's clock. `age > max_age` has no lower
+    #: bound of its own, so a clock that stepped backwards would otherwise
+    #: widen the staleness window by however far it stepped -- a negative age is
+    #: never a fresher decision, it is a lane that cannot say how old this one
+    #: is.
+    DECISION_IN_FUTURE = "decision_in_future"
     #: `decision_at` is older than `[lane] completion_max_age_s`. A completion
     #: is an answer to a driver who is at the barrier now.
     DECISION_STALE = "decision_stale"
     #: `decision_at` is not the moment of this lane's last decision -- or this
     #: lane has not decided anything, which is the same fact to a caller.
     DECISION_MISMATCH = "decision_mismatch"
+    #: THE DECISION NAMED HAS ALREADY BEEN COMPLETED, whatever idempotency key
+    #: this call carries. One decision is one case and one case is one vend:
+    #: the guarantee a barrier needs is "one decision, one vend", and "one key,
+    #: one vend" is not it -- a caller that regenerates its key on retry is the
+    #: commonest idempotency bug there is, and without this it would mint a
+    #: second ticket and a second billable stay for one car. The only way to a
+    #: second vend is a second decision, which is a second arrival.
+    ALREADY_COMPLETED = "already_completed"
     #: There is nothing to complete. `allow` already vended; `deny` is a rule,
     #: and only `human_open_now` overrides one.
     NOT_COMPLETABLE = "not_completable"
@@ -210,6 +224,28 @@ def is_ticket_ref(value) -> bool:
     This lane holds no key and mints no ticket: the agent does both, and a lane
     that pretended to verify one would be publishing a claim it cannot support.
     """
+    return _shaped(value)
+
+
+def is_idempotency_key(value) -> bool:
+    """Whether `Idempotency-Key` has the shape this contract accepts.
+
+    THE SAME ALPHABET AND THE SAME BOUNDS AS A TICKET, deliberately, and stated
+    rather than left to be noticed: the key is a caller's own bookkeeping and
+    this lane has no opinion about what it means, so the only thing it can say
+    about one is that it is an opaque token of a size a lane can hold. An
+    unbounded key is a caller choosing how much memory this process uses; a key
+    with no alphabet is a caller choosing what goes into a log line.
+
+    The key is NOT published anywhere. It lives in this process's idempotency
+    store for the run and reaches no event, no read route and no session
+    action -- see `AssistedVend._hold` and `LaneController.complete_vend`.
+    """
+    return _shaped(value)
+
+
+def _shaped(value) -> bool:
+    """The one shape rule, for the two opaque tokens this contract carries."""
     return (
         isinstance(value, str)
         and TICKET_REF_MIN <= len(value) <= TICKET_REF_MAX
@@ -378,6 +414,16 @@ class LastDecision:
     #: `None` when no read was obtained, and when the identifier does not
     #: supply one.
     read_ref: str | None = None
+    #: WHETHER THIS DECISION HAS ALREADY BEEN COMPLETED by `POST
+    #: /v1/lane/vend`. A completed decision is consumed: a further completion
+    #: naming it is refused `already_completed` whatever key it carries, and
+    #: the only way to another vend is another arrival.
+    #:
+    #: It is published because without it a second consumer could not see that
+    #: the first one had acted -- the decision, its outcome and its `at` are
+    #: byte-identical before and after a vend, which is exactly what made "one
+    #: key, one vend" read as a guarantee it was not.
+    completed: bool = False
 
     def __post_init__(self) -> None:
         if self.outcome not in OUTCOMES:
@@ -390,6 +436,8 @@ class LastDecision:
             _text(self.cause, "cause")
         if self.read_ref is not None:
             _text(self.read_ref, "read_ref")
+        if not isinstance(self.completed, bool):
+            raise ValueError(f"completed must be true or false, got {self.completed!r}")
 
     @property
     def fallback(self) -> str | None:
@@ -416,6 +464,7 @@ class LastDecision:
             "presence": self.presence,
             "at": self.at,
             "read_ref": self.read_ref,
+            "completed": self.completed,
         }
 
 
@@ -516,9 +565,9 @@ SOURCES: dict[MalfunctionCode, Source] = {
     MalfunctionCode.BOOM_DID_NOT_RISE: Source.NO_SOURCE,
     MalfunctionCode.BOOM_DID_NOT_CLOSE: Source.NO_SOURCE,
     MalfunctionCode.VEND_RELAY_FAULT: Source.NO_SOURCE,
-    MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED: Source.NO_SOURCE,
+    MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED: Source.MEASURED,
     MalfunctionCode.ARMING_LOOPS_DISAGREE: Source.NOT_MEASURED,
-    MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING: Source.NOT_MEASURED,
+    MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING: Source.MEASURED,
     MalfunctionCode.CAMERA_FEED_LOST: Source.NOT_MEASURED,
     MalfunctionCode.CAMERA_FEED_FROZEN: Source.NO_SOURCE,
     MalfunctionCode.LENS_OBSTRUCTED_OR_DARK: Source.NOT_MEASURED,
@@ -535,6 +584,34 @@ SOURCES: dict[MalfunctionCode, Source] = {
     MalfunctionCode.DISK_NEARLY_FULL: Source.NO_SOURCE,
     MalfunctionCode.CLOCK_SKEW_REJECTED: Source.MEASURED,
 }
+
+#: THE SUBSET OF `MalfunctionCode` THAT REFUSES AN ASSISTED VEND, and it is a
+#: subset by decision rather than by accident.
+#:
+#: These five are about THE PHYSICAL ACT OF OPENING SAFELY: the boom, the relay
+#: that drives it, and the arming loops that say something is in front of it.
+#: A barrier that will not rise, will not close, or is being told to move by a
+#: faulty relay is a barrier nobody should command; a stuck or disagreeing
+#: arming loop is a lane that cannot say whether there is a car there at all,
+#: which is the metal-plate fraud with the loops themselves as the accomplice.
+#:
+#: EVERY OTHER CODE, INCLUDING EVERY ONE THIS BUILD MEASURES, NO LONGER REFUSES
+#: A COMPLETION, and the one sentence that says why: they concern the READING
+#: and the RECORD -- whether the engine answered, whether the outbox is
+#: draining, whether the clock agrees -- not the barrier, and the assisted vend
+#: exists precisely for the driver whose reading failed. Refusing that driver
+#: because the thing that failed to read them is broken is the module refusing
+#: the case it was built for.
+#:
+#: Derived in the payload sets both ways, so a code cannot be in the enum and
+#: absent from this set unnoticed, or here and absent from the enum.
+VEND_BLOCKING: tuple[MalfunctionCode, ...] = (
+    MalfunctionCode.BOOM_DID_NOT_RISE,
+    MalfunctionCode.BOOM_DID_NOT_CLOSE,
+    MalfunctionCode.VEND_RELAY_FAULT,
+    MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED,
+    MalfunctionCode.ARMING_LOOPS_DISAGREE,
+)
 
 #: Codes a monitor must NOT page a human on, each with the caveat that says why.
 #: Membership and caveat come from this one mapping, so a code cannot be marked

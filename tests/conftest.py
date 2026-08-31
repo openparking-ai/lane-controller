@@ -945,5 +945,119 @@ def _break_the_vend(monkeypatch):
         # a measurement it did not make, on the record that prices the stay.
         monkeypatch.setattr(vend_module, "VEND_IDENTITY_KINDS", ("ticket", "plate"))
 
+    elif mode == "no_flush_after_the_vend":
+        # THE RECORD NEVER LEAVES THE BOX. The order is still right, the
+        # identity is still written before the relay, and the platform holds
+        # nothing about any of it until some later ordinary arrival flushes --
+        # which at a lane using the intercom may never come, and a restart
+        # before it loses the record entirely.
+        from lane_controller.events import EventQueue
+
+        original_complete = LaneController.complete_vend
+        original_flush = EventQueue.flush
+
+        def unflushed(self, identity, *, authorised_by, assisted):
+            monkeypatch.setattr(EventQueue, "flush", lambda self: 0)
+            try:
+                return original_complete(
+                    self, identity, authorised_by=authorised_by, assisted=assisted
+                )
+            finally:
+                monkeypatch.setattr(EventQueue, "flush", original_flush)
+
+        monkeypatch.setattr(LaneController, "complete_vend", unflushed)
+
+    elif mode == "decision_not_consumed":
+        # THE DECISION IS NOT CONSUMED. One arrival, any number of completions:
+        # two idempotency keys, two relay pulses, two tickets, TWO BILLABLE
+        # STAYS for one car. Every other refusal passes -- the car is on the
+        # loop, the decision is seconds old, the outcome is `fallback`.
+        original_complete = LaneController.complete_vend
+
+        def unconsumed(self, identity, *, authorised_by, assisted):
+            at = original_complete(self, identity, authorised_by=authorised_by, assisted=assisted)
+            self.last_decision_completed_at = None
+            return at
+
+        monkeypatch.setattr(LaneController, "complete_vend", unconsumed)
+
+    elif mode == "compare_digest_on_str":
+        # The comparison goes back to `str`. `hmac.compare_digest` raises on a
+        # non-ASCII one, and the query check is the first thing every request
+        # reaches -- so an unauthenticated caller gets a dropped connection and
+        # an unhandled traceback instead of the named 401.
+        import hmac
+
+        monkeypatch.setattr(
+            service_module, "_same", lambda a, b: hmac.compare_digest(a, b)
+        )
+
+    elif mode == "key_recorded_on_the_event":
+        # The caller's raw `Idempotency-Key` goes back onto `assisted_identity`,
+        # which reaches `GET /v1/lane/events` and the platform's append-only
+        # `events` table. Whatever a caller wrote there could never be removed.
+        original_accept = AssistedVend._accept
+
+        def with_the_key(self, request):
+            original_record = LaneController.complete_vend
+
+            def recording(controller, identity, *, authorised_by, assisted):
+                assisted = {**assisted, "idempotency_key": request.idempotency_key}
+                return original_record(
+                    controller, identity, authorised_by=authorised_by, assisted=assisted
+                )
+
+            monkeypatch.setattr(LaneController, "complete_vend", recording)
+            try:
+                return original_accept(self, request)
+            finally:
+                monkeypatch.setattr(LaneController, "complete_vend", original_record)
+
+        monkeypatch.setattr(AssistedVend, "_accept", with_the_key)
+
+    elif mode == "no_settle_deadline":
+        # The settle waits on the loop driver for ever again. A driver that does
+        # not return leaves the lane refusing every assisted vend `busy` until a
+        # restart, with `transit` reading `pending` -- which is also what a
+        # legitimate in-window transit reads.
+        def unbounded(self, identity, at):
+            controller = self._service.controller
+            try:
+                controller.resolve_transit(identity, at)
+            finally:
+                with self._state:
+                    self._in_progress = False
+
+        assert hasattr(AssistedVend, "_settle"), "the settle break's anchor has moved"
+        monkeypatch.setattr(AssistedVend, "_settle", unbounded)
+
+    elif mode == "subset_widened_to_all_codes":
+        # Refusal 2 goes back to refusing on every measured code. The lane then
+        # refuses the driver whose reading failed BECAUSE the thing that failed
+        # to read them is broken -- the module refusing the case it exists for.
+        from lane_controller.contract import MalfunctionCode
+
+        monkeypatch.setattr(vend_module, "VEND_BLOCKING", tuple(MalfunctionCode))
+
+    elif mode == "no_arming_dwell_measure":
+        # The dwell is never measured, so `arming_loop_stuck_occupied` can never
+        # be `active` and a lane whose arming loops are stuck accepts every
+        # assisted vend with nothing in front of the barrier.
+        assert hasattr(LaneController, "observe_arming_loop"), "the dwell break's anchor has moved"
+        monkeypatch.setattr(LaneController, "observe_arming_loop", lambda self: None)
+
+    elif mode == "finite_check_removed":
+        # The duration validator goes back to testing one side of zero. `nan`
+        # and `inf` are TOML float literals, `nan <= 0` is False, and
+        # `x > nan` is False for every x -- so `completion_max_age_s = nan` is a
+        # well-formed configuration file with no staleness refusal in it.
+        from lane_controller import config as config_module
+
+        def unchecked(value, name):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"{name} must be a positive number of seconds, got {value!r}")
+
+        monkeypatch.setattr(config_module, "positive_finite", unchecked)
+
     else:
         raise RuntimeError(f"unknown BREAK_VEND mode: {mode}")
