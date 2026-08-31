@@ -6,24 +6,35 @@ could ask what the lane had just decided. Our own intercom agent needs to ask,
 and so does a third party's -- so it is a contract, not a private path, and our
 software is an ordinary client of it.
 
-**READ ONLY, for the whole of this contract version.** Four routes, all `GET`,
-and there is deliberately no fifth:
+**FOUR READS AND ONE ACT.** Version 2 grows the act surface, and it is one
+route:
 
-    GET /v1/lane                 who this lane is, and what it can do
-    GET /v1/lane/state           the last decision, and the current transit
-    GET /v1/lane/health          every malfunction code, with its source
-    GET /v1/lane/events?since=N  the event cursor
+    GET  /v1/lane                 who this lane is, and what it can do
+    GET  /v1/lane/state           the last decision, and the current transit
+    GET  /v1/lane/health          every malfunction code, with its source
+    GET  /v1/lane/events?since=N  the event cursor
+    POST /v1/lane/vend            the assisted vend -- see `vend.py`
 
-There is no vend route and no resolve route. `ACT_ROUTES` below is empty, and
-`Capabilities.can_vend` is derived from it, so the capability cannot say `false`
-while a route that opens a barrier exists. Every method other than `GET` is
-answered by one shared refusal.
+`ACT_ROUTES` below is that one route, and `Capabilities.can_vend` is derived
+from it and from the lane's direction, so the capability cannot say `false`
+while a route that opens a barrier exists, nor `true` at a lane that would
+serve none. Every method other than `GET` and `POST` is answered by one shared
+refusal, and `POST` to anything but an act route is answered by the same one.
+
+**TWO TOKENS, AND A READ TOKEN NEVER AUTHORISES AN ACT.** The reads take
+`--auth-token-file`; the vend takes `--act-token-file`, a SECOND file. Each is
+refused on the other's routes with a 403 -- not a 401, because the caller is
+known and is asking for something this credential does not buy. A credential in
+a QUERY STRING is refused 401 on every route, whichever token it is: a token in
+a URL is a token in an access log.
 
 **Local, always.** It binds loopback by default and is meant to run on the same
 device as the lane it describes. Off loopback it REFUSES to start without a
 shared token -- `InsecureBind`, the same rule and the same shape the Vehicle ID
 service applies, because the exposure is the same: on a lane's own LAN, this
-publishes where a vehicle was, when, and what the lane decided about it.
+publishes where a vehicle was, when, and what the lane decided about it. Off
+loopback it refuses to start without the ACT token too, for a larger reason:
+the exposed thing is no longer only a description of a lane, it is a barrier.
 
 **No state store, and none is added here.** The service reads what the
 controller holds in memory. A restart loses the last decision, and
@@ -63,6 +74,8 @@ from .contract import (
 from .interfaces import Unavailable
 from .sync import to_iso
 from .vehicle_id_client import VehicleIdClient
+from .vend import AssistedVend, BadVendRequest
+from .vend import parse as parse_vend
 
 log = logging.getLogger(__name__)
 
@@ -75,16 +88,46 @@ READ_ROUTES: tuple[str, ...] = (
 )
 
 #: Routes that CHANGE something -- a vend, a resolve, anything that moves a
-#: barrier or a session. EMPTY, and it is empty by decision: the act surface is
-#: a later round, deliberately after the display and the agent, because it is
-#: the first thing that can open a barrier.
+#: barrier or a session. ONE, and it is the whole act surface of this contract
+#: version: the assisted vend.
 #:
-#: `Capabilities.can_vend` is derived from this tuple. Adding a route here
-#: without building the refusals behind it therefore changes what the lane
-#: TELLS a consumer it can do, in the same commit, which is the point.
-ACT_ROUTES: tuple[str, ...] = ()
+#: `Capabilities.can_vend` is derived from this tuple (and from the lane's
+#: direction), so a route added here changes what the lane TELLS a consumer it
+#: can do, in the same commit, which is the point. The refusals behind it are
+#: in `vend.py`; a route added here without them would be a lane announcing an
+#: act surface with nothing guarding it.
+ACT_ROUTES: tuple[str, ...] = ("/v1/lane/vend",)
+
+#: Query-string parameter names that would be carrying a credential.
+#:
+#: A token in a URL is a token in an access log, in a proxy's log, in a browser
+#: history and in a referrer header -- none of which anybody decided. This lane
+#: takes credentials in the `Authorization` header and NOWHERE else, so one that
+#: arrives in a query string is answered 401 rather than ignored: ignoring it
+#: would let a caller hold a working integration that leaks its own credential
+#: on every request, with nothing anywhere saying so.
+#:
+#: The names are one half of the check. The other half is a VALUE equal to a
+#: configured token under any parameter name at all -- see `_credential_in_query`.
+CREDENTIAL_QUERY_KEYS: tuple[str, ...] = (
+    "token",
+    "access_token",
+    "auth",
+    "auth_token",
+    "act_token",
+    "bearer",
+    "api_key",
+    "apikey",
+    "key",
+)
 
 MAX_QUERY_CURSOR = 2**63 - 1
+
+#: The largest body `POST /v1/lane/vend` will read. A completion is four short
+#: fields; anything larger is not one, and reading an unbounded body off a
+#: socket into a gate housing's memory is a way to stop a lane serving from the
+#: LAN it is on.
+MAX_BODY_BYTES = 16 * 1024
 
 
 class InsecureBind(Exception):
@@ -113,21 +156,38 @@ def is_loopback(host: str) -> bool:
         return False
 
 
-def assert_bind_allowed(host: str, port: int, token: str | None) -> None:
-    """Raise unless this host may be bound with this credential.
+def assert_bind_allowed(
+    host: str, port: int, token: str | None, act_token: str | None = None
+) -> None:
+    """Raise unless this host may be bound with these credentials.
 
     One implementation, called by `make_server` -- so the rule holds for every
     caller of this package -- and by the CLI before it builds anything, so a
     misconfiguration is reported in the moment.
+
+    TWO refusals, because there are now two exposures and they are not the same
+    size. Without the read token, anything that can reach the port learns where
+    a vehicle was and what this lane decided about it. Without the act token,
+    anything that can reach the port can OPEN THE BARRIER -- this contract
+    version has a route that does -- and refusing at the moment of the bind is
+    the only place that can be said before it is true.
     """
-    if is_loopback(host) or token:
+    if is_loopback(host):
         return
-    raise InsecureBind(
-        f"refusing to bind {host or 'every interface'}:{port} with no token. Off loopback "
-        "anything that can reach this port can read where a vehicle was, when it was there, "
-        "and what this lane decided about it. Configure a shared token with --auth-token-file, "
-        "or bind 127.0.0.1."
-    )
+    if not token:
+        raise InsecureBind(
+            f"refusing to bind {host or 'every interface'}:{port} with no token. Off loopback "
+            "anything that can reach this port can read where a vehicle was, when it was there, "
+            "and what this lane decided about it. Configure a shared token with "
+            "--auth-token-file, or bind 127.0.0.1."
+        )
+    if ACT_ROUTES and not act_token:
+        raise InsecureBind(
+            f"refusing to bind {host or 'every interface'}:{port} with no ACT token. This "
+            f"contract version serves {', '.join(ACT_ROUTES)}, which opens a barrier, and the "
+            "read token does not authorise it. Configure a SECOND token with --act-token-file, "
+            "or bind 127.0.0.1."
+        )
 
 
 def bearer(header: str | None) -> str | None:
@@ -176,6 +236,9 @@ class LaneService:
 
     def __init__(self, controller) -> None:
         self.controller = controller
+        #: The act surface. It holds the refusals, the order they are applied
+        #: in and the idempotency store; this service holds the HTTP.
+        self.assisted = AssistedVend(self)
         self._lock = threading.Lock()
         #: The one identification-service health read that may be outstanding.
         #: See `_bounded_identity_health` -- it is what keeps a service that
@@ -210,9 +273,26 @@ class LaneService:
             # that the day a display is wired, this follows it instead of
             # needing to be remembered.
             has_display=getattr(controller, "display", None) is not None,
-            # From the route table, not from a constant. See ACT_ROUTES.
-            can_vend=bool(ACT_ROUTES),
+            # From the route table AND the direction, not from a constant. See
+            # ACT_ROUTES, and `can_vend` below.
+            can_vend=self.can_vend(),
         )
+
+    def can_vend(self) -> bool:
+        """Whether this lane serves a route that opens a barrier.
+
+        Two facts, and both are derived: the service has an act route at all,
+        and this lane is an ENTRY lane.
+
+        The direction is in it because the act surface COMPLETES AN ENTRY. At an
+        exit, completing an identity would close a stay and freeze a fee, which
+        is the exit process and is a later round -- so an exit lane serves no
+        such route and says `can_vend: false` rather than announcing a
+        capability every call to which it would refuse. One answer, one place:
+        the handler asks this before it serves, so the capability and the routes
+        cannot disagree.
+        """
+        return bool(ACT_ROUTES) and self.controller.config.direction == "entry"
 
     def describe(self) -> LaneDescription:
         controller = self.controller
@@ -598,8 +678,11 @@ class LaneService:
 class _Handler(BaseHTTPRequestHandler):
     service: LaneService
     #: None means no credential is configured, which is the loopback default.
-    #: A string means every route requires it.
+    #: A string means every READ route requires it.
     token: str | None = None
+    #: The SECOND credential, and the only one that authorises the vend. None
+    #: is the loopback default; off loopback the bind is refused without it.
+    act_token: str | None = None
 
     server_version = "openparking-lane-controller"
     sys_version = ""
@@ -607,12 +690,17 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         log.debug("%s - %s", self.address_string(), fmt % args)
 
-    # --- the only method that does anything -------------------------------
+    # --- the reads --------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802  (http.server's spelling)
         url = urlparse(self.path)
-        if not self._authorised():
-            return self._unauthorised()
+        if self._credential_in_query(url.query):
+            return self._credential_in_a_url()
+        refusal = self._authorise(
+            self.token, self.act_token, "a read route", unconfigured_refuses=False
+        )
+        if refusal is not None:
+            return refusal()
 
         if url.path == "/v1/lane":
             return self._json(200, self.service.describe().to_dict())
@@ -635,22 +723,73 @@ class _Handler(BaseHTTPRequestHandler):
 
         return self._json(404, {"error": "no such route"})
 
+    # --- the one act ------------------------------------------------------
+
+    def do_POST(self) -> None:  # noqa: N802
+        """The act surface, and it is exactly `ACT_ROUTES`.
+
+        A POST to anything else -- including a read route -- is the same shared
+        refusal every other method gets. The route table is what decides, not a
+        list somebody remembered here.
+        """
+        url = urlparse(self.path)
+        if self._credential_in_query(url.query):
+            return self._credential_in_a_url()
+        if url.path not in ACT_ROUTES:
+            return self._method_not_allowed()
+        # An act route this LANE does not serve is not there, and says so. See
+        # `LaneService.can_vend`: an exit lane publishes `can_vend: false` and
+        # this is the same fact answered as a status.
+        if not self.service.can_vend():
+            return self._json(404, {"error": "no such route on this lane"})
+
+        refusal = self._authorise(
+            self.act_token, self.token, "the vend route", unconfigured_refuses=True
+        )
+        if refusal is not None:
+            return refusal()
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self._json(400, {"error": "Content-Length is not an integer"})
+        if length < 0 or length > MAX_BODY_BYTES:
+            return self._json(400, {"error": f"the body must be at most {MAX_BODY_BYTES} bytes"})
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return self._json(400, {"error": "the body is not JSON"})
+
+        try:
+            request = parse_vend(body, self.headers.get("Idempotency-Key"))
+        except BadVendRequest as exc:
+            return self._json(400, {"error": str(exc)})
+
+        status, payload = self.service.assisted.complete(request)
+        return self._json(status, payload)
+
     # --- every other method, through ONE refusal --------------------------
 
     def _method_not_allowed(self) -> None:
-        """The single refusal every non-GET method is answered by.
+        """The single refusal every method that is not a route is answered by.
 
         Spelled once and shared, so `tests/test_lane_contract.py` can sweep the
-        handler and require that every `do_*` other than `do_GET` IS this
-        function. A route that mutated something would have to stop being it,
-        and the sweep goes red in the same commit.
+        handler and require that every `do_*` other than `do_GET` and `do_POST`
+        IS this function -- and that `do_POST` serves exactly `ACT_ROUTES` and
+        answers this everywhere else. A second route that mutated something
+        would have to break one of those two, and the sweep goes red in the
+        same commit.
         """
         self.send_response(405)
-        self.send_header("Allow", "GET")
+        self.send_header("Allow", "GET, POST" if ACT_ROUTES else "GET")
         body = json.dumps(
             {
-                "error": "this contract version is read-only; there is no route that changes "
-                "anything. See capabilities.can_vend on GET /v1/lane.",
+                "error": (
+                    "this route does not change anything. The whole act surface of this "
+                    f"contract version is {', '.join(ACT_ROUTES) or 'empty'}. See "
+                    "capabilities.can_vend on GET /v1/lane."
+                ),
                 "contract_version": CONTRACT_VERSION,
             }
         ).encode("utf-8")
@@ -659,25 +798,106 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    do_POST = _method_not_allowed  # noqa: N815
     do_PUT = _method_not_allowed  # noqa: N815
     do_PATCH = _method_not_allowed  # noqa: N815
     do_DELETE = _method_not_allowed  # noqa: N815
 
     # --- plumbing ---------------------------------------------------------
 
-    def _authorised(self) -> bool:
-        """Compared in constant time, because a token is a secret.
+    def _authorise(
+        self, required: str | None, other: str | None, what: str, *, unconfigured_refuses: bool
+    ):
+        """`None` when the caller may proceed, or the refusal to send.
 
+        Compared in constant time, because a token is a secret.
         `hmac.compare_digest` and not `==`: the ordinary comparison returns as
         soon as two bytes differ, and that timing is enough to recover a token
         one character at a time from a machine on the same LAN -- which is
         exactly the machine this credential exists to keep out.
+
+        THE OTHER TOKEN IS A 403, NOT A 401. A 401 means "I do not know who you
+        are"; this caller is known, holds a real credential of this lane's, and
+        is asking for something that credential does not buy. Answering 401
+        would invite it to retry with the same token for ever, and would make
+        the read token and a wrong guess look identical -- which is the whole
+        point of there being two.
         """
-        if self.token is None:
-            return True
+        if required is None:
+            if other is None:
+                # NEITHER credential is configured: the loopback default, and
+                # it is the default for the vend too. A lane on loopback with
+                # no files at all is the developer's lane and the demo's, and
+                # this is the same answer it has always given.
+                return None
+            if not unconfigured_refuses:
+                # No credential configured for this route: the loopback
+                # default, which is what the reads have always had. It stays
+                # open here even when the OTHER token is configured, because
+                # refusing a monitor with a 403 for a credential it was never
+                # asked for is a confusing failure and not a safer one -- and
+                # off loopback the bind already requires both.
+                return None
+            # THE ASYMMETRY, and it is deliberate. A lane with no ACT token has
+            # authorised nothing to vend. Serving the barrier to anything that
+            # can reach loopback because the act file was never written is
+            # exactly the silent failure this contract refuses, and it is a
+            # different size of mistake from an open read.
+            return lambda: self._forbidden(f"this lane has no credential configured for {what}")
         presented = bearer(self.headers.get("Authorization"))
-        return presented is not None and hmac.compare_digest(presented, self.token)
+        if presented is None:
+            return self._unauthorised
+        if hmac.compare_digest(presented, required):
+            return None
+        if other is not None and hmac.compare_digest(presented, other):
+            return lambda: self._forbidden(f"that credential does not authorise {what}")
+        return self._unauthorised
+
+    def _credential_in_query(self, query: str) -> bool:
+        """Whether this request put a credential in the URL. Either token, any name.
+
+        Two halves, and both are needed. The NAMES catch a caller that has
+        invented its own way of passing a token; the VALUE comparison catches
+        one that used a name nobody thought of, and it is the half that cannot
+        be got round.
+        """
+        if not query:
+            return False
+        params = parse_qs(query, keep_blank_values=True)
+        if any(name.lower() in CREDENTIAL_QUERY_KEYS for name in params):
+            return True
+        configured = [token for token in (self.token, self.act_token) if token]
+        return any(
+            hmac.compare_digest(value, token)
+            for values in params.values()
+            for value in values
+            for token in configured
+        )
+
+    def _credential_in_a_url(self) -> None:
+        """401, and the request is not served whatever else was right about it.
+
+        A URL is logged by everything it passes through. Serving this request
+        would hand the caller a working integration that publishes its own
+        credential on every call, with nothing anywhere saying so.
+        """
+        log.warning("a credential was presented in a query string; refusing the request")
+        self._json(
+            401,
+            {
+                "error": (
+                    "a credential in a query string is refused. A token in a URL is a token "
+                    "in an access log: present it in the Authorization header."
+                )
+            },
+        )
+
+    def _forbidden(self, why: str) -> None:
+        self.send_response(403)
+        body = json.dumps({"error": why}).encode("utf-8")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _unauthorised(self) -> None:
         self.send_response(401)
@@ -702,20 +922,27 @@ def make_server(
     host: str = "127.0.0.1",
     port: int = 8090,
     token: str | None = None,
+    act_token: str | None = None,
 ):
     """Bound to loopback by default. Exposing it is a deployment decision.
 
-    Off loopback this REFUSES to build a server unless a token is configured.
-    The refusal is here rather than in the CLI so it holds for every caller of
-    this package, not only for the one that types the flag.
+    Off loopback this REFUSES to build a server unless BOTH tokens are
+    configured. The refusal is here rather than in the CLI so it holds for every
+    caller of this package, not only for the one that types the flags.
     """
-    assert_bind_allowed(host, port, token)
-    handler = type("_BoundHandler", (_Handler,), {"service": service, "token": token or None})
+    assert_bind_allowed(host, port, token, act_token)
+    handler = type(
+        "_BoundHandler",
+        (_Handler,),
+        {"service": service, "token": token or None, "act_token": act_token or None},
+    )
     return ThreadingHTTPServer((host, port), handler)
 
 
 __all__ = [
     "ACT_ROUTES",
+    "CREDENTIAL_QUERY_KEYS",
+    "MAX_BODY_BYTES",
     "READ_ROUTES",
     "InsecureBind",
     "LaneService",

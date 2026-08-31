@@ -218,7 +218,13 @@ class PlatformTransport(EventTransport):
         declared = event.detail["entry_confirmation"]
         result = self._client.open_session(
             event_id=event.event_id,
-            plate=event.detail["plate"],
+            # EXACTLY ONE of the two, and which one is decided where the record
+            # was written -- `LaneController._identity_detail` -- not here. A
+            # `.get` on both rather than a `[...]` on the plate: a stay opened
+            # on a ticket carries no plate key at all, and a KeyError on this
+            # path would kill the flush after the barrier had already opened.
+            plate=event.detail.get("plate"),
+            ticket_ref=event.detail.get("ticket_ref"),
             entry_at=event.detail.get("at") or to_iso(event.at),
             plate_region=event.detail.get("plate_region"),
             entry_confirmation=declared,
@@ -243,7 +249,8 @@ class PlatformTransport(EventTransport):
         declared = event.detail["exit_confirmation"]
         result = self._client.close_session(
             event_id=event.event_id,
-            plate=event.detail["plate"],
+            plate=event.detail.get("plate"),
+            ticket_ref=event.detail.get("ticket_ref"),
             exit_at=event.detail.get("at") or to_iso(event.at),
             # Recorded at the moment of the exit, when it was still unambiguous
             # which session was open. By the time a queued close is delivered it

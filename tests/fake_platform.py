@@ -73,16 +73,35 @@ class FakePlatform:
                 accepted += 1
         return {"accepted": accepted, "duplicates": len(events) - accepted}
 
+    @staticmethod
+    def _identity(plate, ticket_ref) -> str:
+        """The one identity this stay is against, refused if it is not one.
+
+        The real route applies exactly this rule (`laneIdentity` in
+        `platform/src/app.js`) and answers 400. A fake that accepted both, or
+        neither, would let the lane's side pass against a platform that would
+        have refused it.
+        """
+        if bool(plate) == bool(ticket_ref):
+            raise PlatformRejected(
+                400,
+                "exactly one of plate or ticket_ref is required in the body; "
+                f"this request sent {'both' if plate else 'neither'}",
+            )
+        return plate or ticket_ref
+
     def open_session(
         self,
         *,
         event_id: str,
-        plate: str,
         entry_at: str,
         entry_confirmation: str,
+        plate: str | None = None,
+        ticket_ref: str | None = None,
         plate_region=None,
     ) -> dict:
         self._check()
+        identity = self._identity(plate, ticket_ref)
         # Refused here exactly as the real platform refuses it. A fake that
         # accepted an open with no confirmation would let the lane's side of
         # this pass while the contract it is written against says no.
@@ -93,6 +112,7 @@ class FakePlatform:
             {
                 "event_id": event_id,
                 "plate": plate,
+                "ticket_ref": ticket_ref,
                 "entry_at": entry_at,
                 "entry_confirmation": entry_confirmation,
             }
@@ -102,8 +122,8 @@ class FakePlatform:
         # opened -- not open a second one.
         if event_id in self.sessions_by_open_event:
             return {"session": self.sessions_by_open_event[event_id], "created": False}
-        if plate in self.open_sessions:
-            return {"session": self.open_sessions[plate], "created": False}
+        if identity in self.open_sessions:
+            return {"session": self.open_sessions[identity], "created": False}
         # Echoed back, exactly as the route does -- it answers with the row it
         # wrote, and `PlatformClient.open_session` refuses an open that comes
         # back without the value it sent. A fake that did not echo would make
@@ -111,30 +131,33 @@ class FakePlatform:
         # record the field.
         session = {
             "plate": plate,
+            "ticket_ref": ticket_ref,
             "entry_at": entry_at,
             "fee_minor": None,
             "entry_confirmation": entry_confirmation,
         }
-        self.open_sessions[plate] = session
+        self.open_sessions[identity] = session
         self.sessions_by_open_event[event_id] = session
         return {"session": session, "created": True}
 
-    def find_open_session(self, *, plate: str) -> dict | None:
+    def find_open_session(self, *, plate: str | None = None, ticket_ref: str | None = None):
         if not self.online:
             return None
-        session = self.open_sessions.get(plate)
+        session = self.open_sessions.get(plate or ticket_ref)
         return {"session": {**session, "id": id(session)}} if session else None
 
     def close_session(
         self,
         *,
         event_id: str,
-        plate: str,
         exit_at: str,
         exit_confirmation: str,
+        plate: str | None = None,
+        ticket_ref: str | None = None,
         session_id: str | None = None,
     ) -> dict:
         self._check()
+        identity = self._identity(plate, ticket_ref)
         if exit_confirmation not in ACCEPTED_EXIT_CONFIRMATIONS:
             raise PlatformRejected(400, f"exit_confirmation {exit_confirmation!r} is not one of "
                                        f"{sorted(ACCEPTED_EXIT_CONFIRMATIONS)}")
@@ -142,6 +165,7 @@ class FakePlatform:
             {
                 "event_id": event_id,
                 "plate": plate,
+                "ticket_ref": ticket_ref,
                 "exit_at": exit_at,
                 "session_id": session_id,
                 "exit_confirmation": exit_confirmation,
@@ -149,7 +173,7 @@ class FakePlatform:
         )
         if event_id in self.sessions_by_close_event:
             return {"session": self.sessions_by_close_event[event_id], "replay": True}
-        session = self.open_sessions.pop(plate, None)
+        session = self.open_sessions.pop(identity, None)
         if session is None:
             if self.reject_close_without_open:
                 raise PlatformRejected(404, "no open session for this vehicle")

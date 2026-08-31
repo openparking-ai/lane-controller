@@ -26,6 +26,7 @@ import pytest
 from lane_consumer import Escalate, LaneConsumer
 from lane_controller import EventQueue, VehicleIdClient
 from lane_controller.contract import (
+    CONTRACT_VERSION,
     OUTCOMES,
     REQUIRED_REASONS,
     HealthState,
@@ -89,7 +90,7 @@ def test_a_consumer_reads_all_four_routes_from_either_lane(lane_url):
     consumer = LaneConsumer(lane_url)
 
     lane = consumer.lane()
-    assert lane["contract_version"] == 1
+    assert lane["contract_version"] == CONTRACT_VERSION
     assert lane["direction"] in ("entry", "exit")
     assert set(lane["capabilities"]) == {
         "confirms_entry",
@@ -121,14 +122,26 @@ def test_a_consumer_reads_all_four_routes_from_either_lane(lane_url):
     )
 
 
-def test_neither_lane_will_do_anything_for_a_consumer_that_asks(lane_url):
-    """`can_vend` is `false` on both, and both refuse a POST.
+def test_a_consumer_asks_whether_a_lane_will_act_and_gets_the_truth(lane_url):
+    """`can_vend` and the route AGREE, on whichever lane this is.
 
-    The question a consumer would actually ask, asked identically of both.
+    The question a consumer would actually ask, asked identically of both --
+    and this is the assertion that changed shape in version 2. It used to be
+    "neither lane will do anything". Now ours will and theirs will not, and
+    what the contract has to guarantee is that the capability tells you which
+    WITHOUT trying it.
     """
     consumer = LaneConsumer(lane_url)
-    assert consumer.lane()["capabilities"]["can_vend"] is False
-    assert consumer.post("/v1/lane/vend") in (404, 405)
+    can_vend = consumer.lane()["capabilities"]["can_vend"]
+    answered = consumer.post("/v1/lane/vend")
+    if can_vend:
+        assert answered not in (404, 405), (
+            "a lane that says it can vend must serve the route it names"
+        )
+    else:
+        assert answered in (404, 405), (
+            "a lane that says it cannot vend must not serve a route that opens a barrier"
+        )
 
 
 def test_a_cursor_ahead_of_either_lane_says_reset(lane_url):
@@ -220,11 +233,18 @@ def test_our_lane_and_theirs_disagree_on_every_capability_that_can_differ():
         theirs = LaneConsumer(base).lane()["capabilities"]
 
     differing = {key for key in ours if ours[key] != theirs[key]}
-    assert differing == {"confirms_entry", "has_identity_service", "has_platform"}
-    # Neither has a display, and -- the one this whole round turns on -- neither
-    # will vend.
+    assert differing == {
+        "confirms_entry",
+        "has_identity_service",
+        "has_platform",
+        # The one this round adds, and it is now a fourth axis the two lanes
+        # disagree on: implementing the act side is OPTIONAL, and a consumer
+        # must read the capability rather than assume either answer.
+        "can_vend",
+    }
+    # Neither has a display.
     assert ours["has_display"] is False and theirs["has_display"] is False
-    assert ours["can_vend"] is False and theirs["can_vend"] is False
+    assert ours["can_vend"] is True and theirs["can_vend"] is False
 
 
 # ---------------------------------------------------------------------------

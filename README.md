@@ -71,10 +71,31 @@ both.
 lane-controller serve --config lane.toml
 ```
 
-Loopback by default; off loopback it refuses to start without a token.
+Loopback by default; off loopback it refuses to start without **both** tokens.
 
-**This contract version is read only.** No route on it opens a barrier, closes a
-session, or changes anything at all.
+**Four reads and one act.** Contract version 2 adds `POST /v1/lane/vend` — the
+assisted vend, and the only route here that changes anything. It completes a
+decision this lane already made and could not finish on its own: a driver whose
+plate was not read, at a barrier that did not open, with a human on the intercom
+or a confirmed display code saying to let them in.
+
+What makes that safe is enforced, not promised:
+
+- **The lane applies its own refusals** — presence read off the arming loop at
+  the moment of the call, its own malfunction table, its own arming geometry,
+  and the case must be one this lane is holding and is still recent. All of them
+  come from the code an ordinary arrival goes through.
+- **The lane writes the completed identity before the relay moves**, in that
+  order, asserted by a test that records every call.
+- **A read token never authorises an act.** The vend takes a second token from
+  `--act-token-file`; each is `403` on the other's routes, and either in a query
+  string is `401`.
+- **The answer is `vend_commanded`, never `opened`.** Nothing in this system
+  measures the boom, and this lane's own health surface says so.
+
+`capabilities.can_vend` says whether a given lane serves it, derived from the
+route table and the lane's direction — an exit lane answers `false`, because
+completing an identity there would close a stay and freeze a fee.
 
 ## Talking to the platform
 

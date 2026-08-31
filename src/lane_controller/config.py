@@ -172,6 +172,25 @@ DEFAULT_OUTBOX_DEPTH_THRESHOLD = 1_000
 #: code derived from a different signal.
 DEFAULT_IDENTITY_HEALTH_TIMEOUT_S = 1.0
 
+#: The published default for `LaneConfig.completion_max_age_s`: how old the
+#: decision named by `POST /v1/lane/vend` may be before the completion is
+#: refused `decision_stale`.
+#:
+#: A PER-SITE SETTING AND AN ASSUMPTION. Nothing in this package measures how
+#: long an intercom conversation takes, and 120 seconds is not a measurement of
+#: one. What it IS drawn against is what a completion MEANS: an answer to a
+#: driver who is at the barrier now. A completion accepted against a decision
+#: from ten minutes ago would open a barrier for whoever happens to be there,
+#: which is the fraud the whole round is built not to enable -- and a bound so
+#: tight that an ordinary call cannot finish inside it sends every real customer
+#: to a human instead.
+#:
+#: It is the same number the agent will use for the case it speaks, and it is a
+#: setting on both sides rather than a constant on either, so a site whose
+#: intercom queue is long raises it in one place and the two stay drawn against
+#: the same thing.
+DEFAULT_COMPLETION_MAX_AGE_S = 120.0
+
 
 @dataclass(frozen=True, slots=True)
 class LaneConfig:
@@ -202,6 +221,9 @@ class LaneConfig:
     # health route before answering `unknown`. A per-site setting: see
     # DEFAULT_IDENTITY_HEALTH_TIMEOUT_S above for what it is and is not.
     identity_health_timeout_s: float = DEFAULT_IDENTITY_HEALTH_TIMEOUT_S
+    # How old the decision a `POST /v1/lane/vend` completes may be. A per-site
+    # setting: see DEFAULT_COMPLETION_MAX_AGE_S above for what it is and is not.
+    completion_max_age_s: float = DEFAULT_COMPLETION_MAX_AGE_S
 
     def __post_init__(self) -> None:
         if self.direction not in ("entry", "exit"):
@@ -224,6 +246,18 @@ class LaneConfig:
             raise ValueError(
                 f"identity_health_timeout_s must be a positive number of seconds, "
                 f"got {self.identity_health_timeout_s!r}"
+            )
+        if (
+            isinstance(self.completion_max_age_s, bool)
+            or not isinstance(self.completion_max_age_s, (int, float))
+            or self.completion_max_age_s <= 0
+        ):
+            # Zero or negative would refuse every completion as stale, which is
+            # a lane with an act surface that can never act -- and it would do
+            # it while publishing `can_vend: true`.
+            raise ValueError(
+                f"completion_max_age_s must be a positive number of seconds, "
+                f"got {self.completion_max_age_s!r}"
             )
 
     @classmethod
@@ -250,6 +284,9 @@ class LaneConfig:
             ),
             identity_health_timeout_s=float(
                 lane.get("identity_health_timeout_s", DEFAULT_IDENTITY_HEALTH_TIMEOUT_S)
+            ),
+            completion_max_age_s=float(
+                lane.get("completion_max_age_s", DEFAULT_COMPLETION_MAX_AGE_S)
             ),
             camera=CameraConfig(
                 camera_id=camera.get("id", "cam-1"),
