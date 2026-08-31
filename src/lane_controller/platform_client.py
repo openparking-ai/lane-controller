@@ -103,13 +103,35 @@ class PlatformClient:
     def post_events(self, events: list[dict]) -> dict:
         return self._request("POST", "/api/v1/lane/events", {"events": events})
 
+    @staticmethod
+    def _identity(plate: str | None, ticket_ref: str | None) -> dict:
+        """EXACTLY ONE of the two, on the wire, and refused here if not.
+
+        The platform refuses both and neither with a 400, which this lane's
+        transport dead-letters -- counted and logged, but after the barrier has
+        already opened and with the stay lost from the money record. A request
+        this lane can see is malformed does not get sent: it is a fault in the
+        lane, and it is louder here than three hops away.
+
+        The key that is not set is ABSENT rather than null. Nothing on the
+        platform distinguishes the two, and this is the shape the record has.
+        """
+        if bool(plate) == bool(ticket_ref):
+            raise PlatformRejected(
+                None,
+                "a session action must carry exactly one of plate or ticket_ref; this one "
+                f"carries {'both' if plate else 'neither'}",
+            )
+        return {"plate": plate} if plate else {"ticket_ref": ticket_ref}
+
     def open_session(
         self,
         *,
         event_id: str,
-        plate: str,
         entry_at: str,
         entry_confirmation: str,
+        plate: str | None = None,
+        ticket_ref: str | None = None,
         plate_region: str | None = None,
     ) -> dict:
         # event_id is the lane's own, and it is what makes a re-sent flush safe.
@@ -120,7 +142,7 @@ class PlatformClient:
             "/api/v1/lane/sessions/open",
             {
                 "event_id": event_id,
-                "plate": plate,
+                **self._identity(plate, ticket_ref),
                 "entry_at": entry_at,
                 "plate_region": plate_region,
                 # Not optional and not defaulted, here or at the platform. A
@@ -148,14 +170,15 @@ class PlatformClient:
         self,
         *,
         event_id: str,
-        plate: str,
         exit_at: str,
         exit_confirmation: str,
+        plate: str | None = None,
+        ticket_ref: str | None = None,
         session_id: str | None = None,
     ) -> dict:
         body = {
             "event_id": event_id,
-            "plate": plate,
+            **self._identity(plate, ticket_ref),
             "exit_at": exit_at,
             "exit_confirmation": exit_confirmation,
         }

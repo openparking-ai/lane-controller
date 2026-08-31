@@ -246,6 +246,23 @@ class VehicleIdentity:
     #: READ, so it is safe in a record the retention purge cannot reach --
     #: which is exactly why the plate itself is not put here.
     read_ref: str | None = None
+    #: AN IDENTITY THAT WAS ASSERTED, NOT MEASURED, and the one field on this
+    #: type that is not a reading. It is set by the LANE, in `complete_vend`,
+    #: from a completion a display code or a human authorised through
+    #: `POST /v1/lane/vend` -- and by nothing else.
+    #:
+    #: AN IDENTIFIER MAY NOT SUPPLY IT. `LaneController.handle_arrival` strips
+    #: one that arrives from `identify()` and says so on a warning line, for the
+    #: reason every other field here exists: this type is what the vision stage
+    #: BELIEVES IT SAW, and a value a camera did not produce sitting inside it
+    #: is judgement laundered into evidence by proximity. A third-party
+    #: identifier that could set this would be minting a parking session
+    #: identity through the seam that exists to report measurements.
+    #:
+    #: It never reaches the read contract. `entry_pending` carries the identity
+    #: KIND and not this value; the session action carries it, and that goes to
+    #: the platform's `vehicles.ticket_ref`, which the retention purge redacts.
+    ticket_ref: str | None = None
 
     def __post_init__(self) -> None:
         """The seam. Anything not in the set is refused, never carried.

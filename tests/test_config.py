@@ -1,13 +1,22 @@
+import math
 import re
 from pathlib import Path
 
 import pytest
 
 from lane_controller import (
+    CameraConfig,
     DecisionCache,
+    GateConfig,
     LaneConfig,
     LaneController,
     VehicleIdentity,
+)
+from lane_controller.config import (
+    DEFAULT_ARMING_LOOP_MAX_OCCUPIED_S,
+    DEFAULT_COMPLETION_MAX_AGE_S,
+    DEFAULT_IDENTITY_HEALTH_TIMEOUT_S,
+    DEFAULT_SETTLE_GRACE_S,
 )
 from lane_controller.interfaces import ClosingSequence
 from lane_controller.simulated import (
@@ -29,6 +38,94 @@ def test_the_example_config_loads():
     assert config.lane_id == "lane-1"
     assert config.camera.frames_per_read == 3
     assert config.confidence_threshold == 0.85
+
+
+def test_the_example_config_publishes_every_per_site_duration():
+    """The defaults a site copies, and they are the published ones.
+
+    A number in a document is a claim; this reads it out of the file an
+    installer actually copies and compares it against the constant the code
+    defaults to, so the two cannot drift.
+    """
+    config = LaneConfig.from_file(EXAMPLE)
+
+    assert config.identity_health_timeout_s == DEFAULT_IDENTITY_HEALTH_TIMEOUT_S == 1.0
+    assert config.completion_max_age_s == DEFAULT_COMPLETION_MAX_AGE_S == 120.0
+    assert config.settle_grace_s == DEFAULT_SETTLE_GRACE_S == 5.0
+    assert config.arming_loop_max_occupied_s == DEFAULT_ARMING_LOOP_MAX_OCCUPIED_S == 600.0
+
+
+# ---------------------------------------------------------------------------
+# A NUMBER THAT IS NOT A NUMBER IS REFUSED, and TOML has two of them.
+#
+# `nan <= 0` is False and `inf <= 0` is False, so a validator that tests one
+# side of zero admits both -- and `completion_max_age_s = nan` made
+# `decision_stale` unreachable, because `x > nan` is False for every x. TOML 1.0
+# has `nan` and `inf` as float literals, so that was a well-formed configuration
+# file that silently removed a refusal on the route that opens a barrier.
+# ---------------------------------------------------------------------------
+
+DURATIONS = (
+    "identity_health_timeout_s",
+    "completion_max_age_s",
+    "settle_grace_s",
+    "arming_loop_max_occupied_s",
+)
+
+
+@pytest.mark.parametrize("name", DURATIONS)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_duration_that_is_not_finite_is_refused_by_name(name, value):
+    with pytest.raises(ValueError, match=name):
+        LaneConfig(
+            lane_id="lane-1",
+            site_id="site-1",
+            camera=CameraConfig(camera_id="c", rtsp_url="", frames_per_read=1),
+            gate=GateConfig(),
+            **{name: value},
+        )
+
+
+@pytest.mark.parametrize("name", DURATIONS)
+@pytest.mark.parametrize("value", [0, -1, 0.0, False, True, "120", None])
+def test_a_duration_that_is_not_a_positive_number_is_refused_by_name(name, value):
+    with pytest.raises(ValueError, match=name):
+        LaneConfig(
+            lane_id="lane-1",
+            site_id="site-1",
+            camera=CameraConfig(camera_id="c", rtsp_url="", frames_per_read=1),
+            gate=GateConfig(),
+            **{name: value},
+        )
+
+
+@pytest.mark.parametrize("name", DURATIONS)
+def test_the_control_a_positive_finite_duration_is_accepted(name):
+    """Otherwise the refusals above are a constructor that refuses everything."""
+    config = LaneConfig(
+        lane_id="lane-1",
+        site_id="site-1",
+        camera=CameraConfig(camera_id="c", rtsp_url="", frames_per_read=1),
+        gate=GateConfig(),
+        **{name: 7.5},
+    )
+    assert getattr(config, name) == 7.5
+
+
+def test_nan_and_inf_reach_the_validator_from_a_real_toml_file(tmp_path):
+    """The control on the control: TOML really does parse them.
+
+    Without this the tests above measure a Python constructor and say nothing
+    about what a site can write in `lane.toml`.
+    """
+    import tomllib
+
+    parsed = tomllib.loads("[lane]\na = nan\nb = inf\nc = -inf\n")["lane"]
+    assert math.isnan(parsed["a"]) and math.isinf(parsed["b"]) and math.isinf(parsed["c"])
+
+    path = edited(tmp_path, r"^completion_max_age_s\b", "completion_max_age_s = nan")
+    with pytest.raises(ValueError, match="completion_max_age_s"):
+        LaneConfig.from_file(path)
 
 
 # ---------------------------------------------------------------------------
