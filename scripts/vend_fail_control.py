@@ -56,6 +56,29 @@ measures THAT refusal rather than something beside it.
                                 measurement it did not make, on the record that
                                 prices the stay
 
+  no_flush_after_the_vend       the barrier opens and nothing reaches the
+                                platform until some later ordinary arrival --
+                                and a restart before that loses the record
+  decision_not_consumed         one arrival completed any number of times: two
+                                keys, two pulses, two tickets, two billable
+                                stays for one car
+  compare_digest_on_str         the credential comparison goes back to `str`, so
+                                an unauthenticated non-ASCII query string drops
+                                the connection with a traceback instead of a 401
+  key_recorded_on_the_event     the caller's raw idempotency key goes back onto
+                                `assisted_identity`, which is append-only at the
+                                platform: whatever is written there is permanent
+  no_settle_deadline            the settle waits on a hung loop driver for ever,
+                                so the lane refuses every completion `busy`
+  subset_widened_to_all_codes   refusal 2 refuses on every measured code again,
+                                so a lane whose engine is down refuses the
+                                driver that engine could not read
+  no_arming_dwell_measure       nothing measures the dwell, so a stuck arming
+                                loop tells `no_vehicle` there is a car there
+  finite_check_removed          `nan` and `inf` are legal durations again, and
+                                `completion_max_age_s = nan` makes
+                                `decision_stale` unreachable
+
 This also proves the suite RUNS. A guarantee that can quietly stop being
 collected is not a guarantee, and a suite that never ran would pass control A
 and then fail to fail under every break, which is what control B reports.
@@ -63,11 +86,20 @@ and then fail to fail under every break, which is what control B reports.
 
 from __future__ import annotations
 
-import os
-import subprocess
 import sys
 
-SUITE = ["-q", "tests/test_vend.py", "tests/test_lane_contract.py", "tests/test_loops.py"]
+from _control import intact, judge, run
+
+SUITE = [
+    "-q",
+    "tests/test_vend.py",
+    "tests/test_lane_contract.py",
+    "tests/test_loops.py",
+    # The per-site DURATIONS the act surface rests on are validated here, and
+    # `completion_max_age_s = nan` removes a refusal on the route that opens a
+    # barrier. A control for it belongs with the route's other controls.
+    "tests/test_config.py",
+]
 
 BREAKS = [
     ("suppress_no_vehicle", "the loop is not consulted at all"),
@@ -88,19 +120,15 @@ BREAKS = [
     ("vend_says_opened", "the answer claims the barrier opened"),
     ("ticket_shape_unchecked", "any string at all is a ticket"),
     ("plate_asserted_by_a_caller", "a caller may assert a plate"),
+    ("no_flush_after_the_vend", "the completed vend never reaches the platform"),
+    ("decision_not_consumed", "one arrival is completed any number of times"),
+    ("compare_digest_on_str", "a non-ASCII credential crashes the handler"),
+    ("key_recorded_on_the_event", "the caller's key is published on an append-only event"),
+    ("no_settle_deadline", "a hung loop driver leaves the lane busy for ever"),
+    ("subset_widened_to_all_codes", "every measured code refuses an assisted vend again"),
+    ("no_arming_dwell_measure", "a stuck arming loop vends"),
+    ("finite_check_removed", "nan and inf are legal durations again"),
 ]
-
-
-def run(env_extra: dict[str, str]) -> subprocess.CompletedProcess:
-    env = {**os.environ, **env_extra}
-    return subprocess.run(
-        [sys.executable, "-m", "pytest", *SUITE], env=env, capture_output=True, text=True
-    )
-
-
-def tail(result: subprocess.CompletedProcess, lines: int = 1) -> str:
-    body = [line for line in result.stdout.strip().splitlines() if line.strip()]
-    return " | ".join(body[-lines:]) if body else "(no output)"
 
 
 CLEAN = {"BREAK_VEND": ""}
@@ -108,33 +136,16 @@ CLEAN = {"BREAK_VEND": ""}
 failures = 0
 
 print("== control A: the vend suite must PASS intact ==")
-intact = run(CLEAN)
-if intact.returncode == 0:
-    print(f"  control A OK — {tail(intact)}")
-else:
-    print(
-        f"  CONTROL A FAILED — the suite does not pass even intact: {tail(intact)}", file=sys.stderr
-    )
-    print(intact.stdout, file=sys.stderr)
+collected, _ = intact(SUITE, CLEAN)
+if collected < 0:
     failures += 1
 
 print("\n== control B: each break must make it FAIL ==")
 for mode, description in BREAKS:
-    broken = run({"BREAK_VEND": mode})
-    if broken.returncode == 0:
-        print(
-            f"  {mode:29} *** PASSED WITH {description.upper()} —"
-            " the suite is not measuring this ***",
-            file=sys.stderr,
-        )
+    if not judge(mode, description, collected, run(SUITE, {"BREAK_VEND": mode})):
         failures += 1
-    else:
-        print(f"  {mode:29} fails as required when {description} — {tail(broken)}")
 
 if failures:
-    print(
-        f"\n{failures} control(s) failed. Do not trust the assisted-vend tests.",
-        file=sys.stderr,
-    )
+    print(f"\n{failures} control(s) failed. Do not trust the vend tests.", file=sys.stderr)
     sys.exit(1)
 print("\nall controls OK — the suite fails on every property the act surface rests on.")

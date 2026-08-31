@@ -97,11 +97,27 @@ jobs:
         # again, the read token given the act route, a credential in a URL
         # served, and the ticket reference put on the read contract and in a
         # log line. Each must turn the suite red.
+        #
+        # The cut round added eight more, one per blocker it closed: the flush
+        # removed so the completed vend never reaches the platform; the decision
+        # left unconsumed so one arrival vends any number of times; the
+        # credential comparison put back on `str` so a non-ASCII query string
+        # drops the connection; the caller's idempotency key put back on an
+        # append-only event; the settle deadline removed so a hung loop driver
+        # leaves the lane `busy` for ever; the malfunction subset widened so a
+        # lane whose engine is down refuses the driver it could not read; the
+        # arming dwell measure removed so a stuck loop vends; and the finite
+        # check removed so `completion_max_age_s = nan` is a legal setting.
+        #
+        # AND EVERY CONTROL SCRIPT NOW JUDGES ON THE PYTEST SUMMARY LINE rather
+        # than on the exit status. A break whose ANCHOR HAS MOVED makes the
+        # suite ERROR, which is also non-zero, and the old judgement reported
+        # that as "fails as required" with the break never applied. See
+        # scripts/_control.py.
         run: python scripts/vend_fail_control.py
 
       - name: Measured-codes fail-control
-        # Two malfunction codes moved from `not_measured` to `measured` this
-        # round, and a `measured` label is a claim that this build derives the
+        # Malfunction codes have moved from `not_measured` to `measured`, and a `measured` label is a claim that this build derives the
         # state from something it observes. `HealthEntry` cannot check that
         # direction -- it refuses a code claiming `ok` without the label, and
         # says nothing about a code with the label that derives a constant. Each

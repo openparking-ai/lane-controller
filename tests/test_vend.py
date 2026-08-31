@@ -16,6 +16,7 @@ is a line here, with a positive control beside it.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 
@@ -33,6 +34,7 @@ from lane_controller import (
 )
 from lane_controller.contract import (
     CONTRACT_VERSION,
+    VEND_BLOCKING,
     MalfunctionCode,
     TransitState,
     VendAuthority,
@@ -69,6 +71,8 @@ def a_lane(
     direction="entry",
     default_action="allow",
     events=None,
+    clock=None,
+    window=10.0,
     **config_kwargs,
 ):
     """The standard installation, wired to the simulated seams."""
@@ -83,7 +87,7 @@ def a_lane(
             arming_spacing_m=1.5,
             closing_loops=2,
             closing_spacing_m=1.5,
-            confirmation_window_seconds=10.0,
+            confirmation_window_seconds=window,
         ),
         **config_kwargs,
     )
@@ -100,6 +104,7 @@ def a_lane(
         closing_loops=ScriptedClosingLoops(crossings or []),
         cache=cache,
         events=events or EventQueue(),
+        **({"clock": clock} if clock is not None else {}),
     )
 
 
@@ -117,7 +122,7 @@ def a_lane_awaiting_a_completion(**kwargs):
     """
     controller = a_lane(
         identities=kwargs.pop("identities", UNREADABLE),
-        crossings=kwargs.pop("crossings", [(ClosingSequence.FORWARD, 1.0)]),
+        crossings=kwargs.pop("crossings", [(ClosingSequence.FORWARD, 0.0)]),
         **kwargs,
     )
     controller.run_once()
@@ -132,7 +137,7 @@ def body(controller, *, authority=VendAuthority.HUMAN_OPEN_NOW, ticket=TICKET, d
     }
 
 
-def complete(service, controller, *, key="key-1", **kwargs):
+def complete(service, controller, *, key="KEY-001", **kwargs):
     """Call the route the way `vend.py` does, without a socket in the way."""
     from lane_controller.vend import parse
 
@@ -152,7 +157,7 @@ def settled(service):
 # ---------------------------------------------------------------------------
 
 
-def _post(base, path, payload, *, token=None, key="key-1", headers=None):
+def _post(base, path, payload, *, token=None, key="KEY-001", headers=None):
     request = urllib.request.Request(
         f"{base}{path}", data=json.dumps(payload).encode(), method="POST",
         headers={"Content-Type": "application/json", **(headers or {})},
@@ -299,7 +304,7 @@ def test_the_loop_decides_whether_a_vehicle_is_there_not_the_caller():
 
     # THE CONTROL: the car is back on the loop and the same call is accepted.
     controller.loop._occupied = True
-    assert complete(service, controller, key="key-2")[0] == 202
+    assert complete(service, controller, key="KEY-002")[0] == 202
     settled(service)
     assert controller.vend.vend_count == 1
 
@@ -317,7 +322,7 @@ def test_a_body_that_asserts_presence_is_not_consulted():
     controller.loop.clear()
 
     asserted = {**body(controller), "presence": True, "vehicle_present": True}
-    status, refused = service.assisted.complete(parse(asserted, "key-1"))
+    status, refused = service.assisted.complete(parse(asserted, "KEY-001"))
     assert status == 409
     assert refused["code"] == VendRefusal.NO_VEHICLE.value
 
@@ -351,7 +356,91 @@ def test_the_presence_refusal_is_decides_own(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_an_active_malfunction_refuses_and_names_the_code():
+def a_lane_with_a_stuck_arming_loop(bound=60.0):
+    """A lane whose arming loop has read occupied for longer than any dwell.
+
+    The clock is this lane's own and is advanced by hand, so the dwell is exact
+    rather than slept for. `run_once` takes the first observation; the vend
+    route takes the second, through `derived_states()`.
+
+    The bound is 60 s here and not the published 600, because the clock the
+    dwell is measured on is the clock the DECISION is aged on: an advance past
+    600 would be refused `decision_stale` before it reached the malfunction and
+    the test would pass for the wrong reason. The published default is asserted
+    where a default belongs, in `tests/test_config.py`.
+    """
+    now = [1788000000.0]
+    controller = a_lane_awaiting_a_completion(
+        clock=lambda: now[0], arming_loop_max_occupied_s=bound
+    )
+    return controller, now
+
+
+def test_a_vend_blocking_malfunction_refuses_and_names_the_code():
+    """`arming_loop_stuck_occupied`, which is now MEASURED and now refuses.
+
+    It is the code that matters most of the five, because it defeats the
+    route's FIRST refusal rather than being caught by its second: a stuck loop
+    answers `no_vehicle`'s presence question YES, and `geometry_incomplete`
+    asks the second loop the same question. A lane with stuck arming loops
+    would accept every assisted vend with nothing in front of it.
+    """
+    controller, now = a_lane_with_a_stuck_arming_loop()
+    service = LaneService(controller)
+
+    # THE CONTROL, first: before the bound the same call is accepted, so what
+    # follows is the dwell and not a lane that refuses everything.
+    now[0] += 59.0
+    assert complete(service, controller)[0] == 202
+    settled(service)
+
+    controller, now = a_lane_with_a_stuck_arming_loop()
+    service = LaneService(controller)
+    now[0] += 61.0
+    assert (
+        service.derived_states()[MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED].value == "active"
+    ), "the fixture must actually produce an active malfunction"
+
+    status, refused = complete(service, controller)
+    assert status == 409
+    assert refused["code"] == VendRefusal.MALFUNCTION_ACTIVE.value
+    assert refused["malfunction"] == MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED.value
+    assert controller.vend.vend_count == 0
+
+
+def test_a_planted_boom_fault_refuses(monkeypatch):
+    """The other four `VEND_BLOCKING` codes, through a test double.
+
+    `boom_did_not_rise` has NO SOURCE in this build -- nothing produces it, so
+    it can never be `active` here -- and the refusal must still be the one it
+    would get. The double is the only honest way to reach it, and the fact that
+    it is needed is the finding: four of the five codes that refuse a vend
+    cannot fire today, and the contract says which.
+    """
+    from lane_controller.contract import HealthState
+
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    monkeypatch.setattr(
+        LaneService,
+        "derived_states",
+        lambda self: {MalfunctionCode.BOOM_DID_NOT_RISE: HealthState.ACTIVE},
+    )
+    status, refused = complete(service, controller)
+    assert status == 409
+    assert refused["malfunction"] == MalfunctionCode.BOOM_DID_NOT_RISE.value
+    assert controller.vend.vend_count == 0
+
+
+def test_a_measured_code_outside_the_subset_no_longer_refuses():
+    """The identification service being down is the case this module EXISTS for.
+
+    Every code this build measures is about the READING or the RECORD, and none
+    of them is about the barrier. Refusing the assisted vend because the engine
+    that failed to read the driver is down is the module refusing the case it
+    was built for -- and it was the measured behaviour at the tip: 20 of the 21
+    codes refused.
+    """
     controller = a_lane_awaiting_a_completion(
         identities=[
             VehicleIdentity(
@@ -363,16 +452,12 @@ def test_an_active_malfunction_refuses_and_names_the_code():
     assert (
         service.derived_states()[MalfunctionCode.IDENTITY_SERVICE_DOWN].value == "active"
     ), "the fixture must actually produce an active malfunction"
+    assert MalfunctionCode.IDENTITY_SERVICE_DOWN not in VEND_BLOCKING
 
-    status, refused = complete(service, controller)
-    assert status == 409
-    assert refused["code"] == VendRefusal.MALFUNCTION_ACTIVE.value
-    assert refused["malfunction"] == MalfunctionCode.IDENTITY_SERVICE_DOWN.value
-    assert controller.vend.vend_count == 0
-
-    # THE CONTROL: the same lane with nothing wrong accepts the same call.
-    healthy = a_lane_awaiting_a_completion()
-    assert complete(LaneService(healthy), healthy, key="key-2")[0] == 202
+    status, _ = complete(service, controller)
+    assert status == 202, "a driver the engine could not read is exactly who this route is for"
+    assert controller.vend.vend_count == 1
+    settled(service)
 
 
 def test_a_never_alarm_code_does_not_refuse(monkeypatch):
@@ -406,7 +491,7 @@ def test_one_arming_loop_occupied_refuses_geometry_incomplete():
 
     # THE CONTROL: both loops occupied and the same call is accepted.
     controller.arming_loop_b.set_occupied(True)
-    assert complete(service, controller, key="key-2")[0] == 202
+    assert complete(service, controller, key="KEY-002")[0] == 202
     settled(service)
 
 
@@ -424,7 +509,7 @@ def test_a_decision_older_than_the_sites_bound_is_stale():
 
     # THE CONTROL: one second inside the bound is accepted.
     controller._clock = lambda: real_now + 29.0
-    assert complete(service, controller, key="key-2")[0] == 202
+    assert complete(service, controller, key="KEY-002")[0] == 202
     settled(service)
 
 
@@ -446,7 +531,7 @@ def test_a_decision_at_that_is_not_this_lanes_last_is_refused():
     # is accepted whichever way the caller spells the same instant.
     published = service.state().to_dict()["decision"]["at"]
     reserialised = published.replace("+00:00", "Z")
-    assert complete(service, controller, decision_at=reserialised, key="key-2")[0] == 202
+    assert complete(service, controller, decision_at=reserialised, key="KEY-002")[0] == 202
     settled(service)
 
 
@@ -465,17 +550,16 @@ def test_a_lane_that_has_decided_nothing_has_nothing_to_complete():
             "identity": {"kind": "ticket", "ticket_ref": TICKET},
             "decision_at": "2026-08-30T14:03:11.482913+00:00",
         },
-        "key-1",
+        "KEY-001",
     )
-    # Ordered AFTER `decision_stale`, so an ancient `decision_at` is stale
-    # first. This one is aged against the lane's clock and is not.
-    controller._clock = lambda: 1788000000.0
+    # Ordered AFTER `decision_in_future` and `decision_stale`, so the clock is
+    # pinned a minute PAST the instant the request names: the age is positive
+    # and inside the bound, and what is left is that this lane never published
+    # it.
+    controller._clock = lambda: 1788098591.482913 + 60
     status, refused = service.assisted.complete(request)
     assert status == 409
-    assert refused["code"] in (
-        VendRefusal.DECISION_STALE.value,
-        VendRefusal.DECISION_MISMATCH.value,
-    )
+    assert refused["code"] == VendRefusal.DECISION_MISMATCH.value
     assert controller.vend.vend_count == 0
 
 
@@ -526,7 +610,7 @@ def test_human_open_now_on_a_deny_vends_and_records_the_override():
     # THE CONTROL: an ordinary completion of a FALLBACK records `null` there,
     # so the field distinguishes an override from every other vend.
     ordinary = a_lane_awaiting_a_completion()
-    complete(LaneService(ordinary), ordinary, key="key-2")
+    complete(LaneService(ordinary), ordinary, key="KEY-002")
     assert [
         event.detail["override_of"]
         for _, event in ordinary.events._history
@@ -535,7 +619,14 @@ def test_human_open_now_on_a_deny_vends_and_records_the_override():
 
 
 def test_a_vend_in_progress_refuses_the_next_one():
-    """`busy`, held from the acceptance until the transit settles."""
+    """`busy`, held from the acceptance until the transit settles.
+
+    IT TAKES A SECOND ARRIVAL TO REACH IT NOW, and that is the point of the
+    refusal above it: a second completion of the SAME decision is
+    `already_completed` whatever key it carries, so the only caller that gets
+    as far as `busy` is one completing a genuinely new case while the previous
+    car's transit is still settling. One lane, one vend at a time.
+    """
     controller = a_lane_awaiting_a_completion(
         crossings=[(ClosingSequence.NONE, 0.0), (ClosingSequence.NONE, 0.0)],
     )
@@ -549,13 +640,57 @@ def test_a_vend_in_progress_refuses_the_next_one():
         release.wait(timeout=5) or ClosingSequence.NONE
     )
 
-    assert complete(service, controller, key="key-1")[0] == 202
-    status, refused = complete(service, controller, key="key-2")
+    assert complete(service, controller, key="KEY-001")[0] == 202
+
+    # A SECOND CAR: a new arrival, a new decision, nothing completed yet.
+    controller.loop._remaining = 1
+    controller.run_once()
+    assert service.state().to_dict()["decision"]["completed"] is False
+
+    status, refused = complete(service, controller, key="KEY-002")
     assert status == 409
     assert refused["code"] == VendRefusal.BUSY.value
     assert controller.vend.vend_count == 1, "the second call moved nothing"
 
     release.set()
+    settled(service)
+
+
+def test_the_same_decision_cannot_be_completed_twice():
+    """ONE DECISION, ONE VEND -- and the key makes no difference.
+
+    "One key, one vend" was true and was not the guarantee a barrier needs. A
+    caller that regenerates its key on retry is the commonest idempotency bug
+    there is, and it minted a second ticket, a second billable stay and a
+    second occupant for one car: the car is on the loop the whole time so
+    `no_vehicle` never fires, the decision is seconds old so `decision_stale`
+    never fires, and the outcome is `fallback` so `not_completable` never
+    fires.
+    """
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+
+    assert complete(service, controller, key="KEY-001")[0] == 202
+    settled(service)
+
+    status, refused = complete(service, controller, key="A-DIFFERENT-KEY")
+    assert status == 409
+    assert refused["code"] == VendRefusal.ALREADY_COMPLETED.value
+    assert controller.vend.vend_count == 1, "one arrival, one relay pulse"
+    assert (
+        len([e for e in controller.events._sessions if e.kind == SESSION_OPEN]) == 1
+    ), "one arrival, one billable stay"
+
+    # THE READ SIDE: a consumer can see that the case has been completed
+    # without discovering it by trying to complete it.
+    assert service.state().to_dict()["decision"]["completed"] is True
+
+    # THE CONTROL, and it is the only way to a second vend: a second car.
+    controller.loop._remaining = 1
+    controller.run_once()
+    assert service.state().to_dict()["decision"]["completed"] is False
+    assert complete(service, controller, key="KEY-002")[0] == 202
+    assert controller.vend.vend_count == 2
     settled(service)
 
 
@@ -722,7 +857,7 @@ def test_the_ticket_is_in_no_log_line(caplog):
     controller.arming_loop_b.set_occupied(False)
     complete(service, controller)
     controller.arming_loop_b.set_occupied(True)
-    complete(service, controller, key="key-2")
+    complete(service, controller, key="KEY-002")
     settled(service)
 
     assert TICKET not in caplog.text
@@ -737,11 +872,11 @@ def test_a_malformed_ticket_is_refused_without_being_quoted_back():
     controller = a_lane_awaiting_a_completion()
     for bad in ("tkt-lower", "SHORT", "T" * 65, "TKT REF", None, 12345):
         with pytest.raises(BadVendRequest) as refused:
-            parse(body(controller, ticket=bad), "key-1")
+            parse(body(controller, ticket=bad), "KEY-001")
         assert str(bad) not in str(refused.value), "a refusal must not quote the secret back"
     # THE CONTROL: a well-formed one at both bounds parses.
     for good in ("A1-2B3", "T" * 64):
-        assert parse(body(controller, ticket=good), "key-1").ticket_ref == good
+        assert parse(body(controller, ticket=good), "KEY-001").ticket_ref == good
 
 
 # ---------------------------------------------------------------------------
@@ -753,7 +888,7 @@ def test_a_replay_returns_the_same_body_and_moves_nothing():
     controller = a_lane_awaiting_a_completion()
     service = LaneService(controller)
 
-    status, first = complete(service, controller, key="the-same-key")
+    status, first = complete(service, controller, key="THE-SAME-KEY")
     assert status == 202
     settled(service)
     cursor_after = controller.events.cursor
@@ -761,7 +896,7 @@ def test_a_replay_returns_the_same_body_and_moves_nothing():
     # The car has driven off by now, which is what makes this the real case: a
     # replay checked against the loop would be answered `no_vehicle`.
     controller.loop.clear()
-    status, again = complete(service, controller, key="the-same-key")
+    status, again = complete(service, controller, key="THE-SAME-KEY")
     assert status == 202
     assert again == first, "a replay must return the first answer, byte for byte"
     assert controller.vend.vend_count == 1, "one key, one vend"
@@ -769,7 +904,7 @@ def test_a_replay_returns_the_same_body_and_moves_nothing():
 
     # THE CONTROL: a DIFFERENT key is a new attempt and is judged afresh --
     # here it meets the loop, which is empty.
-    assert complete(service, controller, key="another-key")[1]["code"] == (
+    assert complete(service, controller, key="ANOTHER-KEY")[1]["code"] == (
         VendRefusal.NO_VEHICLE.value
     )
 
@@ -779,10 +914,10 @@ def test_a_refusal_is_not_held_against_the_key():
     controller = a_lane_awaiting_a_completion()
     service = LaneService(controller)
     controller.loop.clear()
-    assert complete(service, controller, key="k")[1]["code"] == VendRefusal.NO_VEHICLE.value
+    assert complete(service, controller, key="KEY-00K")[1]["code"] == VendRefusal.NO_VEHICLE.value
 
     controller.loop._occupied = True
-    status, _ = complete(service, controller, key="k")
+    status, _ = complete(service, controller, key="KEY-00K")
     assert status == 202, "the condition passed; the same key must be allowed to succeed"
     settled(service)
 
@@ -830,7 +965,7 @@ def test_a_malformed_completion_is_a_400_and_never_a_409(payload, why):
     from lane_controller.vend import BadVendRequest, parse
 
     with pytest.raises(BadVendRequest):
-        parse({"decision_at": "2026-08-30T14:03:11.482913+00:00", **payload}, "key-1")
+        parse({"decision_at": "2026-08-30T14:03:11.482913+00:00", **payload}, "KEY-001")
 
 
 def test_the_only_identity_kind_is_the_published_one():
@@ -849,8 +984,8 @@ def test_the_only_identity_kind_is_the_published_one():
     for kind in ("plate", "phone", "TICKET", ""):
         payload = {**body(controller), "identity": {"kind": kind, "ticket_ref": TICKET}}
         with pytest.raises(BadVendRequest, match="identity.kind"):
-            parse(payload, "key-1")
-    assert parse(body(controller), "key-1").ticket_ref == TICKET
+            parse(payload, "KEY-001")
+    assert parse(body(controller), "KEY-001").ticket_ref == TICKET
 
 
 def test_a_missing_idempotency_key_is_refused():
@@ -860,7 +995,7 @@ def test_a_missing_idempotency_key_is_refused():
     for absent in (None, "", "   "):
         with pytest.raises(BadVendRequest, match="Idempotency-Key"):
             parse(body(controller), absent)
-    assert parse(body(controller), "k").idempotency_key == "k"
+    assert parse(body(controller), "KEY-00K").idempotency_key == "KEY-00K"
 
 
 def test_a_naive_decision_at_is_refused():
@@ -868,7 +1003,7 @@ def test_a_naive_decision_at_is_refused():
 
     controller = a_lane_awaiting_a_completion()
     with pytest.raises(BadVendRequest, match="UTC offset"):
-        parse(body(controller, decision_at="2026-08-30T14:03:11.482913"), "key-1")
+        parse(body(controller, decision_at="2026-08-30T14:03:11.482913"), "KEY-001")
 
 
 def test_an_identifier_may_not_supply_a_ticket(caplog):
@@ -947,3 +1082,398 @@ def test_a_session_action_carrying_both_identities_never_leaves_this_lane():
                 entry_at="2026-08-30T14:03:11+00:00",
                 entry_confirmation="confirmed",
             )
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE — the completed vend REACHES THE PLATFORM, and what a kill leaves
+#
+# The order (identity before relay) only buys anything if the record then
+# leaves the box. `EventQueue.record` appends to two in-memory deques and
+# nothing else; `flush()` is the only thing that calls the transport, and this
+# path had none -- so a barrier opened and the platform held nothing until some
+# later ordinary arrival flushed, which at a lane using the intercom may never
+# come. There is no state store behind the queue, so a restart before that lost
+# it entirely.
+# ---------------------------------------------------------------------------
+
+
+def a_lane_with_a_platform(**kwargs):
+    """The standard lane, wired to a real transport over a FakePlatform."""
+    from fake_platform import FakePlatform
+    from lane_controller.sync import PlatformTransport
+
+    platform = FakePlatform()
+    controller = a_lane_awaiting_a_completion(
+        events=EventQueue(PlatformTransport(platform)), **kwargs
+    )
+    return controller, platform
+
+
+def test_the_completed_vend_reaches_the_platform_with_no_further_arrival():
+    controller, platform = a_lane_with_a_platform()
+    service = LaneService(controller)
+
+    # THE CONTROL, and it is the arrival this lane has already had: the
+    # ordinary path flushes, so the platform has everything and the outbox is
+    # empty BEFORE the completion. A sweep that could not see a delivery would
+    # report the assisted path clean by being blind.
+    assert controller.events.pending == 0, "the ordinary arrival delivered everything"
+    before = len(platform.events)
+    assert before > 0
+
+    status, _ = complete(service, controller)
+    assert status == 202
+
+    # ALREADY DELIVERED WHEN THE ROUTE ANSWERS: `complete_vend` flushes before
+    # it returns, so the identity, the relay's record and the pending entry are
+    # on the platform without waiting for the settle.
+    kinds = {event["kind"] for event in platform.events.values()}
+    assert {"assisted_identity", "vended", "entry_pending"} <= kinds
+
+    settled(service)
+    assert len(platform.opened) == 1, "the stay that bills the customer is on the platform"
+    assert controller.events.pending == 0, "nothing is left undelivered"
+    kinds = {event["kind"] for event in platform.events.values()}
+    assert {"assisted_identity", "vended", "entry_pending", "entry_confirmed"} <= kinds
+
+
+def test_what_a_kill_at_each_point_leaves_and_the_contract_says_which():
+    """The three points question B names, each asserted rather than reasoned.
+
+    A "kill" here is the process ending with whatever is in memory lost, which
+    is exactly what the queue's own deques mean: no state store, so nothing
+    survives except what the transport already took.
+    """
+    from fake_platform import FakePlatform
+    from lane_controller.sync import PlatformTransport
+
+    # 1. AFTER THE IDENTITY IS WRITTEN, BEFORE THE RELAY IS PULSED.
+    #    Nothing on the platform, and the barrier did not move. Consistent.
+    controller, platform = a_lane_with_a_platform()
+    service = LaneService(controller)
+    delivered = len(platform.events)
+    controller.vend.vend = lambda reason: (_ for _ in ()).throw(KeyboardInterrupt("killed"))
+    with pytest.raises(KeyboardInterrupt):
+        complete(service, controller)
+    assert len(platform.events) == delivered, "nothing was delivered"
+    assert controller.vend.vend_count == 0, "and the barrier did not move"
+
+    # 2. AFTER THE RELAY IS PULSED, BEFORE THE FLUSH.
+    #    Nothing on the platform, and the barrier DID move. This is the window
+    #    that cannot be closed without making the barrier wait on the network,
+    #    and `docs/CONTRACT.md` states it rather than implying it is not there.
+    platform = FakePlatform()
+    controller = a_lane_awaiting_a_completion(events=EventQueue(PlatformTransport(platform)))
+    service = LaneService(controller)
+    delivered = len(platform.events)
+    original = controller.events.flush
+    controller.events.flush = lambda: (_ for _ in ()).throw(KeyboardInterrupt("killed"))
+    with pytest.raises(KeyboardInterrupt):
+        complete(service, controller)
+    assert controller.vend.vend_count == 1, "the barrier moved"
+    assert len(platform.events) == delivered, "and the platform holds nothing about it"
+    controller.events.flush = original
+
+    # 3. AFTER THE FLUSH, BEFORE THE TRANSIT SETTLES.
+    #    The identity, the relay's record and the pending entry are DELIVERED;
+    #    the session is not, because it does not exist yet.
+    controller, platform = a_lane_with_a_platform()
+    service = LaneService(controller)
+    status, _ = complete(service, controller)
+    assert status == 202
+    kinds = {event["kind"] for event in platform.events.values()}
+    assert {"assisted_identity", "vended", "entry_pending"} <= kinds
+    settled(service)
+    assert len(platform.opened) == 1
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE — the Idempotency-Key is an opaque bounded token, published nowhere
+# ---------------------------------------------------------------------------
+
+
+def test_the_idempotency_key_is_on_no_event_and_no_read_route():
+    """The key used to be recorded verbatim on `assisted_identity`.
+
+    That event reaches `GET /v1/lane/events` and the platform's `events` table,
+    which is append-only by grant there -- so whatever a caller put in the key
+    could never be removed by anybody. The natural key for "one ticket, one
+    vend" is the ticket.
+    """
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    key = "SECRETTICKET-42"
+    assert complete(service, controller, key=key)[0] == 202
+    settled(service)
+
+    assisted = [e for _, e in controller.events._history if e.kind == "assisted_identity"]
+    assert len(assisted) == 1
+    assert "idempotency_key" not in assisted[0].detail
+    assert key not in json.dumps(assisted[0].detail)
+    assert assisted[0].detail["completion_id"], "the completion has its own opaque identifier"
+    assert key not in assisted[0].detail["completion_id"]
+    assert TICKET not in assisted[0].detail["completion_id"]
+
+    for route in ("/v1/lane", "/v1/lane/state", "/v1/lane/health", "/v1/lane/events"):
+        payload = {
+            "/v1/lane": service.describe,
+            "/v1/lane/state": service.state,
+            "/v1/lane/health": service.health,
+            "/v1/lane/events": lambda: service.events(0),
+        }[route]().to_dict()
+        assert key not in json.dumps(payload), f"{route} carries the key"
+
+    # THE CONTROL: the sweep can see a value it IS given. The ticket travels on
+    # the session action, and the sweep finds it there.
+    assert any(
+        TICKET in json.dumps(event.detail) for event in controller.events._sessions
+    ), "the sweep cannot see a value at all"
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["", "   ", None, "short", "A" * 65, "lower-case-key", "key with spaces", "A" * 10_000],
+)
+def test_an_idempotency_key_outside_the_shape_is_refused(key):
+    from lane_controller.vend import BadVendRequest, parse
+
+    controller = a_lane_awaiting_a_completion()
+    with pytest.raises(BadVendRequest, match="Idempotency-Key"):
+        parse(body(controller), key)
+
+
+def test_the_control_a_key_inside_the_shape_is_accepted():
+    """Otherwise the refusals above are a rule that refuses everything."""
+    from lane_controller.vend import parse
+
+    controller = a_lane_awaiting_a_completion()
+    for key in ("ABC123", "A" * 64, "TKT-4RS9WQ2M"):
+        assert parse(body(controller), key).idempotency_key == key
+
+
+def test_the_idempotency_store_is_bounded_by_bytes_as_well_as_by_count():
+    from lane_controller.vend import MAX_HELD_BYTES, MAX_HELD_KEYS
+
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    store = service.assisted
+    for n in range(MAX_HELD_KEYS + 20):
+        store._hold(f"KEY-{n:06d}", {"contract_version": CONTRACT_VERSION, "n": n})
+    assert len(store._answers) <= MAX_HELD_KEYS
+    assert store._bytes() <= MAX_HELD_BYTES
+
+    # THE CONTROL: the BYTES bound is a real bound and not a count in disguise.
+    store._answers.clear()
+    store._hold("A" * 64, {"padding": "P" * (MAX_HELD_BYTES + 1)})
+    assert len(store._answers) < MAX_HELD_KEYS
+    assert store._bytes() <= MAX_HELD_BYTES
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE — `busy` has a bound, and the code that names it is MEASURED
+# ---------------------------------------------------------------------------
+
+
+def test_a_loop_driver_that_never_returns_does_not_leave_the_lane_busy():
+    """`_in_progress` cleared in a `finally`, which never runs if the call never
+    returns. The lane refused every assisted vend `busy` until a restart, and
+    `transit` read `pending` for ever -- which is also what a legitimate
+    in-window transit reads, so no surface said which of the two it was.
+    """
+    import threading
+
+    controller = a_lane_awaiting_a_completion(
+        crossings=[(ClosingSequence.NONE, 0.0)], window=0.1, settle_grace_s=0.05
+    )
+    service = LaneService(controller)
+
+    hung = threading.Event()
+    controller.closing_loops.wait_for_sequence = lambda window: (
+        hung.wait(timeout=30) or ClosingSequence.NONE
+    )
+
+    assert complete(service, controller, key="KEY-001")[0] == 202
+    settled(service)  # the settle thread returns at the deadline, not the driver
+
+    assert service.assisted._in_progress is False, "the lane is not busy for ever"
+    state = service.state().to_dict()
+    assert state["transit"]["state"] == TransitState.UNCONFIRMABLE.value
+    unconfirmable = [
+        event
+        for _, event in controller.events._history
+        if event.kind == "entry_unconfirmable"
+    ]
+    assert unconfirmable[-1].detail["reason"] == "loop_driver_timeout"
+    assert unconfirmable[-1].detail["settle_deadline_s"] == pytest.approx(0.15)
+    assert not controller.events._sessions, "a driver that never answered bills nobody"
+
+    # THE CODE IT MEASURES, and it is measured from exactly this.
+    assert (
+        service.derived_states()[MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING].value == "active"
+    )
+
+    # THE LANE ACCEPTS AGAIN: a second car, a second decision, a second vend.
+    controller.loop._remaining = 1
+    controller.closing_loops.wait_for_sequence = lambda window: ClosingSequence.FORWARD
+    controller.run_once()
+    assert complete(service, controller, key="KEY-002")[0] == 202
+    settled(service)
+    hung.set()
+
+
+def test_the_control_a_driver_that_returns_inside_the_bound_settles_normally():
+    """Otherwise the test above measures a lane that times out on everything."""
+    controller = a_lane_awaiting_a_completion(settle_grace_s=5.0)
+    service = LaneService(controller)
+    assert complete(service, controller)[0] == 202
+    settled(service)
+
+    assert service.state().to_dict()["transit"]["state"] == TransitState.CONFIRMED.value
+    assert (
+        service.derived_states()[MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING].value == "unknown"
+    ), "nothing here observes the loops working, so it is never `ok`"
+    assert len(controller.events._sessions) == 1
+
+
+def test_a_late_driver_finds_the_outcome_already_published():
+    """One transit, one outcome. A driver that returns after the deadline would
+    otherwise record a SECOND: a confirmed billable session for a crossing this
+    lane had already published as unconfirmable."""
+    import threading
+
+    released = threading.Event()
+    controller = a_lane_awaiting_a_completion(
+        crossings=[(ClosingSequence.FORWARD, 0.0)], window=0.1, settle_grace_s=0.05
+    )
+    service = LaneService(controller)
+    controller.closing_loops.wait_for_sequence = lambda window: (
+        released.wait(timeout=30) or ClosingSequence.FORWARD
+    )
+
+    assert complete(service, controller)[0] == 202
+    settled(service)
+    assert service.state().to_dict()["transit"]["state"] == TransitState.UNCONFIRMABLE.value
+
+    released.set()
+    for _ in range(200):
+        if not any(e.kind == "entry_confirmed" for _, e in controller.events._history):
+            time.sleep(0.005)
+    assert not any(e.kind == "entry_confirmed" for _, e in controller.events._history)
+    assert not controller.events._sessions, "the late crossing opened no stay"
+    assert service.state().to_dict()["transit"]["state"] == TransitState.UNCONFIRMABLE.value
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE — a decision AHEAD of this lane's clock is refused
+# ---------------------------------------------------------------------------
+
+
+def test_a_decision_ahead_of_this_lanes_clock_is_refused():
+    """`age > max_age` has no lower bound of its own. A lane whose clock stepped
+    backwards would accept a decision of any age at all -- the older it got, the
+    more negative the age became."""
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    stamped = controller.now()
+
+    controller._clock = lambda: stamped - 3600  # the clock steps an hour back
+    status, refused = complete(service, controller)
+    assert status == 409
+    assert refused["code"] == VendRefusal.DECISION_IN_FUTURE.value
+    assert controller.vend.vend_count == 0
+
+    # THE CONTROL: the same call with the clock where it was is accepted.
+    controller._clock = lambda: stamped
+    assert complete(service, controller, key="KEY-002")[0] == 202
+    settled(service)
+
+
+# ---------------------------------------------------------------------------
+# GUARANTEE — a non-ASCII credential is a NAMED refusal, never a crash
+#
+# `hmac.compare_digest` on `str` raises `TypeError: comparing strings with
+# non-ASCII characters is not supported`. `parse_qs` percent-decodes, and
+# `http.server` decodes header bytes as latin-1, so both comparisons could be
+# handed one -- and the query check is the FIRST thing `do_GET` and `do_POST`
+# do, before authorisation and before the route table. The request was answered
+# with an unhandled traceback and a dropped connection, unauthenticated, on
+# every route, on the one service in this project that can open a barrier.
+#
+# AND ONLY IN THE EXPOSED DEPLOYMENT: `configured` is empty on a loopback lane
+# with no tokens, so `any()` over nothing never reached the comparison. The
+# reverse of the direction a reviewer would guess, and the reason the suite did
+# not see it -- every test that exercised a query string used ASCII.
+# ---------------------------------------------------------------------------
+
+
+def _raw(base, method, path, *, headers=None):
+    """A request `urllib` will not mangle, and one that reports a DROPPED
+    connection as such rather than as an exception a caller could mistake for a
+    refusal."""
+    import http.client
+    from urllib.parse import urlparse as _urlparse
+
+    parts = _urlparse(base)
+    connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=5)
+    try:
+        connection.request(method, path, headers=headers or {})
+        response = connection.getresponse()
+        return response.status
+    except http.client.RemoteDisconnected:
+        return None
+    finally:
+        connection.close()
+
+
+ROUTES = ("/v1/lane", "/v1/lane/state", "/v1/lane/health", "/v1/lane/events", "/v1/lane/vend")
+
+
+@pytest.mark.parametrize("route", ROUTES)
+@pytest.mark.parametrize("value", ["%C3%A9", "%E2%82%AC", "%F0%9F%9A%97"])
+def test_a_non_ascii_query_value_is_a_401_and_not_a_dropped_connection(route, value):
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    method = "POST" if route.endswith("/vend") else "GET"
+    with serving(make_server(service, port=0, token=READ_TOKEN, act_token=ACT_TOKEN)) as base:
+        assert _raw(base, method, f"{route}?x={value}") == 401
+        # THE CONTROL: the identical request with an ASCII query value is
+        # answered too, so the probe can see this route reply at all.
+        assert _raw(base, method, f"{route}?x=abc") == 401
+        assert controller.vend.vend_count == 0
+
+
+def test_a_non_ascii_authorization_header_is_a_401_and_not_a_dropped_connection():
+    """The OTHER `compare_digest` call site, found by sweeping for the shape.
+
+    `http.server` decodes header bytes as latin-1, so a byte above 0x7F in an
+    `Authorization` header reaches `_authorise` as a non-ASCII `str`. The
+    positive control is the query-string case above, which is the one the L3
+    measured.
+    """
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    with serving(make_server(service, port=0, token=READ_TOKEN, act_token=ACT_TOKEN)) as base:
+        assert _raw(base, "GET", "/v1/lane", headers={"Authorization": "Bearer \xe9\xff"}) == 401
+        assert _raw(base, "POST", "/v1/lane/vend", headers={"Authorization": "Bearer \xe9"}) == 401
+        # THE CONTROL: an ASCII credential on the same connection shape is
+        # served, so the two 401s are the comparison and not a dead server.
+        allowed = {"Authorization": f"Bearer {READ_TOKEN}"}
+        assert _raw(base, "GET", "/v1/lane", headers=allowed) == 200
+        assert controller.vend.vend_count == 0
+
+
+def test_the_service_survives_a_non_ascii_request_and_still_serves():
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    with serving(make_server(service, port=0, token=READ_TOKEN, act_token=ACT_TOKEN)) as base:
+        assert _raw(base, "GET", "/v1/lane?x=%C3%A9") == 401
+        assert _get(base, "/v1/lane", token=READ_TOKEN)[0] == 200
+
+
+def test_a_credential_in_a_non_ascii_query_is_still_caught_by_value():
+    """The byte comparison did not lose the property it replaced."""
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    with serving(make_server(service, port=0, token=READ_TOKEN, act_token=ACT_TOKEN)) as base:
+        assert _raw(base, "GET", f"/v1/lane?zz={ACT_TOKEN}") == 401
+        assert _raw(base, "GET", f"/v1/lane?zz={READ_TOKEN}") == 401

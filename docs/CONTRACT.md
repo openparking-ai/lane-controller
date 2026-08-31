@@ -47,7 +47,13 @@ serves it, and it is derived rather than declared.
 `false` for every lane there has ever been. A consumer written against version 1
 read that field to mean *nothing here opens a barrier*; it no longer does. A
 value a consumer branches on changing meaning is exactly what this number is
-for. Nothing on the four read routes changed shape.
+for.
+
+On the read routes, `GET /v1/lane/state` gained one field — `decision.completed`
+— and nothing else changed shape. **It is required of a lane that serves the act
+route and optional for one that does not**: a lane with no act surface has no
+completions and nothing to report, so a consumer must not require it of every
+lane, and must not read its absence as `false`.
 
 - **Additive changes do not bump it.** New fields may appear. Ignore fields you
   do not recognise rather than rejecting the payload.
@@ -131,7 +137,8 @@ its wiring, its route table — and none is a flag somebody set.
     "cause": "unreachable",
     "presence": true,
     "at": "2026-08-30T14:03:11.482913+00:00",
-    "read_ref": null
+    "read_ref": null,
+    "completed": false
   },
   "transit": {
     "state": "pending",
@@ -139,6 +146,15 @@ its wiring, its route table — and none is a flag somebody set.
   }
 }
 ```
+
+**`decision.completed` says whether this case is still open.** A decision is
+one case and one case is one vend: once `POST /v1/lane/vend` has completed it,
+this reads `true` and any further completion naming it is refused
+`already_completed`, whatever `Idempotency-Key` it carries. It is here because
+without it the decision, its outcome and its `at` are byte-identical before and
+after a vend, so a second consumer could not see that the first one had acted.
+It returns to `false` on the next arrival, because a new decision is a new case
+— and a new arrival is the only route to a second vend.
 
 **`decision` is `null` until this lane has decided something.** It lives in
 memory for as long as the process does; this package has no state store and
@@ -263,11 +279,11 @@ would hide which of those an operator is waiting for.
 
 Where the `not_measured` signals live today, so nobody has to go looking:
 
-- `arming_loops_disagree` and `closing_loops_never_firing` — the lane already
-  writes an event per vehicle (`arming_incomplete`, `entry_held` / `exit_held`).
-  What does not exist is the aggregation that turns a RUN of them into a fault,
-  and nothing has measured how many in a row a run is. A threshold invented here
-  would be a number nobody measured, applied at every site;
+- `arming_loops_disagree` — the lane already writes an event per vehicle
+  (`arming_incomplete`). What does not exist is the aggregation that turns a RUN
+  of them into a fault, and nothing has measured how many in a row a run is. A
+  threshold invented here would be a number nobody measured, applied at every
+  site;
 - `camera_feed_lost`, `lens_obstructed_or_dark` and `reference_not_recognised` —
   the identification engine's own `GET /v1/health`, under `camera_faults`. That
   field is a **count since that service started**, not a current state, and a
@@ -325,6 +341,46 @@ it publishes with it. **A hung identification service costs this one field, not
 this payload.** On timeout the entry is `unknown`: nobody measured, never `ok`
 and never `active`. A consumer of this route sets its own timeout comfortably
 above this one.
+
+`arming_loop_stuck_occupied` reads THIS LANE'S OWN ARMING LOOP, and the
+measurement is exactly this: the lane samples the loop on every poll of its
+sequence — arrival or not — and on every call to this route, and holds the
+instant of the first observation in the current unbroken run of occupied
+readings. The code is `active` when that run is older than
+`[lane] arming_loop_max_occupied_s`, which defaults to **600 seconds**.
+
+That number is a **setting and an assumption, and nothing has measured a
+dwell**: no site exists, no arrival has been timed, and 600 seconds is not a
+measurement of how long a real vehicle waits at a real barrier. It is drawn
+against what the code means — a car that has been on the arming loop for ten
+minutes is a breakdown, a van somebody parked, or a loop reading occupied with
+nothing on it. All three want a human, and the third is the one that matters
+here: **a stuck arming loop defeats this route's first refusal rather than being
+caught by its second.** `no_vehicle` asks the loop whether a car is there and a
+stuck loop says yes; `geometry_incomplete` asks the second loop the same
+question. Without this measure a lane with stuck arming loops would accept every
+assisted vend with nothing in front of it.
+
+The state is `active` or `unknown` and **never `ok`**: what is observed is one
+way for a loop to be wrong, and a loop that reads clear at this instant has not
+been found healthy. The claim is about this lane's own observations and not
+about the gaps between them — it samples when it polls and when it is asked, and
+it says so rather than claiming continuity it did not watch.
+
+`closing_loops_never_firing` is derived from **one named occurrence**, and the
+name suggests something else, so this says which: an assisted vend whose
+`resolve_transit` had not returned by the confirmation window plus
+`[lane] settle_grace_s`. That is a loop driver that did not return AT ALL — not
+a run of crossings that were missed, which is the aggregation nobody has
+measured and which is still not built. The transit is published `unconfirmable`
+with reason `loop_driver_timeout` and no session is opened.
+
+It is **latched** and it is never `ok`. A driver that stops answering is a fault
+somebody goes and fixes, so it does not clear the next time a transit happens to
+settle; it clears when the lane restarts, by which point a person has been
+there. And it is never `ok` because nothing here observes the loops WORKING: an
+ordinary arrival's crossing wait is not bounded by this deadline, so silence is
+not evidence of health.
 
 `outbox_depth_growing` reads the outbox's PENDING DEPTH — every undelivered
 event, log entries and session actions alike — against a per-site threshold,
@@ -434,8 +490,8 @@ refusal cannot exist on one path and not the other.
 **This lane writes the completed identity BEFORE the relay moves**, in this
 order and no other:
 
-1. `assisted_identity` — who authorised it, which **kind** of identity it is,
-   the caller's idempotency key, the decision it completes, and whether it
+1. `assisted_identity` — who authorised it, which **kind** of identity it is, a
+   `completion_id` this lane mints, the decision it completes, and whether it
    overrode a `deny`
 2. the relay, with the **authority** as its reason
 3. `vended`
@@ -472,7 +528,7 @@ Content-Type: application/json
 | `identity.kind` | a member of `vend_identity_kinds`. **`ticket` is the only one in this version, and a plate is deliberately not on it**: a plate is what the camera reads, and a caller that could assert one would be handing this lane a measurement it did not make. |
 | `identity.ticket_ref` | the completed identity. Opaque here; see above. |
 | `decision_at` | the `at` of the decision being completed, **exactly as `GET /v1/lane/state` published it**. The instants are compared, not the strings, so a caller that parsed and re-serialised it names the same moment. |
-| `Idempotency-Key` | **required**, and there is no generated fallback. A key this lane invented would be unique per request, which is the same as having none: the caller's retry would vend a second time. |
+| `Idempotency-Key` | **required**, and there is no generated fallback. A key this lane invented would be unique per request, which is the same as having none: the caller's retry would vend a second time. **It has the ticket's shape** — 6 to 64 characters of `A-Z`, `0-9` and hyphen, `400` otherwise — because it is an opaque token to this lane and an unbounded one is a caller choosing how much memory this process uses. A lowercase UUID is not in the alphabet; upper-case it. |
 
 Anything malformed is a **`400`**, and it is never a `409`. The difference
 matters to a caller: a `409` says this lane refused a well-formed completion for
@@ -512,9 +568,22 @@ attempt: the car that was on the loop when the first call vended has driven off
 by the time a retry arrives, and a replay checked against the loop would tell a
 caller its own successful vend failed.
 
+**THE KEY IS PUBLISHED NOWHERE.** It is held in this process's idempotency store
+for the run and reaches no event, no read route, no log line and no session
+action. `assisted_identity` carries a `completion_id` this lane mints instead —
+opaque, random, and unrelated to the key and to the ticket. The reason is the
+sentence this contract already makes about `GET /v1/lane/events`: *no plate text
+goes in it, on any route of this contract*, which cannot be true of a field the
+caller writes. That event reaches the platform's `events` table, which is
+append-only by grant there, so anything a caller put in the key could never be
+removed by anybody — and the natural key for "one ticket, one vend" is the
+ticket.
+
 **Only accepted vends are held**, for the run, and the last **256** keys — the
 same depth as the read window, so a consumer holds one idea of how far back this
-lane remembers anything. A refusal is not an answer to replay: every one of them
+lane remembers anything — and at most **64 kB** of keys and answers. Both bounds
+are real: the count is the one a consumer reasons about and the bytes are the one
+the machine does. A refusal is not an answer to replay: every one of them
 is about the world at the moment of the call, and freezing one against a key
 would refuse a caller for ever on a condition that has already passed.
 
@@ -527,21 +596,23 @@ order. The full set is published under **The closed sets** as `vend_refusals`.
 ```json
 {
   "contract_version": 2,
-  "error": "this lane has an active malfunction: identity_service_down",
+  "error": "this lane has an active malfunction: arming_loop_stuck_occupied",
   "code": "malfunction_active",
-  "malfunction": "identity_service_down"
+  "malfunction": "arming_loop_stuck_occupied"
 }
 ```
 
 | order | code | when |
 |---|---|---|
 | 1 | `no_vehicle` | the arming loop reads unoccupied **now**. Not the caller's word for it, and not what was true when the decision was made |
-| 2 | `malfunction_active` | any malfunction this build **measures** is `active` and is not `never_alarm`. The code is named in `malfunction` |
+| 2 | `malfunction_active` | a code in `vend_blocking` is `active`. The code is named in `malfunction` |
 | 3 | `geometry_incomplete` | a two-loop lane with one loop occupied — the same check that stops the lane arming |
-| 4 | `decision_stale` | `decision_at` is older than `[lane] completion_max_age_s` |
-| 5 | `decision_mismatch` | `decision_at` is not the moment of this lane's last decision — **or this lane has decided nothing**, which is the same fact to a caller |
-| 6 | `not_completable` | the last decision's outcome is `allow` or `deny`; see below |
-| 7 | `busy` | a vend is in progress on this lane |
+| 4 | `decision_in_future` | `decision_at` is **ahead of this lane's clock** |
+| 5 | `decision_stale` | `decision_at` is older than `[lane] completion_max_age_s` |
+| 6 | `decision_mismatch` | `decision_at` is not the moment of this lane's last decision — **or this lane has decided nothing**, which is the same fact to a caller |
+| 7 | `already_completed` | that decision **has already been completed**, whatever key this call carries |
+| 8 | `not_completable` | the last decision's outcome is `allow` or `deny`; see below |
+| 9 | `busy` | a vend is in progress on this lane |
 
 `malfunction` is present on **every** refusal, `null` on all but
 `malfunction_active`. A field carried by one refusal and absent from six cannot
@@ -555,6 +626,26 @@ conversation takes. What it is drawn against is what a completion *means*: an
 answer to a driver who is at the barrier now. A completion accepted against a
 ten-minute-old decision opens a barrier for whoever happens to be there.
 
+**ONE CLOCK AGES A COMPLETION, and it is this lane's.** `decision_at` is stamped
+by this lane and must be the instant it published, so the caller's clock never
+enters the subtraction — a caller whose clock is an hour out completes exactly
+the same decisions this lane would have accepted from a caller whose clock is
+right. The bound below it exists for the other direction: a lane whose OWN clock
+steps backwards would otherwise widen the window by however far it stepped,
+because `age > max_age` has no lower bound of its own. A negative age is never a
+fresher decision, so it is `decision_in_future`.
+
+**`already_completed`, and it is the guarantee the barrier needs.** A decision is
+one case and one case is one vend. The idempotency store below gives you *one
+key, one vend*, which is true and is not the same statement: a caller that
+regenerates its key on retry — the commonest idempotency bug there is — would
+otherwise mint a second ticket, a second billable stay and a second occupant for
+one car, and every other refusal would pass it, because the car is still on the
+loop, the decision is seconds old and the outcome is still `fallback`. **The
+only way to a second vend is a second decision, which is a second arrival.**
+`GET /v1/lane/state` publishes `decision.completed` so a consumer can see the
+case is closed without discovering it by trying to complete it.
+
 **`not_completable`, and the one case that is not.** `allow` has already
 vended — there is nothing left to complete. `deny` is a **rule**, and a human
 overturning a rule is a deliberate, single, named act: `human_open_now` on a
@@ -564,14 +655,28 @@ a rule, `human_open_and_flag` included: a completion the human is unsure about
 and a human overturning a refusal are different acts, and one of them is not
 made safer by being uncertain.
 
-**A consequence, stated rather than left to be discovered.** Refusal 2 uses this
-lane's own health surface, and `outbox_depth_growing`, `clock_skew_rejected` and
-`session_actions_dead_lettered` are among the codes it measures. **A lane whose
-platform has been unreachable long enough to grow its outbox past the site's
-threshold will refuse this route** — the barrier still works for an ordinary
-arrival, but the assisted vend is refused and names the code. That is the
-conservative direction and it is deliberate; a site that wants the other
-behaviour is asking for a decision nobody has made.
+**Refusal 2 refuses on a PUBLISHED SUBSET, `vend_blocking`, and not on the whole
+table.** The five members are listed in full under **The closed sets**: they are
+the codes about the physical act of opening safely — the boom, the relay that
+drives it, and the arming loops that say something is in front of it.
+
+**Every other code, including every one this build measures, no longer refuses a
+completion, and the reason is one sentence: they concern the reading and the
+record, not the barrier.** Whether the engine answered, whether the outbox is
+draining, whether the clock agrees — none of those is a reason to refuse the
+driver whose reading failed, which is exactly who this route exists for. The
+earlier behaviour refused on any measured code, so a lane whose platform had
+been unreachable long enough to grow its outbox refused every intercom
+completion at the site.
+
+**Two things about the subset, said plainly rather than left to be discovered.**
+Of the five, only `arming_loop_stuck_occupied` can be `active` in this build —
+it is measured, and how is under `GET /v1/lane/health` above. The other four are
+`no_source`: nothing in this system produces them, so refusal 2 fires today on
+one code and not on five, and it will fire on the rest when something is built
+that can answer them. And `arming_loop_stuck_occupied` is the one that matters
+most: it is the only member that defends the route's FIRST refusal, because a
+stuck loop tells `no_vehicle` there is a car there.
 
 ### The two tokens
 
@@ -614,6 +719,22 @@ lands in a column that platform's retention purge redacts.
 reach `GET /v1/lane/events` and the platform's `events` table — which is
 append-only by grant there, so a reference written into a detail would be the one
 identity nothing could ever remove.
+
+**A `ticket_ref` is an OPAQUE IDENTIFIER, and it is not a secret.** It
+identifies one stay for as long as that stay is open, and the platform publishes
+it in full to any holder of an operator token — the same posture a plate already
+had there. It is personal data and it is handled as such; what it is not is a
+credential, and nothing anywhere may treat holding one as authority to do
+anything. **The secret is the signed token the agent will mint, which never
+leaves the agent and never reaches this lane.** Both repositories describe the
+value in these terms.
+
+**`assisted_identity` is readable by the READ token, deliberately.** A monitor
+polling `GET /v1/lane/events` learns which authority opened a barrier and when,
+and that is what a monitor is for: a barrier that opened on a human's say-so
+with nothing watching is the thing this event exists to prevent. It carries no
+ticket, no plate and no key, so what is exposed is the fact and the authority
+and nothing that identifies the driver.
 
 ## The closed sets, in full
 
@@ -674,6 +795,13 @@ does adding one to the enum without adding it here.
   "never_alarm": [
     "reference_not_recognised"
   ],
+  "vend_blocking": [
+    "boom_did_not_rise",
+    "boom_did_not_close",
+    "vend_relay_fault",
+    "arming_loop_stuck_occupied",
+    "arming_loops_disagree"
+  ],
   "vend_authorities": [
     "display_code_confirmed",
     "human_open_now",
@@ -683,8 +811,10 @@ does adding one to the enum without adding it here.
     "no_vehicle",
     "malfunction_active",
     "geometry_incomplete",
+    "decision_in_future",
     "decision_stale",
     "decision_mismatch",
+    "already_completed",
     "not_completable",
     "busy"
   ],
@@ -705,6 +835,10 @@ does adding one to the enum without adding it here.
 - **`vend_authorities`** — every member of `contract.VendAuthority`, the closed
   set `POST /v1/lane/vend` takes in `authorised_by`. Every one names a decision
   a person or a confirmed display code made.
+- **`vend_blocking`** — the subset of `malfunction_codes` that refuses a
+  completion, and the whole of it. Every other code, including every one this
+  build measures, does not: they concern the reading and the record, not the
+  barrier. Four of the five are `no_source` today.
 - **`vend_refusals`** — every member of `contract.VendRefusal`, in the order the
   route applies them. Each arrives as a `409` carrying its name in `code`.
 - **`vend_identity_kinds`** — the identity kinds that route accepts. **One**,
@@ -746,12 +880,29 @@ There is no flag that turns any of that off.
 
 - **No resolve route.** What becomes of a HELD entry is decided by nothing on
   this contract. `POST /v1/lane/vend` is the whole act surface.
-- **No state store**, and the vend does not add one. `decision`, `transit` and
-  the idempotency keys are lost on a restart and the contract says so, rather
-  than reporting the last thing it happened to remember. A key from before a
-  restart is not recognised, and a replay carrying one is a NEW attempt subject
-  to every refusal — which at a barrier the car has already left is
-  `no_vehicle`.
+- **No state store**, and the vend does not add one. `decision`, `transit`,
+  `decision.completed` and the idempotency keys are lost on a restart and the
+  contract says so, rather than reporting the last thing it happened to
+  remember. A key from before a restart is not recognised, and a replay carrying
+  one is a NEW attempt subject to every refusal — which at a barrier the car has
+  already left is `no_vehicle`.
+- **No durability across a kill in the middle of a vend.** The completion path
+  ends by flushing the outbox, exactly as an ordinary arrival does, so a
+  completed vend reaches the platform without waiting for the next car — and the
+  window that is left is stated rather than implied. **A kill between the
+  identity being written and the relay being pulsed loses the record and the
+  barrier did not move**, which is consistent. **A kill between the relay being
+  pulsed and the flush loses the record and the barrier DID move**, and nothing
+  can close that window without making the barrier wait on the network. The
+  ordinary arrival path has the same window for the same reason, and this
+  contract does not pretend otherwise.
+- **No way to kill a hung loop driver.** The settle waits at most the
+  confirmation window plus `[lane] settle_grace_s`; past that the transit is
+  `unconfirmable` with reason `loop_driver_timeout` and the lane accepts vends
+  again. The thread waiting on the driver is ABANDONED, not killed — Python
+  cannot kill one — so a driver that eventually returns finds the outcome
+  already published and records nothing. What that costs is one leaked thread
+  per occurrence, which is a fault somebody is being paged about.
 - **No measurement of the boom.** `vend_commanded` is what this lane can stand
   behind; whether the barrier rose is `no_source` and stays that way.
 - **No verification of a ticket.** Shape only. No signature, no expiry, no

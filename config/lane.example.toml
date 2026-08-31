@@ -62,6 +62,39 @@ identity_health_timeout_s = 1.0
 # intercom queue is long raises it in one place.
 completion_max_age_s = 120.0
 
+# How long PAST the confirmation window an assisted vend waits for the closing
+# loop driver to return before it stops waiting. Past it the transit is
+# `unconfirmable` with reason `loop_driver_timeout`, no session is opened, the
+# lane accepts completions again, and `closing_loops_never_firing` reads
+# `active` on the health surface.
+#
+# WITHOUT A BOUND, a loop driver that never returns leaves this lane refusing
+# every assisted vend `busy` until it is restarted, with `transit` reading
+# `pending` for ever -- which is also what a legitimate in-window transit reads,
+# so nothing on any surface says which of the two it is.
+#
+# A PER-SITE SETTING AND AN ASSUMPTION -- nothing here measures how late a loop
+# board answers. It is short because a driver that has not answered by now is a
+# fault rather than a slow answer: a LATE crossing is already handled, and the
+# window rule that exists for it decides that case.
+settle_grace_s = 5.0
+
+# How long an arming loop may read occupied, across this lane's own
+# observations, before `arming_loop_stuck_occupied` reads `active` -- which
+# refuses `POST /v1/lane/vend`, because a stuck loop tells the route's first
+# refusal that there is a car in front of the barrier.
+#
+# A PER-SITE SETTING AND AN ASSUMPTION, and this one is worth reading twice:
+# NOTHING HAS MEASURED A DWELL. No site exists, no arrival has been timed, and
+# 600 seconds is not a measurement of how long a real vehicle waits at a real
+# barrier. It is drawn against what the code MEANS -- a car that has been on the
+# loop for ten minutes is a breakdown, a van somebody parked, or a loop reading
+# occupied with nothing on it. All three want a human.
+#
+# A site with a genuinely slow entry raises it, here, and the record says which
+# value was in force.
+arming_loop_max_occupied_s = 600.0
+
 # THE ACT TOKEN IS NOT CONFIGURED HERE. It is a FILE, named on the command line:
 #
 #     lane-controller serve --config lane.toml \

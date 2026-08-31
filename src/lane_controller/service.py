@@ -190,6 +190,29 @@ def assert_bind_allowed(
         )
 
 
+
+def _same(presented: str, configured: str) -> bool:
+    """Constant-time comparison of two credentials, ON BYTES.
+
+    `hmac.compare_digest` on `str` RAISES `TypeError: comparing strings with
+    non-ASCII characters is not supported`, and both of this handler's callers
+    can be handed a non-ASCII string by an unauthenticated request:
+    `parse_qs` percent-decodes a query value, and `http.server` decodes header
+    bytes as latin-1. The query check is the FIRST thing `do_GET` and `do_POST`
+    do -- before authorisation, before the route table -- so
+    `GET /v1/lane?x=%C3%A9` with no credential at all closed the connection with
+    an unhandled traceback and no response, on the one service in this project
+    that can open a barrier. It existed only in the EXPOSED deployment, because
+    `configured` is empty on a loopback lane with no tokens and `any()` over
+    nothing never reaches the comparison.
+
+    Bytes have no such rule. Encoding cannot fail -- `str` is always encodable
+    as UTF-8 -- so this returns True or False and never raises, and a caller
+    that presents rubbish gets the named 401 the contract publishes rather than
+    a dropped connection.
+    """
+    return hmac.compare_digest(presented.encode("utf-8"), configured.encode("utf-8"))
+
 def bearer(header: str | None) -> str | None:
     """The token out of an Authorization header, or None if there is not one."""
     if not header:
@@ -340,6 +363,11 @@ class LaneService:
                 presence=decision.identity.presence,
                 cause=controller.last_cause,
                 read_ref=controller.last_read_ref,
+                # WHETHER THIS CASE IS STILL OPEN. Without it the decision, its
+                # outcome and its `at` are byte-identical before and after a
+                # vend, so a second consumer could not see that the first one
+                # had acted.
+                completed=controller.last_decision_completed_at is not None,
             )
         return LaneState(
             decision=last,
@@ -393,7 +421,63 @@ class LaneService:
             MalfunctionCode.OUTBOX_DEPTH_GROWING: self._outbox_depth_growing(),
             MalfunctionCode.SESSION_ACTIONS_DEAD_LETTERED: self._dead_lettered(),
             MalfunctionCode.CLOCK_SKEW_REJECTED: self._clock_skew_rejected(),
+            MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED: self._arming_loop_stuck(),
+            MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING: self._closing_loops_never_firing(),
         }
+
+    def _arming_loop_stuck(self) -> HealthState:
+        """An arming loop that has read occupied for longer than any dwell.
+
+        MEASURED, and this is the whole of the measurement: this lane samples
+        its own arming loop -- on every poll of `run_once`, arrival or not, and
+        on every call to this method -- and holds the instant of the FIRST
+        observation in the current unbroken run of occupied readings. `active`
+        when that run is older than `[lane] arming_loop_max_occupied_s`.
+
+        THE STATE IS NEVER `ok`, and that is not an oversight. `ok` at a lane
+        means somebody measured and found nothing; what this observes is one
+        way for a loop to be wrong, and a loop that is clear right now has not
+        been found healthy -- it may have been stuck a minute ago, or be about
+        to be. So the answers are `active` and `unknown`, and the third is not
+        available to it.
+
+        WHY IT MATTERS MORE THAN THE OTHER FOUR IN `VEND_BLOCKING`. A stuck loop
+        defeats the vend's FIRST refusal rather than being caught by its second:
+        `no_vehicle` asks the loop whether a car is there and a stuck loop says
+        yes, and `geometry_incomplete` asks the second loop the same question.
+        A lane with stuck arming loops would accept every assisted vend with
+        nothing in front of it -- the metal-plate fraud arriving through the new
+        route with the loops themselves as the accomplice. Adding the code to a
+        refusing subset changes nothing until something measures it; this is
+        that something.
+        """
+        dwell = self.controller.observe_arming_loop()
+        if dwell is None:
+            return HealthState.UNKNOWN
+        if dwell > self.controller.config.arming_loop_max_occupied_s:
+            return HealthState.ACTIVE
+        return HealthState.UNKNOWN
+
+    def _closing_loops_never_firing(self) -> HealthState:
+        """A closing-loop driver that did not return inside the settle deadline.
+
+        MEASURED, and from EXACTLY ONE EVENT: an assisted vend whose
+        `resolve_transit` had not returned by the confirmation window plus
+        `[lane] settle_grace_s`. The code's name suggests an aggregation nobody
+        had built -- how many crossings a lane failed to see over some period,
+        against a threshold nobody had chosen -- and this is not that. It is one
+        named occurrence, and the contract says so rather than letting the name
+        imply the other thing.
+
+        LATCHED, and never `ok`. A driver that stops answering is a fault a
+        person goes and fixes, so it does not clear itself the next time a
+        transit happens to settle: it clears when the lane is restarted, by
+        which point somebody has been there. And it is never `ok`, because
+        nothing here observes the loops WORKING -- an ordinary arrival's
+        crossing wait is not bounded by this deadline, so silence is not
+        evidence of health.
+        """
+        return HealthState.ACTIVE if self.controller.loop_driver_timed_out else HealthState.UNKNOWN
 
     def _identity_service_down(self) -> HealthState:
         """From the last decision's cause. `unknown` until a vehicle arrives.
@@ -837,18 +921,24 @@ class _Handler(BaseHTTPRequestHandler):
                 # asked for is a confusing failure and not a safer one -- and
                 # off loopback the bind already requires both.
                 return None
-            # THE ASYMMETRY, and it is deliberate. A lane with no ACT token has
-            # authorised nothing to vend. Serving the barrier to anything that
-            # can reach loopback because the act file was never written is
-            # exactly the silent failure this contract refuses, and it is a
-            # different size of mistake from an open read.
+            # THE ASYMMETRY, and it is deliberate. It holds ONCE A READ TOKEN
+            # EXISTS: a lane that has been given one credential and not the
+            # other has authorised nothing to vend, and serving the barrier to
+            # anything that can reach loopback because the act file was never
+            # written is a different size of mistake from an open read.
+            #
+            # It does NOT say that a lane with no act token never vends. A lane
+            # with NEITHER credential configured is the loopback default and the
+            # branch above returns `None` for it -- "Loopback takes neither,
+            # exactly as the reads do", which is what `docs/CONTRACT.md` says
+            # and what this comment used to overstate.
             return lambda: self._forbidden(f"this lane has no credential configured for {what}")
         presented = bearer(self.headers.get("Authorization"))
         if presented is None:
             return self._unauthorised
-        if hmac.compare_digest(presented, required):
+        if _same(presented, required):
             return None
-        if other is not None and hmac.compare_digest(presented, other):
+        if other is not None and _same(presented, other):
             return lambda: self._forbidden(f"that credential does not authorise {what}")
         return self._unauthorised
 
@@ -867,7 +957,7 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         configured = [token for token in (self.token, self.act_token) if token]
         return any(
-            hmac.compare_digest(value, token)
+            _same(value, token)
             for values in params.values()
             for value in values
             for token in configured

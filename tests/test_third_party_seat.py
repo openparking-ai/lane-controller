@@ -144,6 +144,27 @@ def test_a_consumer_asks_whether_a_lane_will_act_and_gets_the_truth(lane_url):
         )
 
 
+def test_only_a_lane_that_can_vend_reports_whether_a_decision_is_completed(lane_url):
+    """`decision.completed` is required of a lane that SERVES the act route.
+
+    A lane with no act surface has no completions, so there is nothing for it
+    to report and it may omit the field -- which the stub does, and which is
+    what proves the field is not something a third party has to invent.
+    A consumer that required it of every lane would refuse a perfectly good
+    read-only lane; one that assumed its absence meant `false` would read "not
+    completed" out of a lane that cannot complete anything.
+    """
+    consumer = LaneConsumer(lane_url)
+    can_vend = consumer.lane()["capabilities"]["can_vend"]
+    decision = consumer.state()["decision"]
+    if decision is None:
+        return
+    if can_vend:
+        assert isinstance(decision["completed"], bool)
+    else:
+        assert "completed" not in decision
+
+
 def test_a_cursor_ahead_of_either_lane_says_reset(lane_url):
     """One cursor policy, both lanes."""
     consumer = LaneConsumer(lane_url)

@@ -47,6 +47,7 @@ from lane_controller.contract import (
     REQUIRED_CAUSES,
     REQUIRED_REASONS,
     SOURCES,
+    VEND_BLOCKING,
     VEND_IDENTITY_KINDS,
     HealthEntry,
     HealthState,
@@ -1632,9 +1633,18 @@ def test_the_codes_this_round_did_not_close_are_still_unmeasured_and_say_why():
         camera that failed at 3am and was fixed at 4am reports the same number
         for ever. Deriving `active` from it would need a rate over a window, and
         nobody has measured what rate is a fault.
-      * `arming_loops_disagree` and `closing_loops_never_firing` -- the lane
-        writes an event per vehicle already; the fault is a RUN of them, and
-        nobody has measured how many in a row a run is.
+      * `arming_loops_disagree` -- the lane writes an event per vehicle
+        already; the fault is a RUN of them, and nobody has measured how many
+        in a row a run is.
+
+    `closing_loops_never_firing` WAS on this list for that reason and has been
+    taken off it, which is the act this test exists to force somebody to
+    perform. It is not closed by the aggregation nobody had measured: it is
+    closed by ONE NAMED OCCURRENCE -- an assisted vend whose settle exceeded
+    the confirmation window plus `[lane] settle_grace_s`, which is a loop
+    driver that did not return at all rather than a run of crossings that were
+    missed. The name suggested the other thing, so the document says which it
+    is. See `LaneService._closing_loops_never_firing`.
 
     If one of these is closed, this test is what tells you to come and say so.
     """
@@ -1642,7 +1652,6 @@ def test_the_codes_this_round_did_not_close_are_still_unmeasured_and_say_why():
         MalfunctionCode.CAMERA_FEED_LOST,
         MalfunctionCode.LENS_OBSTRUCTED_OR_DARK,
         MalfunctionCode.ARMING_LOOPS_DISAGREE,
-        MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING,
     }
     for code in still_open:
         assert SOURCES[code] is Source.NOT_MEASURED, (
@@ -1676,6 +1685,11 @@ PUBLISHED_SETS = {
     "outcomes": lambda: list(OUTCOMES),
     "transit_states": lambda: [state.value for state in TransitState],
     "never_alarm": lambda: [code.value for code in NEVER_ALARM],
+    # The subset refusal 2 refuses on, derived BOTH WAYS: every member is a
+    # `MalfunctionCode` and every one of them is in the document. A code that
+    # blocked a vend and was not published would be a barrier refusing for a
+    # reason an integrator cannot look up.
+    "vend_blocking": lambda: [code.value for code in VEND_BLOCKING],
     "vend_authorities": lambda: [authority.value for authority in VendAuthority],
     # In the ORDER the route applies them, which is the order the enum declares
     # them in and the order the document's table walks. A refusal ladder whose

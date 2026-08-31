@@ -61,6 +61,7 @@ from .sync import (
     HELD,
     REASON_ARMING_INCOMPLETE,
     REASON_FORWARD,
+    REASON_LOOP_DRIVER_TIMEOUT,
     REASON_NO_CLOSING_LOOPS,
     REASON_REVERSE,
     REASON_WINDOW_ELAPSED,
@@ -184,6 +185,12 @@ class LaneController:
         # honestly rather than reporting the last thing it happens to remember.
         self.last_decision: Decision | None = None
         self.last_decision_at: str | None = None
+        #: WHEN the last decision was COMPLETED by `POST /v1/lane/vend`, or
+        #: `None` while it has not been. A decision is one case and one case is
+        #: one vend: this is what `already_completed` refuses against, what
+        #: `GET /v1/lane/state` publishes as `decision.completed`, and it is
+        #: cleared by the next arrival because a new decision is a new case.
+        self.last_decision_completed_at: str | None = None
         self.last_read_ref: str | None = None
         self.last_cause: str | None = None
         self.transit_state: str = TransitState.NONE.value
@@ -195,6 +202,14 @@ class LaneController:
         #: reference travels on the session action to the platform, where the
         #: retention purge can reach it.
         self.last_assisted: dict | None = None
+        #: WHEN this lane first observed the arming loop occupied, across the
+        #: run of observations that is still unbroken -- `None` whenever an
+        #: observation read it clear. `arming_loop_stuck_occupied` is derived
+        #: from it; see `observe_arming_loop`.
+        self._arming_occupied_since: float | None = None
+        #: Whether an assisted vend's settle has ever exceeded this lane's own
+        #: deadline. `closing_loops_never_firing` is derived from it.
+        self._loop_driver_timed_out = False
 
     def now(self) -> float:
         """This lane's clock, which is the authority for WHEN.
@@ -259,6 +274,11 @@ class LaneController:
         # answer depending on whether the platform happened to be reachable.
         self.last_decision = decision
         self.last_decision_at = to_iso(self._clock())
+        # A NEW CASE, so nothing has completed it. This is the only way back to
+        # a completable decision, and it is the whole of "one decision, one
+        # vend": the second vend a caller can legitimately get is the one that
+        # belongs to the second car.
+        self.last_decision_completed_at = None
         self.last_read_ref = identity.read_ref
         self.last_cause = identity.unavailable.value if identity.unavailable else None
 
@@ -372,7 +392,27 @@ class LaneController:
         self.events.record("vended", lane, reason=authorised_by)
 
         at = to_iso(self._clock())
+        # THE DECISION IS CONSUMED HERE, beside the relay pulse it authorised
+        # rather than in the route that asked for it, so nothing can vend
+        # without consuming and nothing can consume without vending.
+        self.last_decision_completed_at = at
         self.begin_transit(identity, at)
+
+        # AND THE RECORD LEAVES THE BOX, exactly as `handle_arrival` ends.
+        # `EventQueue.record` appends to two in-memory deques and nothing else;
+        # `flush()` is the only thing that calls the transport, and this path
+        # had none. A barrier opened and the platform held nothing -- not the
+        # session that bills the stay, and not the `assisted_identity` that is
+        # the only record of who authorised the barrier moving -- until some
+        # later ordinary arrival flushed, which at a lane using the intercom may
+        # never come. There is no state store behind the queue, so a restart
+        # before that lost the record entirely.
+        #
+        # Best effort and after the barrier has already been told what to do,
+        # for the same reason as `handle_arrival`: nothing above this line waits
+        # on the network. WHAT A KILL AT EACH POINT LEAVES is asserted in
+        # `tests/test_vend.py` and stated in `docs/CONTRACT.md`.
+        self.events.flush()
         return at
 
     # ------------------------------------------------------------------
@@ -471,11 +511,26 @@ class LaneController:
         )
         self._transit(TransitState.PENDING, at)
 
-    def resolve_transit(self, identity, at: str) -> None:
-        """What the loops after the barrier made of the pending entry."""
+    def resolve_transit(self, identity, at: str, *, claim=None) -> None:
+        """What the loops after the barrier made of the pending entry.
+
+        `claim` is how the assisted vend bounds a loop driver that does not
+        return: the settle waits for this call under its own deadline and, when
+        the deadline wins, records the outcome itself. Exactly one of the two
+        may publish, so a driver that returns an hour late finds the claim taken
+        and records nothing -- otherwise one transit would get two outcomes, and
+        the second of them would be a confirmed billable session for a crossing
+        this lane had already published as unconfirmable.
+
+        `None` is the ordinary arrival's path, which has one settler and needs
+        no claim.
+        """
         lane = self.config.lane_id
         names = _ENTRY if self.config.direction == "entry" else _EXIT
         geometry = self.config.loops.as_published()
+
+        def mine() -> bool:
+            return claim is None or claim.take()
 
         if self.closing_loops is None:
             # No closing loops at this site, so nothing here can confirm or
@@ -483,6 +538,8 @@ class LaneController:
             # the previous generation of this weakness was true from the day it
             # was written, published in pieces across three documents, and
             # never once stated in a single place a reader would reach.
+            if not mine():
+                return
             self.events.record(
                 names.unconfirmable,
                 lane,
@@ -506,6 +563,16 @@ class LaneController:
         started = self._clock()
         crossing = self.closing_loops.wait_for_sequence(window)
         elapsed = self._clock() - started
+
+        # THE DRIVER RETURNED. Whether this call is still the one that may say
+        # what happened is a different question -- see `claim` above.
+        if not mine():
+            log.warning(
+                "lane %s: the closing-loop driver returned after this lane's settle deadline; "
+                "the transit was already resolved and this crossing is not recorded",
+                lane,
+            )
+            return
 
         if self._confirms(crossing) and self._within_window(elapsed, window):
             self.events.record(
@@ -555,6 +622,70 @@ class LaneController:
             # `exit_held` event above beside it: a flag for a human, not a hole
             # in the ledger.
             self._record_session(identity, at, confirmation=HELD)
+
+    def transit_timed_out(self, identity, at: str, deadline: float) -> None:
+        """The loop driver did not return inside this lane's own deadline.
+
+        A FOURTH ANSWER, and it is deliberately not one of the other three. It
+        is not `confirmed` -- nothing crossed as far as this lane knows. It is
+        not `backed_out` -- that is an observation, and this is the absence of
+        one. It is not `held` either: `held` means the window elapsed with the
+        loops answering, which is a car that did not go through, and this is the
+        loops not answering at all. The lane cannot tell those apart, and
+        `unconfirmable` is the honest name for a transit nothing could confirm
+        or refute -- the same word a lane with no closing loops uses, for the
+        same reason, with its own reason code beside it saying which.
+
+        NO SESSION IS OPENED. A lane with no closing loops opens one because it
+        never had a way to confirm and its records say so on every vehicle; this
+        lane DECLARED loops and did not hear from them, so billing a stay off
+        that would be the phantom occupant with a fault report attached.
+        """
+        lane = self.config.lane_id
+        names = _ENTRY if self.config.direction == "entry" else _EXIT
+        log.error(
+            "lane %s: the closing-loop driver did not return inside %.1fs "
+            "(window + settle_grace_s); the transit is unconfirmable",
+            lane,
+            deadline,
+        )
+        # MEASURED FROM EXACTLY THIS, and from nothing else. See
+        # `LaneService._closing_loops_never_firing`.
+        self._loop_driver_timed_out = True
+        self.events.record(
+            names.unconfirmable,
+            lane,
+            reason=REASON_LOOP_DRIVER_TIMEOUT,
+            at=at,
+            geometry_assumed=self.config.loops.as_published(),
+            settle_deadline_s=deadline,
+        )
+        self._transit(TransitState.UNCONFIRMABLE, at)
+        self.events.flush()
+
+    @property
+    def loop_driver_timed_out(self) -> bool:
+        """Whether an assisted settle has ever exceeded this lane's deadline."""
+        return self._loop_driver_timed_out
+
+    def observe_arming_loop(self) -> float | None:
+        """Sample the arming loop, and return how long it has read occupied.
+
+        `None` when this observation reads it clear, which is also what RESETS
+        the run: the value is the age of the first observation in an UNBROKEN
+        run of occupied readings, and nothing else. That is the measurement, and
+        it is what `docs/CONTRACT.md` says rather than "continuously occupied" --
+        this lane samples when it is asked and when it polls, and it cannot
+        claim anything about the gaps between.
+        """
+        if not self.loop.is_occupied():
+            self._arming_occupied_since = None
+            return None
+        now = self._clock()
+        if self._arming_occupied_since is None:
+            self._arming_occupied_since = now
+            return 0.0
+        return now - self._arming_occupied_since
 
     def _identity_detail(self, identity, *, with_region: bool) -> dict:
         """The identity fields a SESSION ACTION carries, and only those.
@@ -626,7 +757,13 @@ class LaneController:
         log rather than as silence.
         """
         if not self.loop.wait_for_vehicle(timeout=timeout):
+            # SAMPLED ON EVERY POLL, arrival or not. A loop that is reading
+            # occupied with nothing on it never produces an arrival, so the
+            # timeout branch is the one an actually-stuck loop takes for ever --
+            # and it is the branch where the observation matters most.
+            self.observe_arming_loop()
             return None
+        self.observe_arming_loop()
 
         lane = self.config.lane_id
         geometry = self.config.loops.as_published()
