@@ -50,6 +50,34 @@ outbox_depth_threshold = 1000
 # `active`.
 identity_health_timeout_s = 1.0
 
+# How old the decision named by `POST /v1/lane/vend` may be before the
+# completion is refused `decision_stale`. A completion is an answer to a driver
+# who is at the barrier NOW; one accepted against a ten-minute-old decision
+# opens the barrier for whoever happens to be there.
+#
+# A PER-SITE SETTING AND AN ASSUMPTION -- nothing in this package measures how
+# long an intercom conversation takes, and 120 is not a measurement of one. It
+# is the same number the gate agent uses for the case it speaks, and it is a
+# setting on both sides rather than a constant on either, so a site whose
+# intercom queue is long raises it in one place.
+completion_max_age_s = 120.0
+
+# THE ACT TOKEN IS NOT CONFIGURED HERE. It is a FILE, named on the command line:
+#
+#     lane-controller serve --config lane.toml \
+#       --host 0.0.0.0 \
+#       --auth-token-file /etc/lane/read.token \
+#       --act-token-file  /etc/lane/act.token
+#
+# DECLARED, never defaulted, and never a value in this file: a credential in a
+# configuration file is a credential in every backup and every copy of it, and
+# a value on a command line is readable by every user on the box.
+#
+# Off loopback the service refuses to start without BOTH, and they must be two
+# different values. The read token buys the four GET routes; the act token buys
+# `POST /v1/lane/vend`, which pulses the vend relay. Each is 403 on the other's
+# routes, and either in a query string is 401.
+
 [camera]
 id               = "cam-1"
 # RTSP and PoE are required for any camera on this platform.

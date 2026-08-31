@@ -15,21 +15,39 @@ contract is wrong.
 
 ---
 
-## This version is READ ONLY
+## Four reads and ONE act
 
-Four routes, all `GET`. There is **no vend route and no resolve route**: nothing
-here opens a barrier, closes a session, or changes anything at all. Every other
-method is answered `405` with `Allow: GET`.
+Four `GET` routes that change nothing, and one `POST` that opens a barrier:
 
-That is not an omission to be filled in quietly. The act surface is a later
-round, deliberately after the display and the agent, because it is the first
-thing that can open a barrier — and a new route to a vend is the boundary every
-outside reviewer of this project has named. `capabilities.can_vend` exists so a
-consumer can **ask**, and it is `false` here.
+| | |
+|---|---|
+| `GET /v1/lane` | who this lane is, and what it can do |
+| `GET /v1/lane/state` | the last decision, and the current transit |
+| `GET /v1/lane/health` | every malfunction code, with its source |
+| `GET /v1/lane/events?since=N` | the event cursor |
+| `POST /v1/lane/vend` | **the assisted vend** — the only route here that changes anything |
+
+Every other method, and a `POST` to any other path, is answered `405` with
+`Allow: GET, POST`.
+
+**The act surface arrives deliberately late**, after the display and the agent,
+because it is the first thing that can open a barrier — and a new route to a
+vend is the boundary every outside reviewer of this project has named. What
+makes it safe is stated with the route below and is not a promise in prose:
+**this lane applies its own refusals, and it writes the completed identity
+before it pulses the relay.** `capabilities.can_vend` says whether a given lane
+serves it, and it is derived rather than declared.
 
 ## Compatibility
 
-`contract_version` is `1`, and every payload carries it.
+`contract_version` is `2`, and every payload carries it.
+
+**What version 2 changed, in one line:** `POST /v1/lane/vend` exists, and
+`capabilities.can_vend` answers `true` at an entry lane where version 1 answered
+`false` for every lane there has ever been. A consumer written against version 1
+read that field to mean *nothing here opens a barrier*; it no longer does. A
+value a consumer branches on changing meaning is exactly what this number is
+for. Nothing on the four read routes changed shape.
 
 - **Additive changes do not bump it.** New fields may appear. Ignore fields you
   do not recognise rather than rejecting the payload.
@@ -52,7 +70,7 @@ states, in the same words, so one consumer can hold one policy for both.
   "lane_id": "lane-1",
   "site_id": "site-1",
   "direction": "entry",
-  "contract_version": 1,
+  "contract_version": 2,
   "geometry": {
     "arming_loops": 2,
     "arming_spacing_m": 1.5,
@@ -66,7 +84,7 @@ states, in the same words, so one consumer can hold one policy for both.
     "has_identity_service": true,
     "has_platform": true,
     "has_display": false,
-    "can_vend": false
+    "can_vend": true
   }
 }
 ```
@@ -98,14 +116,14 @@ its wiring, its route table — and none is a flag somebody set.
 | `has_identity_service` | This lane is wired to an identification service. `false` means identity comes from somewhere else, or from nowhere. |
 | `has_platform` | This lane reports to a platform. **`false` is standalone, which is a supported mode and not a degraded one.** |
 | `has_display` | A display this lane can put a per-arrival code on. `false` until a display seam exists; derived from the wiring, so the day one is wired this follows it. |
-| `can_vend` | Whether this lane exposes a route that opens a barrier. `false` for the whole of this contract version, derived from the service's own act-route table — so a vend route cannot be added without this answer changing with it. |
+| `can_vend` | Whether this lane serves a route that opens a barrier. Derived from the service's own act-route table **and this lane's direction** — so a vend route cannot be added without this answer changing with it, and an **exit** lane answers `false` and serves no such route rather than announcing a capability every call to which it would refuse. Completing an identity at an exit would close a stay and freeze a fee, which is the exit process and is not this round. |
 
 ## `GET /v1/lane/state` — the last decision, and the current transit
 
 <!--payload:state-->
 ```json
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "decision": {
     "outcome": "fallback",
     "reason": "engine_unreachable",
@@ -188,7 +206,7 @@ of an entry.
 <!--payload:health-->
 ```json
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "codes": [
     {
       "code": "reference_not_recognised",
@@ -332,7 +350,7 @@ so a monitor built on this surface must not page a human on it.
 <!--payload:events-->
 ```json
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "cursor": 7,
   "reset": false,
   "dropped": 0,
@@ -393,6 +411,210 @@ its own clock gets an answer that is wrong by whatever the two machines'
 timezones differ by, with nothing anywhere saying so. A value test walks a served
 events page and refuses a timestamp with no offset.
 
+## `POST /v1/lane/vend` — the assisted vend
+
+The one route on this contract that changes anything. It completes a decision
+this lane already made and could not finish on its own: a driver whose plate was
+not read, at a barrier that did not open, with a human or a confirmed display
+code saying to let them in.
+
+**It is not a request to open a barrier. It is a completion of a case this lane
+is already holding**, and the difference is the whole design: the caller names
+the decision it is completing, and this lane checks that the decision is its
+own, is recent, and is one there is anything to complete.
+
+### What makes it safe, and it is not a promise in prose
+
+**This lane applies its own refusals.** Presence is read off the arming loop at
+the moment of the call, not taken from the body. The malfunction table is this
+lane's own. The arming geometry is the same check `run_once` makes before it
+arms. All of them come from the code an ordinary arrival goes through, so a
+refusal cannot exist on one path and not the other.
+
+**This lane writes the completed identity BEFORE the relay moves**, in this
+order and no other:
+
+1. `assisted_identity` — who authorised it, which **kind** of identity it is,
+   the caller's idempotency key, the decision it completes, and whether it
+   overrode a `deny`
+2. the relay, with the **authority** as its reason
+3. `vended`
+4. the pending entry — the ticket is not the entry here either
+
+If a caller asserted the completion and this lane trusted it, the caller would
+be `POST /sessions/open` with a microphone attached, and the fraud the loops and
+the presence gate exist to close would be open one layer down.
+
+**This lane verifies NOTHING about the ticket beyond its shape** — 6 to 64
+characters of `A-Z`, `0-9` and hyphen. No signature, no expiry, no issuer. It
+holds no key and mints no ticket; the agent does both. This lane's whole claim
+about a ticket is that it looked like one and that a named authority said to
+open.
+
+### The request
+
+```
+POST /v1/lane/vend
+Authorization: Bearer <the ACT token>
+Idempotency-Key: <the caller's own key>
+Content-Type: application/json
+
+{
+  "authorised_by": "human_open_now",
+  "identity": { "kind": "ticket", "ticket_ref": "TKT-4RS9WQ2M" },
+  "decision_at": "2026-08-30T14:03:11.482913+00:00"
+}
+```
+
+| | |
+|---|---|
+| `authorised_by` | a member of `vend_authorities`, published in full under **The closed sets**. Every one names a decision a person or a confirmed display code made; none of them is "the caller asked". |
+| `identity.kind` | a member of `vend_identity_kinds`. **`ticket` is the only one in this version, and a plate is deliberately not on it**: a plate is what the camera reads, and a caller that could assert one would be handing this lane a measurement it did not make. |
+| `identity.ticket_ref` | the completed identity. Opaque here; see above. |
+| `decision_at` | the `at` of the decision being completed, **exactly as `GET /v1/lane/state` published it**. The instants are compared, not the strings, so a caller that parsed and re-serialised it names the same moment. |
+| `Idempotency-Key` | **required**, and there is no generated fallback. A key this lane invented would be unique per request, which is the same as having none: the caller's retry would vend a second time. |
+
+Anything malformed is a **`400`**, and it is never a `409`. The difference
+matters to a caller: a `409` says this lane refused a well-formed completion for
+a reason about the lane or the vehicle, and is worth retrying when that reason
+clears; a `400` says the caller is broken and retrying will not help.
+
+### The answer
+
+<!--payload:vend-->
+```json
+{
+  "contract_version": 2,
+  "vend_commanded": true,
+  "event_cursor": 7,
+  "transit": "pending"
+}
+```
+
+**`202`, and the field is `vend_commanded` — never `opened`.** Nothing in this
+system measures the boom: `boom_did_not_rise` and `boom_did_not_close` are both
+`no_source` on `GET /v1/lane/health` and stay that way until something is built
+that can answer them. A field called `opened` here would be this lane's own
+health surface contradicted one route away.
+
+`202` and not `201` for that reason and one more: what follows the vend is
+decided by the loops after the barrier, over the confirmation window, **after
+this answer has been sent**. `transit` is `pending` because that is what it is
+at the moment of the answer — a pending entry, created by the vend, waiting on a
+crossing. What became of it is on `GET /v1/lane/state`, and `event_cursor` is
+where to start reading `GET /v1/lane/events` for the events that followed.
+
+### Idempotency
+
+One key, one vend. A replay returns **the same body** and moves nothing — and it
+is answered before any refusal is applied, because a replay is not a new
+attempt: the car that was on the loop when the first call vended has driven off
+by the time a retry arrives, and a replay checked against the loop would tell a
+caller its own successful vend failed.
+
+**Only accepted vends are held**, for the run, and the last **256** keys — the
+same depth as the read window, so a consumer holds one idea of how far back this
+lane remembers anything. A refusal is not an answer to replay: every one of them
+is about the world at the moment of the call, and freezing one against a key
+would refuse a caller for ever on a condition that has already passed.
+
+### The refusals
+
+Each is a **`409`** carrying its name in `code`, and they are applied in this
+order. The full set is published under **The closed sets** as `vend_refusals`.
+
+<!--payload:vend_refused-->
+```json
+{
+  "contract_version": 2,
+  "error": "this lane has an active malfunction: identity_service_down",
+  "code": "malfunction_active",
+  "malfunction": "identity_service_down"
+}
+```
+
+| order | code | when |
+|---|---|---|
+| 1 | `no_vehicle` | the arming loop reads unoccupied **now**. Not the caller's word for it, and not what was true when the decision was made |
+| 2 | `malfunction_active` | any malfunction this build **measures** is `active` and is not `never_alarm`. The code is named in `malfunction` |
+| 3 | `geometry_incomplete` | a two-loop lane with one loop occupied — the same check that stops the lane arming |
+| 4 | `decision_stale` | `decision_at` is older than `[lane] completion_max_age_s` |
+| 5 | `decision_mismatch` | `decision_at` is not the moment of this lane's last decision — **or this lane has decided nothing**, which is the same fact to a caller |
+| 6 | `not_completable` | the last decision's outcome is `allow` or `deny`; see below |
+| 7 | `busy` | a vend is in progress on this lane |
+
+`malfunction` is present on **every** refusal, `null` on all but
+`malfunction_active`. A field carried by one refusal and absent from six cannot
+distinguish "this was not a malfunction" from "this lane is too old to say",
+which is the mistake this project has already made once at the platform's
+conflict codes.
+
+**`completion_max_age_s` defaults to 120 seconds. It is a SETTING and an
+ASSUMPTION**, per site, and nothing here measures how long an intercom
+conversation takes. What it is drawn against is what a completion *means*: an
+answer to a driver who is at the barrier now. A completion accepted against a
+ten-minute-old decision opens a barrier for whoever happens to be there.
+
+**`not_completable`, and the one case that is not.** `allow` has already
+vended — there is nothing left to complete. `deny` is a **rule**, and a human
+overturning a rule is a deliberate, single, named act: `human_open_now` on a
+`deny` **IS allowed**, vends, and is recorded as an override —
+`assisted_identity` carries `override_of: "deny"`. No other authority overrides
+a rule, `human_open_and_flag` included: a completion the human is unsure about
+and a human overturning a refusal are different acts, and one of them is not
+made safer by being uncertain.
+
+**A consequence, stated rather than left to be discovered.** Refusal 2 uses this
+lane's own health surface, and `outbox_depth_growing`, `clock_skew_rejected` and
+`session_actions_dead_lettered` are among the codes it measures. **A lane whose
+platform has been unreachable long enough to grow its outbox past the site's
+threshold will refuse this route** — the barrier still works for an ordinary
+arrival, but the assisted vend is refused and names the code. That is the
+conservative direction and it is deliberate; a site that wants the other
+behaviour is asking for a decision nobody has made.
+
+### The two tokens
+
+**A read token never authorises an act.** The reads take the token from
+`--auth-token-file`; this route takes the token from `--act-token-file`, a
+**second file**.
+
+| | |
+|---|---|
+| the read token on this route | `403` |
+| the act token on a read route | `403` |
+| either token in a **query string**, on any route | `401`, and the request is not served |
+| no credential where one is configured | `401` |
+
+`403` and not `401` for the wrong token, because the caller is known: it holds a
+real credential of this lane's and is asking for something that credential does
+not buy. A `401` would invite it to retry with the same token for ever, and
+would make the read token and a wrong guess look identical — which is the whole
+point of there being two.
+
+A credential in a query string is refused **whichever token it is**, by name and
+by value: a token in a URL is a token in an access log, in a proxy's log and in
+a browser history, none of which anybody decided. Serving such a request would
+hand the caller a working integration that publishes its own credential on every
+call.
+
+**Loopback takes neither**, exactly as the reads do. Off loopback the service
+**refuses to start** without both — the read token because this publishes where
+a vehicle was, and the act token for the larger reason that the exposed thing is
+no longer a description of a lane, it is a barrier.
+
+### What is on this route and what is not
+
+`ticket_ref` is on the **request**, and from there it goes to exactly one place:
+the session action, which becomes `POST /lane/sessions/open` on the platform and
+lands in a column that platform's retention purge redacts.
+
+**It is on no read route and in no log line.** `assisted_identity` and
+`entry_pending` carry the identity's **kind** and not its value, because both
+reach `GET /v1/lane/events` and the platform's `events` table — which is
+append-only by grant there, so a reference written into a detail would be the one
+identity nothing could ever remove.
+
 ## The closed sets, in full
 
 Everything below is a set this contract declares CLOSED, published here so that
@@ -401,8 +623,8 @@ say it did not list them, on the reasoning that a hand-written copy of a set the
 code defines is the copy that goes wrong. The reasoning is right and the
 conclusion was wrong: withholding them did not remove the second copy, it moved
 it into every implementer's guess — and the stub in this repository that exists
-to prove a stranger can take this seat had to import our Python package for
-exactly these four sets.
+to prove a stranger can take this seat had to import our Python package for the
+sets the document withheld.
 
 So they are published, and the copy is held to the code by a test:
 `tests/test_lane_contract.py` compares every member below against the enum it
@@ -451,6 +673,23 @@ does adding one to the enum without adding it here.
   ],
   "never_alarm": [
     "reference_not_recognised"
+  ],
+  "vend_authorities": [
+    "display_code_confirmed",
+    "human_open_now",
+    "human_open_and_flag"
+  ],
+  "vend_refusals": [
+    "no_vehicle",
+    "malfunction_active",
+    "geometry_incomplete",
+    "decision_stale",
+    "decision_mismatch",
+    "not_completable",
+    "busy"
+  ],
+  "vend_identity_kinds": [
+    "ticket"
   ]
 }
 ```
@@ -463,6 +702,13 @@ does adding one to the enum without adding it here.
 - **`transit_states`** — every member of `contract.TransitState`.
 - **`never_alarm`** — the codes a monitor must never page a human on, and the
   reason each is here travels on the wire in that code's `caveat`.
+- **`vend_authorities`** — every member of `contract.VendAuthority`, the closed
+  set `POST /v1/lane/vend` takes in `authorised_by`. Every one names a decision
+  a person or a confirmed display code made.
+- **`vend_refusals`** — every member of `contract.VendRefusal`, in the order the
+  route applies them. Each arrives as a `409` carrying its name in `code`.
+- **`vend_identity_kinds`** — the identity kinds that route accepts. **One**,
+  this version, and a plate is deliberately not on it.
 
 `reason` and `cause` are **not** here, and that is not an oversight: `reason` is
 an OPEN string with a required closed subset, and a lane that is not ours emits
@@ -479,24 +725,37 @@ lane-controller serve --config lane.toml
 Binds `127.0.0.1:8090`. **Local by design** — this is meant to run on the same
 device as the lane it describes.
 
-**Off loopback it refuses to start without a credential.** `--host` anything but
-loopback requires `--auth-token-file`, and with a token every route requires
-`Authorization: Bearer <token>` and answers `401` without it. The exposure that
-rule exists for is real: on a lane's own LAN this publishes where a vehicle was,
-when it was there, and what the lane decided about it.
+**Off loopback it refuses to start without BOTH credentials.** `--host` anything
+but loopback requires `--auth-token-file` **and** `--act-token-file`, and with
+them every read route requires the first and `POST /v1/lane/vend` requires the
+second — see **The two tokens** above.
 
-**The token is read from a FILE, never from a flag value.** A value on the
+Two exposures, and they are not the same size. Without the read token, anything
+on the lane's LAN learns where a vehicle was, when it was there and what the
+lane decided about it. Without the act token, anything on that LAN **opens the
+barrier**, and the moment of the bind is the only place that can be refused
+before it is true.
+
+**Each token is read from a FILE, never from a flag value.** A value on the
 command line is readable by every user on the box for as long as the process
-runs.
+runs — and it is in that user's shell history afterwards.
 
 There is no flag that turns any of that off.
 
 ## What is NOT here, stated rather than left to be discovered
 
-- **No act surface.** No vend, no resolve, no route that changes anything.
-- **No state store.** `decision` and `transit` are lost on a restart and the
-  contract says so, rather than reporting the last thing it happened to
-  remember.
+- **No resolve route.** What becomes of a HELD entry is decided by nothing on
+  this contract. `POST /v1/lane/vend` is the whole act surface.
+- **No state store**, and the vend does not add one. `decision`, `transit` and
+  the idempotency keys are lost on a restart and the contract says so, rather
+  than reporting the last thing it happened to remember. A key from before a
+  restart is not recognised, and a replay carrying one is a NEW attempt subject
+  to every refusal — which at a barrier the car has already left is
+  `no_vehicle`.
+- **No measurement of the boom.** `vend_commanded` is what this lane can stand
+  behind; whether the barrier rose is `no_source` and stays that way.
+- **No verification of a ticket.** Shape only. No signature, no expiry, no
+  issuer, and no key on this box.
 - **No SIP identity.** Which lane an intercom call belongs to is unbound. It
   belongs with the agent, and binding it here would mean refusing every
   configuration file that exists today for a field nothing yet reads.

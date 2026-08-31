@@ -1,17 +1,24 @@
-"""The lane contract. This module IS the lane's public read surface.
+"""The lane contract. This module IS the lane's public surface.
 
 Everything else in this package is an implementation detail that may be
 rewritten; the payloads below are not. They are what a consumer integrates
 against -- our own intercom agent and a third party's alike -- and they are
 versioned from the first release so a change to them is always visible as one.
 
-**This round is READ ONLY.** There is no vend, no resolve, and no route that
-changes anything. `Capabilities.can_vend` exists so a consumer can ASK, and it
-is derived from the service's own act-route table rather than typed, so the
-answer cannot drift from the routes that exist.
+**VERSION 2 ADDS ONE ROUTE THAT CHANGES SOMETHING**, and it is the only one:
+`POST /v1/lane/vend`, the assisted vend. `Capabilities.can_vend` is derived from
+the service's own act-route table and the lane's direction rather than typed, so
+the answer cannot drift from the routes that exist.
 
-Four properties are the whole point, and each is enforced below rather than
-described and hoped for:
+That route is A NEW ROUTE TO A VEND on the exact boundary every outside reviewer
+of this project has named, so the property it exists to have is stated here and
+enforced in `vend.py` rather than described and hoped for: **the LANE applies
+its own refusals and the LANE writes the completed identity before it pulses the
+relay.** If a caller asserted the completion and this lane trusted it, the
+caller would be `POST /sessions/open` with a microphone attached.
+
+Four properties of the READ side are the whole point, and each is enforced below
+rather than described and hoped for:
 
   * **A state nobody derived is `unknown`, never `ok`.** `ok` and `active` are
     claims about a measurement and may only be carried by a code this build
@@ -47,7 +54,14 @@ from .interfaces import Unavailable
 #: not guess which fields it still understands. Additive changes do not bump it
 #: and a consumer ignores fields it does not know -- the same rule the Vehicle
 #: ID contract states, so one consumer can hold one policy for both.
-CONTRACT_VERSION = 1
+#:
+#: **2 -- the assisted vend.** `POST /v1/lane/vend` exists, and
+#: `capabilities.can_vend` answers `true` at an entry lane where version 1
+#: answered `false` for every lane there has ever been. A consumer written
+#: against version 1 read that field to mean "nothing here opens a barrier";
+#: it no longer does, and a value a consumer branches on changing meaning is
+#: precisely what this number is for.
+CONTRACT_VERSION = 2
 
 #: The reasons that are FALLBACK codes, and the only ones `LastDecision.fallback`
 #: will ever carry. Derived from the enum the lane decides with.
@@ -113,6 +127,96 @@ def _iso_utc(value, field_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+class VendAuthority(StrEnum):
+    """WHO says this vend may happen. A CLOSED set, and it is the whole set.
+
+    Every member names a decision a person or a confirmed display code made.
+    None of them is "the caller asked", because a caller that could authorise
+    itself would make this route `POST /sessions/open` with a microphone.
+    """
+
+    #: A code this lane's display showed for this arrival was read back and
+    #: matched. The agent does the matching; this lane records who said so.
+    DISPLAY_CODE_CONFIRMED = "display_code_confirmed"
+    #: A human on the intercom decided to open the barrier now. This is also
+    #: the ONLY authority that may complete a decision whose outcome was
+    #: `deny` -- overriding a rule is a deliberate, single, named act.
+    HUMAN_OPEN_NOW = "human_open_now"
+    #: A human decided to open AND to mark the arrival for somebody to look at.
+    #: It does not override a rule: a completion the human is unsure about and
+    #: a human overturning a refusal are different acts, and one of them is not
+    #: made safer by being uncertain.
+    HUMAN_OPEN_AND_FLAG = "human_open_and_flag"
+
+
+class VendRefusal(StrEnum):
+    """Why this lane refused to complete a vend. A CLOSED set.
+
+    Every one is a 409 carrying its name in `code`, in the order `vend.py`
+    applies them. They are the LANE'S refusals, derived from the same functions
+    an ordinary arrival goes through -- not a second copy that can come to
+    disagree with the one the barrier actually obeys.
+    """
+
+    #: The arming loop reads unoccupied NOW. Not the caller's word for it, and
+    #: not what was true when the decision was made.
+    NO_VEHICLE = "no_vehicle"
+    #: A malfunction this build MEASURES is active and is not `never_alarm`.
+    #: The code is named in the refusal body.
+    MALFUNCTION_ACTIVE = "malfunction_active"
+    #: A two-loop lane with one loop occupied. The same check `run_once` makes
+    #: before it arms, so an object that cannot span the gap cannot be
+    #: completed into an open barrier either.
+    GEOMETRY_INCOMPLETE = "geometry_incomplete"
+    #: `decision_at` is older than `[lane] completion_max_age_s`. A completion
+    #: is an answer to a driver who is at the barrier now.
+    DECISION_STALE = "decision_stale"
+    #: `decision_at` is not the moment of this lane's last decision -- or this
+    #: lane has not decided anything, which is the same fact to a caller.
+    DECISION_MISMATCH = "decision_mismatch"
+    #: There is nothing to complete. `allow` already vended; `deny` is a rule,
+    #: and only `human_open_now` overrides one.
+    NOT_COMPLETABLE = "not_completable"
+    #: A vend is in progress on this lane.
+    BUSY = "busy"
+
+
+#: The identity kinds `POST /v1/lane/vend` accepts. ONE, this version.
+#:
+#: A plate is not on it and must not be: a plate is what the camera reads, and a
+#: caller that could assert one would be handing this lane a measurement it did
+#: not make. What a caller can legitimately produce is a ticket -- a code this
+#: lane's display showed, or one a human read back -- and this lane verifies
+#: NOTHING about it beyond its shape.
+VEND_IDENTITY_KINDS: tuple[str, ...] = ("ticket",)
+
+#: The shape a `ticket_ref` must have, and the whole of what this lane checks.
+#:
+#: A SECOND COPY OF A RULE THAT LIVES IN `platform/src/app.js`, stated as one.
+#: Nothing in either repository's CI compares them, exactly as nothing compares
+#: the platform's lane-event kinds with this package's. The direction of failure
+#: is the safe one: this lane refuses first, so a lane ahead of its platform
+#: answers a caller 400 at the moment of the call rather than opening a barrier
+#: and dead-lettering the session action afterwards.
+TICKET_REF_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+TICKET_REF_MIN = 6
+TICKET_REF_MAX = 64
+
+
+def is_ticket_ref(value) -> bool:
+    """Whether `value` has the shape of a ticket reference, and nothing more.
+
+    Deliberately not a signature check, an expiry check or an issuer check.
+    This lane holds no key and mints no ticket: the agent does both, and a lane
+    that pretended to verify one would be publishing a claim it cannot support.
+    """
+    return (
+        isinstance(value, str)
+        and TICKET_REF_MIN <= len(value) <= TICKET_REF_MAX
+        and all(char in TICKET_REF_ALPHABET for char in value)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Capabilities:
     """What this lane can and cannot do, so a consumer never has to assume.
@@ -138,10 +242,12 @@ class Capabilities:
     #: display seam exists; derived from the wiring, so the day one is wired
     #: this follows it.
     has_display: bool
-    #: Whether this lane exposes a route that opens a barrier. FALSE for the
-    #: whole of this contract version: there is no act surface. Derived from
-    #: the service's act-route table, so a vend route cannot be added without
-    #: this answer changing with it.
+    #: Whether this lane exposes a route that opens a barrier. Derived from the
+    #: service's act-route table AND this lane's direction, so a vend route
+    #: cannot be added without this answer changing with it, and an EXIT lane --
+    #: where completing an identity would close and bill a stay, which is a
+    #: later round -- answers `false` and serves no such route rather than
+    #: announcing a capability it would refuse.
     can_vend: bool
 
     def to_dict(self) -> dict:
@@ -577,4 +683,92 @@ class EventPage:
             "reset": self.reset,
             "dropped": self.dropped,
             "events": list(self.events),
+        }
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/lane/vend
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class VendCommanded:
+    """`202` -- the relay was COMMANDED. It does not say the barrier opened.
+
+    Nothing in this system measures the boom. `boom_did_not_rise` and
+    `boom_did_not_close` are both `no_source` on `GET /v1/lane/health` and will
+    stay that way until something is built that can answer them, so a field
+    called `opened` here would be this lane's own health surface contradicted
+    one route away.
+
+    `202` and not `201` for the same reason plus one more: what follows the
+    vend is decided by the loops after the barrier, over the confirmation
+    window, after this answer has been sent. `transit` is `pending` because
+    that is what it is at the moment of the answer -- a pending entry, created
+    by the vend, waiting on a crossing. What became of it is on
+    `GET /v1/lane/state` and `GET /v1/lane/events`, and `event_cursor` is where
+    to start reading.
+    """
+
+    event_cursor: int
+    transit: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.event_cursor, int) or self.event_cursor < 0:
+            raise ValueError(
+                f"event_cursor must be a non-negative integer, got {self.event_cursor!r}"
+            )
+        if self.transit not in tuple(state.value for state in TransitState):
+            raise ValueError(f"transit must be a TransitState, got {self.transit!r}")
+
+    def to_dict(self) -> dict:
+        return {
+            "contract_version": CONTRACT_VERSION,
+            # COMMANDED, never `opened`. See the class docstring.
+            "vend_commanded": True,
+            "event_cursor": self.event_cursor,
+            "transit": self.transit,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class VendRefused:
+    """`409` -- this lane refused, and the refusal names itself.
+
+    The same rule the platform applies to its own conflicts, and for the same
+    reason: a consumer branches on a FIELD, never on message text, because a
+    message gets reworded and a check keyed on its words goes quietly wrong.
+
+    `malfunction` carries the code when the refusal is `malfunction_active` and
+    is `null` otherwise. It is present on EVERY refusal rather than only on that
+    one, so a consumer cannot read its absence as "this platform is too old to
+    say" -- the mistake the platform's `code` field exists to prevent.
+    """
+
+    code: str
+    error: str
+    malfunction: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.code not in tuple(refusal.value for refusal in VendRefusal):
+            raise ValueError(f"{self.code!r} is not a refusal code in this contract")
+        _text(self.error, "error")
+        if self.malfunction is not None and self.malfunction not in tuple(
+            code.value for code in MalfunctionCode
+        ):
+            raise ValueError(f"{self.malfunction!r} is not a malfunction code in this contract")
+        if (self.malfunction is not None) != (self.code == VendRefusal.MALFUNCTION_ACTIVE):
+            # A named malfunction on any other refusal, or `malfunction_active`
+            # without one, would both be a consumer told which thing to repair
+            # by a payload that does not know.
+            raise ValueError(
+                "`malfunction` is carried by `malfunction_active` and by no other refusal"
+            )
+
+    def to_dict(self) -> dict:
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "error": self.error,
+            "code": self.code,
+            "malfunction": self.malfunction,
         }

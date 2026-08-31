@@ -47,6 +47,7 @@ from lane_controller.contract import (
     REQUIRED_CAUSES,
     REQUIRED_REASONS,
     SOURCES,
+    VEND_IDENTITY_KINDS,
     HealthEntry,
     HealthState,
     LaneHealth,
@@ -55,6 +56,10 @@ from lane_controller.contract import (
     Source,
     Transit,
     TransitState,
+    VendAuthority,
+    VendCommanded,
+    VendRefusal,
+    VendRefused,
 )
 from lane_controller.events import DEFAULT_HISTORY, SESSION_KINDS, LaneEvent
 from lane_controller.interfaces import ClosingSequence, Unavailable
@@ -89,11 +94,12 @@ CONTRACT_DOC = Path(__file__).resolve().parent.parent / "docs" / "CONTRACT.md"
 # ---------------------------------------------------------------------------
 
 
-def full_lane(identities=None, crossings=None, events=None):
+def full_lane(identities=None, crossings=None, events=None, direction="entry"):
     """A lane with the standard installation: two arming loops, two closing."""
     config = LaneConfig(
         lane_id="lane-1",
         site_id="site-1",
+        direction=direction,
         camera=CameraConfig(camera_id="sim-cam-1", rtsp_url="", frames_per_read=3),
         gate=GateConfig(),
         loops=LoopConfig(
@@ -146,17 +152,24 @@ def bare_lane():
 # ---------------------------------------------------------------------------
 
 
-#: The blocks in the document that are a ROUTE's payload. `sets` is in the same
-#: marked-block mechanism and is deliberately not one of them: it publishes the
-#: closed sets a third party needs in order to implement this contract at all,
-#: and it is compared against the ENUMS rather than against a live response.
+#: The blocks in the document that are a READ route's payload. `sets` is in the
+#: same marked-block mechanism and is deliberately not one of them: it publishes
+#: the closed sets a third party needs in order to implement this contract at
+#: all, and it is compared against the ENUMS rather than against a live response.
 ROUTE_PAYLOADS = {"lane", "state", "health", "events"}
+
+#: The blocks that are the ACT route's two answers. Separated from the reads
+#: because they are not built by asking a lane a question -- one is what a
+#: commanded vend answers and the other is what a refusal answers -- and the
+#: expectation for each is derived from the payload class rather than from a
+#: served response.
+ACT_PAYLOADS = {"vend", "vend_refused"}
 
 
 def doc_payloads() -> dict[str, dict]:
     """Every `<!--payload:NAME-->` example in `docs/CONTRACT.md`, parsed."""
     text = CONTRACT_DOC.read_text(encoding="utf-8")
-    found = re.findall(r"<!--payload:([a-z]+)-->\s*```json\n(.*?)\n```", text, re.S)
+    found = re.findall(r"<!--payload:([a-z_]+)-->\s*```json\n(.*?)\n```", text, re.S)
     return {name: json.loads(body) for name, body in found}
 
 
@@ -191,7 +204,7 @@ def test_the_document_shows_exactly_the_payloads_the_code_builds():
     against it, so a field added, renamed or dropped in either one goes red.
     """
     doc = doc_payloads()
-    assert set(doc) == ROUTE_PAYLOADS | {"sets"}, (
+    assert set(doc) == ROUTE_PAYLOADS | ACT_PAYLOADS | {"sets"}, (
         "every route in the contract has a payload example, every example "
         "belongs to a route, and `sets` is the closed-set block that is not a "
         f"route. Found {sorted(doc)}"
@@ -211,12 +224,32 @@ def test_the_document_shows_exactly_the_payloads_the_code_builds():
     # The doc's health example shows ONE entry; the live payload carries every
     # code. Comparing shapes handles that -- a list reduces to its first
     # element -- and completeness is guarantee 3's job, not this one.
-    for name in sorted(ROUTE_PAYLOADS):
+    live.update(act_payloads())
+
+    for name in sorted(ROUTE_PAYLOADS | ACT_PAYLOADS):
         example = doc[name]
         assert shape(example) == shape(live[name]), (
             f"docs/CONTRACT.md's `{name}` example does not have the shape "
             f"`contract.py` builds.\n  doc:  {shape(example)}\n  code: {shape(live[name])}"
         )
+
+
+def act_payloads() -> dict[str, dict]:
+    """The vend route's two answers, built by the code that builds them.
+
+    Not served through a socket here: what a `202` and a `409` LOOK like is a
+    property of `contract.py`, and `tests/test_vend.py` is where they are taken
+    off the wire. The document is compared against the same objects the route
+    sends.
+    """
+    return {
+        "vend": VendCommanded(event_cursor=7, transit=TransitState.PENDING.value).to_dict(),
+        "vend_refused": VendRefused(
+            code=VendRefusal.MALFUNCTION_ACTIVE.value,
+            error="this lane has an active malfunction: identity_service_down",
+            malfunction=MalfunctionCode.IDENTITY_SERVICE_DOWN.value,
+        ).to_dict(),
+    }
 
 
 def test_the_documents_geometry_example_is_the_lanes_own_five_keys():
@@ -519,47 +552,63 @@ def test_flushing_the_outbox_does_not_empty_the_read_window():
 
 
 # ---------------------------------------------------------------------------
-# GUARANTEE 5 — nothing on this contract changes anything
+# GUARANTEE 5 — THE ACT SURFACE IS EXACTLY `ACT_ROUTES`, AND NOTHING ELSE
+#
+# Version 1 asserted that NOTHING here changed anything. Version 2 has one
+# route that does, so the guarantee changes shape rather than being dropped:
+# the act surface is the route table, the capability is derived from it, and
+# every other method and every other path is still the one shared refusal.
+#
+# A second route that mutated something would have to break one of those, and
+# the sweep goes red in the same commit.
 # ---------------------------------------------------------------------------
 
 
-def test_no_route_mutates_anything():
-    """A sweep of the handler, not a list of routes somebody remembered.
-
-    Every `do_*` method other than `do_GET` must BE the one shared refusal.
-    A route that did something would have to stop being it, and this goes red
-    in the same commit -- which is the point, because the act surface is a
-    later round and this is the guard that keeps it one.
-    """
+def test_only_get_and_post_are_answered_at_all():
+    """A sweep of the handler, not a list of methods somebody remembered."""
     methods = {
         name
         for name in dir(_Handler)
         if name.startswith("do_") and callable(getattr(_Handler, name))
     }
-    assert "do_GET" in methods, "the control: this sweep can see methods at all"
+    assert {"do_GET", "do_POST"} <= methods, "the control: this sweep can see methods at all"
 
-    for name in methods - {"do_GET"}:
+    for name in methods - {"do_GET", "do_POST"}:
         assert getattr(_Handler, name) is _Handler._method_not_allowed, (
-            f"{name} is not the shared refusal. This contract version is read-only: "
-            "a method that does anything is a new route to a vend."
+            f"{name} is not the shared refusal. The act surface of this contract version "
+            f"is {ACT_ROUTES}, and a method that does anything else is a new route to a vend."
         )
 
 
-def test_can_vend_is_derived_from_the_route_table():
-    """The capability and the routes are one fact, so they cannot disagree."""
-    assert ACT_ROUTES == ()
-    assert LaneService(full_lane()).capabilities().can_vend is False
-    assert LaneService(full_lane()).describe().to_dict()["capabilities"]["can_vend"] is False
-
-
-def test_a_consumer_that_posts_to_a_vend_path_is_refused():
-    """Asked the way a consumer would ask it: over the socket."""
+def test_post_serves_the_act_routes_and_refuses_every_other_path():
+    """`do_POST` is not a second route table. Asked over the socket."""
     service = LaneService(full_lane())
     with serving(make_server(service, port=0)) as base:
         consumer = LaneConsumer(base)
-        assert consumer.lane()["capabilities"]["can_vend"] is False
-        for path in ("/v1/lane/vend", "/v1/lane/transit/abc/resolve", "/v1/lane"):
-            assert consumer.post(path) in (404, 405)
+        for path in ("/v1/lane", "/v1/lane/state", "/v1/lane/transit/abc/resolve", "/v1/nope"):
+            assert consumer.post(path) == 405, f"POST {path} must be the shared refusal"
+        # THE CONTROL: the act route itself is NOT 405 -- it is served, and a
+        # body this lane refuses gets a refusal from the route rather than from
+        # the method. Without this the sweep above passes on a lane with no act
+        # surface at all.
+        assert consumer.post("/v1/lane/vend") not in (404, 405)
+
+
+def test_can_vend_is_derived_from_the_route_table_and_the_direction():
+    """The capability and the routes are one fact, so they cannot disagree."""
+    assert ACT_ROUTES == ("/v1/lane/vend",)
+
+    entry = LaneService(full_lane())
+    assert entry.capabilities().can_vend is True
+    assert entry.describe().to_dict()["capabilities"]["can_vend"] is True
+
+    # An EXIT lane completes nothing in this version: doing so would close a
+    # stay and freeze a fee, which is the exit process. It says so rather than
+    # announcing a capability every call to which it would refuse.
+    exiting = LaneService(full_lane(direction="exit"))
+    assert exiting.capabilities().can_vend is False
+    with serving(make_server(exiting, port=0)) as base:
+        assert LaneConsumer(base).post("/v1/lane/vend") == 404
 
 
 def test_the_read_routes_are_the_ones_that_answer():
@@ -570,9 +619,12 @@ def test_the_read_routes_are_the_ones_that_answer():
         consumer = LaneConsumer(base)
         for route in READ_ROUTES:
             assert isinstance(consumer._get(route), dict)
-        with pytest.raises(urllib.error.HTTPError) as refused:
-            consumer._get("/v1/lane/vend")
-        assert refused.value.code == 404
+        for route in ACT_ROUTES:
+            # An act route is not a read route. A GET of one is a 404, so a
+            # consumer cannot reach the vend by asking for it politely.
+            with pytest.raises(urllib.error.HTTPError) as refused:
+                consumer._get(route)
+            assert refused.value.code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -705,15 +757,19 @@ def test_presence_not_measured_stays_null_all_the_way_out():
 # ---------------------------------------------------------------------------
 
 
-def test_a_non_loopback_bind_without_a_token_is_refused():
-    """Off loopback this publishes where a vehicle was, and when."""
-    assert_bind_allowed("127.0.0.1", 8090, None)
-    assert_bind_allowed("localhost", 8090, None)
-    assert_bind_allowed("0.0.0.0", 8090, "a-token")  # noqa: S104
+def test_a_non_loopback_bind_without_both_tokens_is_refused():
+    """Off loopback this publishes where a vehicle was — and can open a barrier."""
+    assert_bind_allowed("127.0.0.1", 8090, None, None)
+    assert_bind_allowed("localhost", 8090, None, None)
+    assert_bind_allowed("0.0.0.0", 8090, "a-token", "an-act-token")  # noqa: S104
 
     for host in ("0.0.0.0", "", "192.0.2.10", "lane-1.local"):  # noqa: S104
-        with pytest.raises(InsecureBind):
-            assert_bind_allowed(host, 8090, None)
+        with pytest.raises(InsecureBind, match="no token"):
+            assert_bind_allowed(host, 8090, None, None)
+        # AND the second one, which is the larger exposure: with a read token
+        # and no act token, anything that can reach the port opens the barrier.
+        with pytest.raises(InsecureBind, match="no ACT token"):
+            assert_bind_allowed(host, 8090, "a-token", None)
 
 
 def test_with_a_token_every_route_requires_it():
@@ -1048,10 +1104,11 @@ def test_the_documents_contract_version_is_the_codes():
     would be a second copy of one.
     """
     doc = doc_payloads()
-    carried = {name: doc[name]["contract_version"] for name in sorted(ROUTE_PAYLOADS)}
+    every = ROUTE_PAYLOADS | ACT_PAYLOADS
+    carried = {name: doc[name]["contract_version"] for name in sorted(every)}
 
-    assert set(carried) == ROUTE_PAYLOADS, "an example dropped contract_version"
-    assert len(carried) == 4, f"the sweep found {len(carried)} payloads, not four"
+    assert set(carried) == every, "an example dropped contract_version"
+    assert len(carried) == 6, f"the sweep found {len(carried)} payloads, not six"
     for name, version in carried.items():
         assert version == CONTRACT_VERSION, (
             f"docs/CONTRACT.md's `{name}` example publishes contract_version "
@@ -1062,14 +1119,21 @@ def test_the_documents_contract_version_is_the_codes():
 def test_the_documents_can_vend_is_the_route_tables_answer():
     """`can_vend` is derived from `ACT_ROUTES`. The document may not disagree.
 
-    This is the claim the round is FOR -- that the read contract cannot open a
-    barrier -- and until now the document could have published the opposite of
-    what the code enforces, with CI green.
+    This is the claim the round turns on -- which routes of this lane can open
+    a barrier -- and the document could otherwise publish the opposite of what
+    the code enforces, with CI green. The document's example is an ENTRY lane,
+    which is the only kind that serves the act route.
     """
-    doc = doc_payloads()["lane"]["capabilities"]
-    live = live_payloads()["lane"]["capabilities"]
+    doc = doc_payloads()["lane"]
+    live = live_payloads()["lane"]
 
-    assert doc["can_vend"] == live["can_vend"] == bool(ACT_ROUTES) is False
+    assert doc["direction"] == live["direction"] == "entry"
+    assert (
+        doc["capabilities"]["can_vend"]
+        == live["capabilities"]["can_vend"]
+        == bool(ACT_ROUTES)
+        is True
+    )
 
 
 def test_the_documents_health_row_publishes_the_codes_own_constants():
@@ -1612,6 +1676,13 @@ PUBLISHED_SETS = {
     "outcomes": lambda: list(OUTCOMES),
     "transit_states": lambda: [state.value for state in TransitState],
     "never_alarm": lambda: [code.value for code in NEVER_ALARM],
+    "vend_authorities": lambda: [authority.value for authority in VendAuthority],
+    # In the ORDER the route applies them, which is the order the enum declares
+    # them in and the order the document's table walks. A refusal ladder whose
+    # published order and applied order differed would teach an integrator a
+    # sequence of checks that is not the one it will meet.
+    "vend_refusals": lambda: [refusal.value for refusal in VendRefusal],
+    "vend_identity_kinds": lambda: list(VEND_IDENTITY_KINDS),
 }
 
 

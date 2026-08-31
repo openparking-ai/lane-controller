@@ -87,6 +87,18 @@ jobs:
         # cannot go red on it is not evidence that it does not happen.
         run: python scripts/fallback_cause_fail_control.py
 
+      - name: Assisted-vend fail-control
+        # THE ROUND'S OWN CONTROL, and the most important one in this file.
+        # `POST /v1/lane/vend` is the first route in this project that can open
+        # a barrier. Each break is a barrier that opens when it should not, a
+        # credential that buys what it must not, or a record that is missing
+        # when one does: every named refusal suppressed one at a time, the
+        # order of identity-then-relay swapped, the replay allowed to vend
+        # again, the read token given the act route, a credential in a URL
+        # served, and the ticket reference put on the read contract and in a
+        # log line. Each must turn the suite red.
+        run: python scripts/vend_fail_control.py
+
       - name: Measured-codes fail-control
         # Two malfunction codes moved from `not_measured` to `measured` this
         # round, and a `measured` label is a claim that this build derives the

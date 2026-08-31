@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .config import LaneConfig
 from .contract import TransitState
@@ -188,6 +188,23 @@ class LaneController:
         self.last_cause: str | None = None
         self.transit_state: str = TransitState.NONE.value
         self.transit_since: str | None = None
+        #: The last identity a human or a display code COMPLETED through
+        #: `POST /v1/lane/vend`, held here from before the relay was pulsed
+        #: until the transit it opened is settled. It is the lane's own record
+        #: of what it was told, and it is NOT published on any read route: the
+        #: reference travels on the session action to the platform, where the
+        #: retention purge can reach it.
+        self.last_assisted: dict | None = None
+
+    def now(self) -> float:
+        """This lane's clock, which is the authority for WHEN.
+
+        Public because the vend route ages a completion against it, and it must
+        be the same clock the events are stamped with -- a test that puts a car
+        through a three-hour stay in a millisecond injects one, and a second
+        source of time here would make the two disagree.
+        """
+        return self._clock()
 
     def handle_arrival(self) -> Decision:
         """One vehicle, from arming to vend. Assumes the loop has already armed."""
@@ -197,6 +214,23 @@ class LaneController:
         self.events.record("frames_captured", lane, count=len(frames), camera=self.camera.camera_id)
 
         identity = self.identifier.identify(frames)
+        if identity.ticket_ref is not None:
+            # THE SEAM. `VehicleIdentity` is what the vision stage BELIEVES IT
+            # SAW, and a ticket is not a reading -- it is asserted by a person
+            # or by a display code, through `POST /v1/lane/vend`, and the LANE
+            # is what sets it. An identifier that could set it would be minting
+            # a parking identity through the interface that exists to report
+            # measurements, and that identity would reach the platform's
+            # `vehicles` table on the session action below.
+            #
+            # The VALUE is not logged. Naming it would copy the very text this
+            # exists to keep out of anything the lane owns, exactly as the
+            # `unrecognised_cause` seam refuses to name what it rejected.
+            log.warning(
+                "an identifier supplied a ticket_ref; a ticket is asserted, never measured. "
+                "Dropping it: only the assisted vend route may complete an identity"
+            )
+            identity = replace(identity, ticket_ref=None)
         self.events.record(
             "vehicle_identified",
             lane,
@@ -294,6 +328,54 @@ class LaneController:
         return decision
 
     # ------------------------------------------------------------------
+    # The ASSISTED vend: an identity a human or a display code completed.
+    # ------------------------------------------------------------------
+
+    def complete_vend(self, identity, *, authorised_by: str, assisted: dict) -> str:
+        """Write the identity, pulse the relay, record it, open a pending entry.
+
+        **THE ORDER IS THE SAFETY PROPERTY AND IT IS THE WHOLE OF THIS METHOD.**
+        The identity is recorded BEFORE the relay is asked to move. Every other
+        ordering is a barrier that opened with nothing in the record saying who
+        said so, and that is the vend this project's outside reviewers named:
+
+            1. `assisted_identity`   who authorised it, which KIND of identity
+                                     it is, the caller's idempotency key, and
+                                     the decision it completes
+            2. `vend.vend(reason)`   the relay, with the AUTHORITY as its reason
+            3. `vended`              the lane's ordinary record of a vend
+            4. the pending entry      via `begin_transit` -- the ticket is not
+                                     the entry here either
+
+        `tests/test_vend.py` records every one of those calls and refuses any
+        order but this one.
+
+        The ticket REFERENCE is not in the event at step 1. It is held on this
+        controller and it travels on the session action, which becomes
+        `POST /lane/sessions/open` and lands in a column the platform's
+        retention purge redacts. `events` is append-only by grant there, so a
+        reference written into a detail would be the one identity nothing could
+        ever remove.
+
+        Returns the lane's own timestamp for the vend, which is what
+        `resolve_transit` must be given: the car arrived when it arrived,
+        whatever time anything else eventually hears about it.
+        """
+        lane = self.config.lane_id
+        # FIRST, and before anything moves. Held on the controller as well as
+        # recorded, because the record is what an operator reads and this is
+        # what the session action is built from.
+        self.last_assisted = dict(assisted)
+        self.events.record("assisted_identity", lane, **assisted)
+
+        self.vend.vend(authorised_by)
+        self.events.record("vended", lane, reason=authorised_by)
+
+        at = to_iso(self._clock())
+        self.begin_transit(identity, at)
+        return at
+
+    # ------------------------------------------------------------------
     # From the vend to the session, or to one of the three other answers.
     # ------------------------------------------------------------------
 
@@ -324,8 +406,14 @@ class LaneController:
         return crossing is ClosingSequence.REVERSE
 
     @staticmethod
-    def _arming_complete(loop_b: LoopInput | None) -> bool:
-        """Both arming loops occupied together, or a lane that has only one."""
+    def arming_complete(loop_b: LoopInput | None) -> bool:
+        """Both arming loops occupied together, or a lane that has only one.
+
+        Public because `POST /v1/lane/vend` applies it too, and it applies THIS
+        function rather than a copy: a completion that could open a barrier on
+        an arming geometry `run_once` would have refused is the refusal
+        existing in one place and not in the other.
+        """
         return loop_b is None or loop_b.is_occupied()
 
     def _transit(self, state: TransitState, at: str) -> None:
@@ -339,8 +427,30 @@ class LaneController:
         self.transit_state = state.value
         self.transit_since = at
 
+    @staticmethod
+    def _identity_kind(identity) -> str:
+        """What KIND of identity this is: read, or asserted.
+
+        Derived from the identity itself rather than passed alongside it, so a
+        record cannot say `plate` about a ticket. It is published on the pending
+        event; the ticket REFERENCE is not -- see `begin_transit`.
+        """
+        return "ticket" if identity.ticket_ref else "plate"
+
     def _settle_transit(self, identity, at: str) -> None:
-        """Record the pending entry, then let the closing loops decide its fate."""
+        """Record the pending entry, then let the closing loops decide its fate.
+
+        Two halves, called as one here and separately by the assisted vend --
+        which has to ANSWER its caller once the pending entry exists and then go
+        on waiting for the crossing, because the confirmation window is ten
+        seconds and an HTTP route that held one open for it would be reporting
+        a settled transit as though it were an immediate one.
+        """
+        self.begin_transit(identity, at)
+        self.resolve_transit(identity, at)
+
+    def begin_transit(self, identity, at: str) -> None:
+        """The vend created a PENDING entry. Nothing has decided its fate yet."""
         lane = self.config.lane_id
         names = _ENTRY if self.config.direction == "entry" else _EXIT
         geometry = self.config.loops.as_published()
@@ -349,10 +459,23 @@ class LaneController:
             names.pending,
             lane,
             plate_region=identity.plate_region,
+            # WHICH KIND of identity opened this, and never the ticket itself.
+            # This event reaches `GET /v1/lane/events` and the platform's
+            # `events` table, which is append-only by grant -- so a reference
+            # written here would be the one identity nothing could ever redact.
+            # Publish less: the session action carries the value, and it lands
+            # in a column the retention purge reaches.
+            identity_kind=self._identity_kind(identity),
             at=at,
             geometry_assumed=geometry,
         )
         self._transit(TransitState.PENDING, at)
+
+    def resolve_transit(self, identity, at: str) -> None:
+        """What the loops after the barrier made of the pending entry."""
+        lane = self.config.lane_id
+        names = _ENTRY if self.config.direction == "entry" else _EXIT
+        geometry = self.config.loops.as_published()
 
         if self.closing_loops is None:
             # No closing loops at this site, so nothing here can confirm or
@@ -433,6 +556,30 @@ class LaneController:
             # in the ledger.
             self._record_session(identity, at, confirmation=HELD)
 
+    def _identity_detail(self, identity, *, with_region: bool) -> dict:
+        """The identity fields a SESSION ACTION carries, and only those.
+
+        EXACTLY ONE identity, which is the shape the platform's `vehicles` row
+        now has (`vehicles_exactly_one_identity`). A ticket action carries no
+        `plate` key at all rather than `plate: null`: the record says what the
+        identity WAS, and a null plate beside a ticket reads as a plate the lane
+        failed to get rather than as a lane that was never looking for one.
+
+        These are the only events in this package that have ever carried
+        identity text, and they are not on the read contract -- they become
+        `POST /lane/sessions/open` and `/close`.
+        """
+        if identity.ticket_ref:
+            return {"ticket_ref": identity.ticket_ref, "identity_kind": "ticket"}
+        detail = {"plate": identity.plate, "identity_kind": "plate"}
+        if with_region:
+            # The open carries it and the close never has. Kept that way rather
+            # than tidied: what the region is FOR is telling one jurisdiction's
+            # plate from another's at the moment the vehicle is first recorded,
+            # and the platform's close route neither reads it nor stores it.
+            detail["plate_region"] = identity.plate_region
+        return detail
+
     def _record_session(self, identity, at: str, *, confirmation: str) -> None:
         """Put the session action on the queue, saying what confirmed it."""
         lane = self.config.lane_id
@@ -440,25 +587,30 @@ class LaneController:
             self.events.record(
                 SESSION_OPEN,
                 lane,
-                plate=identity.plate,
-                plate_region=identity.plate_region,
+                **self._identity_detail(identity, with_region=True),
                 at=at,
                 entry_confirmation=confirmation,
             )
             return
         # Ask the platform which session this is, while the answer is still
         # unambiguous. If it cannot be reached the close goes out without an id
-        # and the platform falls back to matching on the plate -- which works,
-        # and is merely less precise.
+        # and the platform falls back to matching on the identity -- which
+        # works, and is merely less precise.
+        #
+        # The lookup takes a PLATE, so a ticket identity skips it. That is not a
+        # gap that can be reached in this version: the vend route is the only
+        # thing that sets a ticket and it serves ENTRY lanes only, and no
+        # identifier may supply one. The close still goes out carrying the
+        # ticket, and the platform finds the open stay from it.
         session_id = None
-        if self.session_lookup is not None:
+        if self.session_lookup is not None and identity.plate:
             found = self.session_lookup(identity.plate)
             if found:
                 session_id = found.get("session", {}).get("id")
         self.events.record(
             SESSION_CLOSE,
             lane,
-            plate=identity.plate,
+            **self._identity_detail(identity, with_region=False),
             at=at,
             session_id=session_id,
             exit_confirmation=confirmation,
@@ -478,7 +630,7 @@ class LaneController:
 
         lane = self.config.lane_id
         geometry = self.config.loops.as_published()
-        if not self._arming_complete(self.arming_loop_b):
+        if not self.arming_complete(self.arming_loop_b):
             log.info("lane %s: one arming loop only, not arming", lane)
             self.events.record(
                 ARMING_INCOMPLETE,

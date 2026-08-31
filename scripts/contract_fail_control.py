@@ -17,11 +17,13 @@ than something next to it.
   unknown_is_ok   the invariant removed at the seam that enforces it AND at the
                   seam that produces it, so a code nothing measures reports a
                   clean bill of health.
-  plant_post      a route that changes something, planted on the handler. The
-                  read-only sweep is what keeps the act surface a later round.
-  vend_capability the capability alone, without the route -- the mirror of
-                  `plant_post`, broken separately because one derivation joins
-                  them and a control that only breaks one end proves half of it.
+  plant_post      a `do_POST` that is not the route table: it answers every
+                  path, the four reads included. The act surface is
+                  `ACT_ROUTES` and nothing else, and this is what keeps it so.
+  vend_capability the capability without the route -- `can_vend: true` at a
+                  lane that serves none. The mirror of `plant_post`, broken
+                  separately because one derivation joins them and a control
+                  that only breaks one end proves half of it.
   stored_fallback `fallback` stops being derived from `reason`, so a foreign
                   lane's own vocabulary arrives looking like one of our codes.
   no_reset        the cursor stops saying the process restarted, so an empty
@@ -78,8 +80,8 @@ CONTRACT_BREAKS = [
     ("geometry_copy", "the service renders its own geometry"),
     ("drop_code", "a malfunction code is missing from the payload"),
     ("unknown_is_ok", "an unmeasured code reports a clean bill of health"),
-    ("plant_post", "a route that changes something is planted on the handler"),
-    ("vend_capability", "the lane claims it can vend"),
+    ("plant_post", "a POST handler answers every path instead of the act routes"),
+    ("vend_capability", "a lane that serves no act route claims it can vend"),
     ("stored_fallback", "`fallback` echoes any reason instead of being derived"),
     ("no_reset", "the cursor stops saying the process restarted"),
     ("extra_field", "the code carries a field the document does not show"),
