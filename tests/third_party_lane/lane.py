@@ -43,7 +43,7 @@ class ThirdPartyLane:
             "lane_id": self.lane_id,
             "site_id": self.site_id,
             "direction": self.direction,
-            "contract_version": 1,
+            "contract_version": 2,
             # No loops, so nothing to publish. Not `null` and not our five
             # keys: this lane has no geometry, and says so with an empty one.
             "geometry": {},
@@ -68,7 +68,7 @@ class ThirdPartyLane:
 
     def state(self) -> dict:
         payload = {
-            "contract_version": 1,
+            "contract_version": 2,
             "decision": {
                 "outcome": "fallback",
                 "reason": VENDOR_REASON,
@@ -113,7 +113,7 @@ class ThirdPartyLane:
         if _break("no_source_label"):
             for entry in codes:
                 del entry["source"]
-        return {"contract_version": 1, "codes": codes}
+        return {"contract_version": 2, "codes": codes}
 
     def events(self, since: int) -> dict:
         # This lane keeps a two-event log and nothing else.
@@ -137,7 +137,7 @@ class ThirdPartyLane:
         ]
         cursor = 2
         payload = {
-            "contract_version": 1,
+            "contract_version": 2,
             "cursor": cursor,
             "reset": since > cursor,
             "dropped": 0,
@@ -175,9 +175,14 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json(404, {"error": "no such route"})
 
     def do_POST(self) -> None:  # noqa: N802
-        # This lane has no act surface either, and answers the same way ours
-        # does. A consumer asking "can I make you do something" gets one answer
-        # from both, which is what makes the question worth asking.
+        # THIS LANE HAS NO ACT SURFACE, and that is the point of it now. Our
+        # lane grew one in version 2; a lane that is not ours implements the
+        # same contract version and declares `can_vend: false`, because
+        # implementing the act side is optional and a consumer must have a case
+        # for a lane that cannot open anything for it.
+        #
+        # A consumer asking "can I make you do something" gets a different
+        # answer from the two lanes and needs no branch to ask the question.
         self.send_response(405)
         self.send_header("Allow", "GET")
         self.send_header("Content-Length", "0")

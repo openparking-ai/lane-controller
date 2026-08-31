@@ -6,6 +6,7 @@ Built by 72 Knots Method by 72Knots.ai
 from .config import CameraConfig, GateConfig, LaneConfig, LoopConfig
 from .contract import (
     CONTRACT_VERSION,
+    VEND_IDENTITY_KINDS,
     Capabilities,
     EventPage,
     HealthEntry,
@@ -18,6 +19,10 @@ from .contract import (
     Source,
     Transit,
     TransitState,
+    VendAuthority,
+    VendCommanded,
+    VendRefusal,
+    VendRefused,
 )
 from .controller import LaneController
 from .decision import Decision, DecisionCache, Fallback, Outcome, Rule, decide
@@ -37,9 +42,13 @@ from .platform_client import PlatformClient, PlatformRejected, PlatformUnreachab
 from .service import InsecureBind, LaneService, make_server
 from .sync import PlatformTransport, sync_rules
 from .vehicle_id_client import VehicleIdClient
+from .vend import AssistedVend, BadVendRequest, VendRequest
 
 __all__ = [
     "CONTRACT_VERSION",
+    "VEND_IDENTITY_KINDS",
+    "AssistedVend",
+    "BadVendRequest",
     "CameraConfig",
     "CameraFeed",
     "Capabilities",
@@ -79,7 +88,12 @@ __all__ = [
     "VehicleIdClient",
     "VehicleIdentifier",
     "VehicleIdentity",
+    "VendAuthority",
+    "VendCommanded",
     "VendOutput",
+    "VendRefusal",
+    "VendRefused",
+    "VendRequest",
     "decide",
     "make_server",
     "sync_rules",

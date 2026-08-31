@@ -192,7 +192,14 @@ def _break_the_confirmation(monkeypatch):
     elif mode == "arming":
         # One arming loop is enough. A person with a piece of metal on a single
         # loop arms the lane again.
-        monkeypatch.setattr(LaneController, "_arming_complete", staticmethod(lambda loop_b: True))
+        # `arming_complete`, and the name matters: it was `_arming_complete`
+        # until the assisted vend needed the same check, and a break anchored
+        # on the old name raises AttributeError instead of applying -- which
+        # reports "fails as required" for the wrong reason. `raising=True` is
+        # the default and is what would have said so; this is the assertion of
+        # the same thing, one line up, where a reader will see it.
+        assert hasattr(LaneController, "arming_complete"), "the arming break's anchor has moved"
+        monkeypatch.setattr(LaneController, "arming_complete", staticmethod(lambda loop_b: True))
 
     else:
         raise RuntimeError(f"unknown BREAK_CONFIRMATION mode: {mode}")
@@ -407,21 +414,22 @@ def _break_the_lane_contract(monkeypatch):
         monkeypatch.setattr(service_module.LaneService, "health", cheerful)
 
     elif mode == "plant_post":
-        # A route that changes something, planted on the handler. The read-only
-        # sweep must find it -- this is the positive control for the guarantee
-        # that keeps the act surface a later round.
+        # A `do_POST` THAT IS NOT THE ROUTE TABLE: it answers every path,
+        # including the four reads. The act surface is `ACT_ROUTES` and nothing
+        # else, and this is the positive control for that -- a second route
+        # that changed something would have to get past this sweep.
         def do_POST(self):  # noqa: N802, N807
             self.send_response(200)
             self.send_header("Content-Length", "0")
             self.end_headers()
 
         monkeypatch.setattr(service_module._Handler, "do_POST", do_POST)
-        monkeypatch.setattr(service_module, "ACT_ROUTES", ("/v1/lane/vend",))
 
     elif mode == "vend_capability":
-        # The capability alone, without the route. A lane that ANNOUNCES it can
-        # vend when it cannot is the mirror of the mode above, and the two are
-        # broken separately because one derivation joins them.
+        # The capability WITHOUT the route: `can_vend: true` on a lane that
+        # serves none -- an EXIT lane, where completing an identity would close
+        # a stay and freeze a fee. The mirror of the mode above, broken
+        # separately because one derivation joins them.
         original = service_module.LaneService.capabilities
 
         def boastful(self):
@@ -763,3 +771,293 @@ def _break_the_measured_codes(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_MEASURED_CODE mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the ASSISTED VEND fail-control.
+#
+# `scripts/vend_fail_control.py` sets BREAK_VEND and requires the vend suite to
+# FAIL. This is the round's most important control set: every mode below is a
+# barrier that opens when it should not, or a record that is missing when it
+# does, and each one is a line that carries a guarantee rather than a fixture.
+#
+# The seven named refusals share ONE mechanism -- the refusal is computed and
+# then suppressed -- so a refusal added to the contract is broken here without
+# anything being remembered, and a control that passes says the suite measures
+# THAT refusal and not something beside it.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_vend(monkeypatch):
+    mode = os.environ.get("BREAK_VEND")
+    if not mode:
+        return
+
+    from lane_controller import controller as controller_module
+    from lane_controller import service as service_module
+    from lane_controller import vend as vend_module
+    from lane_controller.contract import VendRefusal
+    from lane_controller.controller import LaneController
+    from lane_controller.vend import AssistedVend
+
+    suppressible = {f"suppress_{refusal.value}": refusal.value for refusal in VendRefusal}
+
+    if mode in suppressible and mode != "suppress_busy":
+        # The refusal is computed and thrown away. The lane still knows it
+        # should have refused, which is what makes this a break of the ROUTE
+        # rather than of the thing it consults.
+        code = suppressible[mode]
+        original = AssistedVend._refuse
+
+        def without(self, request):
+            refusal = original(self, request)
+            return None if refusal is not None and refusal.code == code else refusal
+
+        monkeypatch.setattr(AssistedVend, "_refuse", without)
+
+    elif mode == "suppress_busy":
+        # A lane that will take a second vend while the first is still
+        # settling. Two relays pulsed for one arrival.
+        #
+        # The flag is CLEARED at the moment the check reads it, rather than
+        # replaced with a constant: the rest of the object still works, so the
+        # suite fails on the barrier moving twice and not on a broken fixture.
+        original_accept = AssistedVend._accept
+
+        def anyway(self, request):
+            with self._state:
+                self._in_progress = False
+            return original_accept(self, request)
+
+        monkeypatch.setattr(AssistedVend, "_accept", anyway)
+
+    elif mode == "presence_not_decides":
+        # The refusal stops going through `decide()` and reads the loop
+        # itself -- A SECOND COPY of the presence rule. It answers identically
+        # today, and it is the shape that drifts: `decide()` moves and the
+        # route does not. Only the test that perturbs `decide()` can see it.
+        original = AssistedVend._refuse
+
+        def own_copy(self, request):
+            from lane_controller.contract import VendRefused
+
+            if not self._service.controller.loop.is_occupied():
+                return VendRefused(
+                    code=VendRefusal.NO_VEHICLE.value, error="the arming loop reads unoccupied"
+                )
+            refusal = original(self, request)
+            if refusal is not None and refusal.code == VendRefusal.NO_VEHICLE.value:
+                return None
+            return refusal
+
+        monkeypatch.setattr(AssistedVend, "_refuse", own_copy)
+
+    elif mode == "relay_before_identity":
+        # THE ORDER SWAPPED. The barrier opens and the record of who said so is
+        # written afterwards -- which, on a lane that loses power between the
+        # two, is written never.
+        def relay_first(self, identity, *, authorised_by, assisted):
+            lane = self.config.lane_id
+            self.vend.vend(authorised_by)
+            self.last_assisted = dict(assisted)
+            self.events.record("assisted_identity", lane, **assisted)
+            self.events.record("vended", lane, reason=authorised_by)
+            at = controller_module.to_iso(self._clock())
+            self.begin_transit(identity, at)
+            return at
+
+        monkeypatch.setattr(LaneController, "complete_vend", relay_first)
+
+    elif mode == "replay_vends_again":
+        # The idempotency store stops answering, so a caller's retry is a
+        # second vend -- and the second one happens after the car has gone.
+        monkeypatch.setattr(AssistedVend, "_held", lambda self, key: None)
+
+    elif mode == "read_token_vends":
+        # The two tokens become one. Anything that may read this lane may open
+        # its barrier, which is the whole reason there are two.
+        original = service_module._Handler._authorise
+
+        def either(self, required, other, what, *, unconfigured_refuses):
+            return original(
+                self, required or other, other, what, unconfigured_refuses=unconfigured_refuses
+            )
+
+        monkeypatch.setattr(service_module._Handler, "_authorise", either)
+
+    elif mode == "query_credential_served":
+        # A credential in a URL is accepted, and the request is served -- so a
+        # working integration publishes its own token on every call, into every
+        # access log it passes through.
+        monkeypatch.setattr(
+            service_module._Handler, "_credential_in_query", lambda self, query: False
+        )
+
+    elif mode == "ticket_on_the_pending_event":
+        # The reference on the READ contract and in the platform's append-only
+        # `events` table: the one identity nothing could ever redact.
+        original = LaneController.begin_transit
+
+        def loud(self, identity, at):
+            original(self, identity, at)
+            if identity.ticket_ref:
+                self.events.record(
+                    "entry_pending", self.config.lane_id, ticket_ref=identity.ticket_ref, at=at
+                )
+
+        monkeypatch.setattr(LaneController, "begin_transit", loud)
+
+    elif mode == "ticket_in_a_log_line":
+        # The same exposure through the other door, and the one the payload
+        # sweep cannot see.
+        original = LaneController.complete_vend
+
+        def chatty(self, identity, *, authorised_by, assisted):
+            controller_module.log.warning("completing ticket %s", identity.ticket_ref)
+            return original(self, identity, authorised_by=authorised_by, assisted=assisted)
+
+        monkeypatch.setattr(LaneController, "complete_vend", chatty)
+
+    elif mode == "identifier_ticket_kept":
+        # The seam stops stripping a ticket an IDENTIFIER supplied, so a
+        # third-party identifier mints a parking identity through the interface
+        # that exists to report what a camera saw.
+        monkeypatch.setattr(controller_module, "replace", lambda identity, **kwargs: identity)
+
+    elif mode == "vend_says_opened":
+        # The answer claims the barrier opened. Nothing in this system measures
+        # the boom, and this lane's own health surface says so one route away.
+        from lane_controller.contract import VendCommanded
+
+        original = VendCommanded.to_dict
+        monkeypatch.setattr(
+            VendCommanded, "to_dict", lambda self: {**original(self), "opened": True}
+        )
+
+    elif mode == "ticket_shape_unchecked":
+        # Any string at all is a ticket. The value is a lookup key that is
+        # echoed into a platform's responses and read out over a telephone.
+        monkeypatch.setattr(vend_module, "is_ticket_ref", lambda value: isinstance(value, str))
+
+    elif mode == "plate_asserted_by_a_caller":
+        # The identity kinds open up, so a caller may hand this lane a PLATE --
+        # a measurement it did not make, on the record that prices the stay.
+        monkeypatch.setattr(vend_module, "VEND_IDENTITY_KINDS", ("ticket", "plate"))
+
+    elif mode == "no_flush_after_the_vend":
+        # THE RECORD NEVER LEAVES THE BOX. The order is still right, the
+        # identity is still written before the relay, and the platform holds
+        # nothing about any of it until some later ordinary arrival flushes --
+        # which at a lane using the intercom may never come, and a restart
+        # before it loses the record entirely.
+        from lane_controller.events import EventQueue
+
+        original_complete = LaneController.complete_vend
+        original_flush = EventQueue.flush
+
+        def unflushed(self, identity, *, authorised_by, assisted):
+            monkeypatch.setattr(EventQueue, "flush", lambda self: 0)
+            try:
+                return original_complete(
+                    self, identity, authorised_by=authorised_by, assisted=assisted
+                )
+            finally:
+                monkeypatch.setattr(EventQueue, "flush", original_flush)
+
+        monkeypatch.setattr(LaneController, "complete_vend", unflushed)
+
+    elif mode == "decision_not_consumed":
+        # THE DECISION IS NOT CONSUMED. One arrival, any number of completions:
+        # two idempotency keys, two relay pulses, two tickets, TWO BILLABLE
+        # STAYS for one car. Every other refusal passes -- the car is on the
+        # loop, the decision is seconds old, the outcome is `fallback`.
+        original_complete = LaneController.complete_vend
+
+        def unconsumed(self, identity, *, authorised_by, assisted):
+            at = original_complete(self, identity, authorised_by=authorised_by, assisted=assisted)
+            self.last_decision_completed_at = None
+            return at
+
+        monkeypatch.setattr(LaneController, "complete_vend", unconsumed)
+
+    elif mode == "compare_digest_on_str":
+        # The comparison goes back to `str`. `hmac.compare_digest` raises on a
+        # non-ASCII one, and the query check is the first thing every request
+        # reaches -- so an unauthenticated caller gets a dropped connection and
+        # an unhandled traceback instead of the named 401.
+        import hmac
+
+        monkeypatch.setattr(
+            service_module, "_same", lambda a, b: hmac.compare_digest(a, b)
+        )
+
+    elif mode == "key_recorded_on_the_event":
+        # The caller's raw `Idempotency-Key` goes back onto `assisted_identity`,
+        # which reaches `GET /v1/lane/events` and the platform's append-only
+        # `events` table. Whatever a caller wrote there could never be removed.
+        original_accept = AssistedVend._accept
+
+        def with_the_key(self, request):
+            original_record = LaneController.complete_vend
+
+            def recording(controller, identity, *, authorised_by, assisted):
+                assisted = {**assisted, "idempotency_key": request.idempotency_key}
+                return original_record(
+                    controller, identity, authorised_by=authorised_by, assisted=assisted
+                )
+
+            monkeypatch.setattr(LaneController, "complete_vend", recording)
+            try:
+                return original_accept(self, request)
+            finally:
+                monkeypatch.setattr(LaneController, "complete_vend", original_record)
+
+        monkeypatch.setattr(AssistedVend, "_accept", with_the_key)
+
+    elif mode == "no_settle_deadline":
+        # The settle waits on the loop driver for ever again. A driver that does
+        # not return leaves the lane refusing every assisted vend `busy` until a
+        # restart, with `transit` reading `pending` -- which is also what a
+        # legitimate in-window transit reads.
+        def unbounded(self, identity, at):
+            controller = self._service.controller
+            try:
+                controller.resolve_transit(identity, at)
+            finally:
+                with self._state:
+                    self._in_progress = False
+
+        assert hasattr(AssistedVend, "_settle"), "the settle break's anchor has moved"
+        monkeypatch.setattr(AssistedVend, "_settle", unbounded)
+
+    elif mode == "subset_widened_to_all_codes":
+        # Refusal 2 goes back to refusing on every measured code. The lane then
+        # refuses the driver whose reading failed BECAUSE the thing that failed
+        # to read them is broken -- the module refusing the case it exists for.
+        from lane_controller.contract import MalfunctionCode
+
+        monkeypatch.setattr(vend_module, "VEND_BLOCKING", tuple(MalfunctionCode))
+
+    elif mode == "no_arming_dwell_measure":
+        # The dwell is never measured, so `arming_loop_stuck_occupied` can never
+        # be `active` and a lane whose arming loops are stuck accepts every
+        # assisted vend with nothing in front of the barrier.
+        assert hasattr(LaneController, "observe_arming_loop"), "the dwell break's anchor has moved"
+        monkeypatch.setattr(LaneController, "observe_arming_loop", lambda self: None)
+
+    elif mode == "finite_check_removed":
+        # The duration validator goes back to testing one side of zero. `nan`
+        # and `inf` are TOML float literals, `nan <= 0` is False, and
+        # `x > nan` is False for every x -- so `completion_max_age_s = nan` is a
+        # well-formed configuration file with no staleness refusal in it.
+        from lane_controller import config as config_module
+
+        def unchecked(value, name):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"{name} must be a positive number of seconds, got {value!r}")
+
+        monkeypatch.setattr(config_module, "positive_finite", unchecked)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_VEND mode: {mode}")

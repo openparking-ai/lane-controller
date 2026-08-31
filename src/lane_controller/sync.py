@@ -60,6 +60,12 @@ REASON_REVERSE = "closing_sequence_reverse"
 REASON_WINDOW_ELAPSED = "confirmation_window_elapsed"
 REASON_NO_CLOSING_LOOPS = "no_closing_loops_configured"
 REASON_ARMING_INCOMPLETE = "only_one_arming_loop_occupied"
+#: The closing-loop driver did not return inside the lane's own settle deadline
+#: -- the confirmation window plus `[lane] settle_grace_s`. NOT the same fact as
+#: `confirmation_window_elapsed`, which is the loops answering that nothing
+#: crossed: this is the loops not answering at all, and the two want different
+#: repairs.
+REASON_LOOP_DRIVER_TIMEOUT = "loop_driver_timeout"
 
 #: What the platform is told confirmed a session. `confirmed` means two loops
 #: after the gate saw a vehicle cross them forward. `unconfirmable` means this
@@ -218,7 +224,13 @@ class PlatformTransport(EventTransport):
         declared = event.detail["entry_confirmation"]
         result = self._client.open_session(
             event_id=event.event_id,
-            plate=event.detail["plate"],
+            # EXACTLY ONE of the two, and which one is decided where the record
+            # was written -- `LaneController._identity_detail` -- not here. A
+            # `.get` on both rather than a `[...]` on the plate: a stay opened
+            # on a ticket carries no plate key at all, and a KeyError on this
+            # path would kill the flush after the barrier had already opened.
+            plate=event.detail.get("plate"),
+            ticket_ref=event.detail.get("ticket_ref"),
             entry_at=event.detail.get("at") or to_iso(event.at),
             plate_region=event.detail.get("plate_region"),
             entry_confirmation=declared,
@@ -243,7 +255,8 @@ class PlatformTransport(EventTransport):
         declared = event.detail["exit_confirmation"]
         result = self._client.close_session(
             event_id=event.event_id,
-            plate=event.detail["plate"],
+            plate=event.detail.get("plate"),
+            ticket_ref=event.detail.get("ticket_ref"),
             exit_at=event.detail.get("at") or to_iso(event.at),
             # Recorded at the moment of the exit, when it was still unambiguous
             # which session was open. By the time a queued close is delivered it

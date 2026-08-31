@@ -25,9 +25,9 @@ and then fail to fail under every break, which is what control B reports.
 
 from __future__ import annotations
 
-import os
-import subprocess
 import sys
+
+from _control import intact, judge, run
 
 SUITE = ["-q", "tests/test_loops.py"]
 BREAKAGES = [
@@ -39,43 +39,17 @@ BREAKAGES = [
 ]
 
 
-def run(env_extra: dict[str, str]) -> subprocess.CompletedProcess:
-    env = {**os.environ, **env_extra}
-    return subprocess.run(
-        [sys.executable, "-m", "pytest", *SUITE], env=env, capture_output=True, text=True
-    )
-
-
-def tail(result: subprocess.CompletedProcess, lines: int = 1) -> str:
-    body = [line for line in result.stdout.strip().splitlines() if line.strip()]
-    return " | ".join(body[-lines:]) if body else "(no output)"
-
-
 failures = 0
 
 print("== control A: the loop suite must PASS intact ==")
-intact = run({"BREAK_CONFIRMATION": ""})
-if intact.returncode == 0:
-    print(f"  control A OK — {tail(intact)}")
-else:
-    print(
-        f"  CONTROL A FAILED — the suite does not pass even intact: {tail(intact)}", file=sys.stderr
-    )
-    print(intact.stdout, file=sys.stderr)
+collected, _ = intact(SUITE, {"BREAK_CONFIRMATION": ""})
+if collected < 0:
     failures += 1
 
 print("\n== control B: each breakage must make it FAIL ==")
 for mode, description in BREAKAGES:
-    broken = run({"BREAK_CONFIRMATION": mode})
-    if broken.returncode == 0:
-        print(
-            f"  {mode:9} *** PASSED WITH {description.upper()} —"
-            " the suite is not measuring this ***",
-            file=sys.stderr,
-        )
+    if not judge(mode, description, collected, run(SUITE, {"BREAK_CONFIRMATION": mode})):
         failures += 1
-    else:
-        print(f"  {mode:9} fails as required when {description} — {tail(broken)}")
 
 if failures:
     print(f"\n{failures} control(s) failed. Do not trust the confirmation tests.", file=sys.stderr)
