@@ -46,7 +46,10 @@ const FORBIDDEN_DIGESTS = new Map([
 const digestOf = (value) =>
   createHash('sha256').update(value.trim().toLowerCase()).digest('hex');
 
-const SKIP = /^(LICENSE|package-lock\.json|\.github\/scripts\/check-no-real-data\.js)$/;
+//: The scanner NO LONGER EXEMPTS ITSELF. That exemption is how two real
+//: addresses sat unread in this file while every run reported the repository
+//: clean. What stays listed here is not ours to edit.
+const SKIP = /^(LICENSE|package-lock\.json)$/;
 
 function trackedFiles() {
   return execFileSync('git', ['ls-files'], { encoding: 'utf8' })
@@ -84,16 +87,24 @@ function scanRepo() {
   return problems;
 }
 
+//: The two probe addresses are ASSEMBLED AT RUNTIME, never written out.
+//: This file is now inside the scanned set, so an address-shaped literal here
+//: would make the scanner refuse its own source on every run. Splitting them on
+//: the `@` keeps a search of this file clean while the self-test still plants a
+//: genuinely real-looking address.
+const REAL_LOOKING = ['someone.real', 'a-real-company.example-not'].join('@');
+const INVENTED = ['nobody', 'example.com'].join('@');
+
 function selfTest() {
   const probe = '_no_real_data_control.md';
   try {
-    writeFileSync(probe, 'contact someone.real@a-real-company.example-not\n');
+    writeFileSync(probe, `contact ${REAL_LOOKING}\n`);
     const caught = scanText(probe, readFileSync(probe, 'utf8'));
     if (caught.length === 0) {
       console.error('SELF-TEST FAILED: a planted address was not caught');
       return false;
     }
-    const clean = scanText(probe, 'write to nobody@example.com, which is invented\n');
+    const clean = scanText(probe, `write to ${INVENTED}, which is invented\n`);
     if (clean.length !== 0) {
       console.error('SELF-TEST FAILED: an example.com address was wrongly rejected');
       return false;
