@@ -361,11 +361,13 @@ class PollThatStartsAVend(ClosingLoops):
 
 
 def test_a_vends_read_never_overlaps_a_polls_read_in_flight():
-    """The check and the read are ONE moment, and a vend that begins inside a
-    poll's read waits for that read to finish -- microseconds, by the seam's
-    own promise -- rather than reading the same board at the same time. Two
-    overlapping driver calls on one board give one crossing to whichever
-    wins, and the first count-only design measured 3 of 200 lost that way."""
+    """The count check and the read are ONE moment, and a vend's READ that
+    begins inside a poll's read waits for that read to finish -- microseconds,
+    by the seam's own promise -- rather than reading the same board at the same
+    time. Two overlapping driver calls on one board give one crossing to
+    whichever wins, and the first count-only design measured 3 of 200 lost that
+    way. (A vend that BEGINS inside a poll's check is the straddle test below;
+    this one is about the read.)"""
     ref: dict = {}
     board = PollThatStartsAVend(ref)
     controller, _, _ = build(arrivals=0, loops_impl=board)
@@ -380,6 +382,105 @@ def test_a_vends_read_never_overlaps_a_polls_read_in_flight():
     )
     assert controller.transit_state == TransitState.CONFIRMED.value
     assert ENTRY_UNADMITTED not in kinds(controller)
+
+
+class BoardWithOneCar(ClosingLoops):
+    """A board a test can put one crossing on, at the moment it chooses. The
+    blocking read finds it or times out; the idle read pops it or finds none."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.crossings: list[ClosingSequence] = []
+        self.polls = 0
+        self.poll_hits = 0
+
+    def cross(self) -> None:
+        with self.lock:
+            self.crossings.append(ClosingSequence.FORWARD)
+
+    def wait_for_sequence(self, window_seconds: float) -> ClosingSequence:
+        deadline = time.monotonic() + window_seconds
+        while time.monotonic() < deadline:
+            with self.lock:
+                if self.crossings:
+                    return self.crossings.pop(0)
+            time.sleep(0.001)
+        return ClosingSequence.NONE
+
+    def poll_sequence(self) -> ClosingSequence:
+        with self.lock:
+            self.polls += 1
+            if self.crossings:
+                self.poll_hits += 1
+                return self.crossings.pop(0)
+            return ClosingSequence.NONE
+
+
+def test_a_vend_that_begins_while_the_poll_is_inside_its_check_waits_for_the_read(monkeypatch):
+    """THE STRADDLE. The poll has answered "nothing pending" and has not yet
+    read the board; a vend begins now. Two moments here is a car admitted and
+    then written down as one nothing admitted: the poll's read, still to come,
+    takes the crossing the vend's own read is waiting for -- measured 26 to 42
+    of 200 when the check sat outside the lock. One critical section is the
+    fix, and this holds the poll inside it to prove the beginning vend waits.
+
+    Two independent assertions, each red on its own when either half of the
+    fix is reverted: `begin_transit` must still be waiting while the poll is
+    held mid-check, and the crossing that follows the vend must be the vend's.
+    """
+    board = BoardWithOneCar()
+    controller, _, _ = build(arrivals=0, loops_impl=board)
+    at = to_iso(controller.now())
+    parked = threading.Event()
+    release = threading.Event()
+    arm = {"on": True}
+    checks_pending = LaneController._nothing_pending
+
+    def check_and_park(self):
+        answer = checks_pending(self)
+        if answer and arm["on"]:
+            arm["on"] = False
+            parked.set()
+            release.wait(timeout=5)  # a poll held between its check and its read
+        return answer
+
+    monkeypatch.setattr(LaneController, "_nothing_pending", check_and_park)
+
+    poll = threading.Thread(target=controller.run_once, kwargs={"timeout": 0}, daemon=True)
+    poll.start()
+    assert parked.wait(timeout=5), "the idle poll never reached its check"
+
+    vend = threading.Thread(target=controller.begin_transit, args=(ALLOWED, at), daemon=True)
+    vend.start()
+    vend.join(timeout=0.3)
+    assert vend.is_alive(), (
+        "a vend BEGAN while the poll was between its check and its read: "
+        "the pending state was published outside the poll's critical section"
+    )
+    assert controller.transit_state != TransitState.PENDING.value
+
+    # The car crosses once the vend has begun -- never before the barrier was
+    # commanded -- and the poll is released. Whichever order the lock allows,
+    # the crossing must be the vend's.
+    def cross_after_the_vend_begins():
+        vend.join(timeout=5)
+        board.cross()
+
+    car = threading.Thread(target=cross_after_the_vend_begins, daemon=True)
+    car.start()
+    release.set()
+    poll.join(timeout=5)
+    car.join(timeout=5)
+    assert not poll.is_alive() and not vend.is_alive() and not car.is_alive()
+    assert controller.transit_state == TransitState.PENDING.value
+
+    controller.resolve_transit(ALLOWED, at)
+    assert board.poll_hits == 0, "the idle poll took the crossing of a vend that had begun"
+    assert controller.transit_state == TransitState.CONFIRMED.value
+    assert ENTRY_UNADMITTED not in kinds(controller), (
+        "a car the lane admitted was recorded as one nothing admitted"
+    )
+    assert ENTRY_CONFIRMED in kinds(controller)
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,14 @@ what the idle read writes -- and never on the fixture that drives it.
             read, so one hung loop driver leaves every later vend unconfirmable
             and the next ordinary arrival's `run_once` hung -- the defect the
             gate of 2026-09-19 found
+  unlocked_transit
+            the transit state is published outside the board lock again, so a
+            vend can begin between the poll's pending check and its read
+  split_check
+            the pending check is taken outside the board lock and the read
+            inside it: two moments -- the defect the re-gate of 2026-09-19
+            found. Either half reverted, the poll takes the crossing of a car
+            the lane admitted and writes it down as one nothing admitted
   reason    an ordinary promotion is answered with the new reason
   folded    the new case is recorded under `entry_confirmed`, so a broken boom
             reads as business as usual
@@ -42,6 +50,8 @@ BREAKAGES = [
     ("outstanding", "the idle read ignores an outstanding read of the loops"),
     ("overlap", "a vend's read overlaps a poll's read in flight"),
     ("starve", "a settle's read waits behind an abandoned one"),
+    ("unlocked_transit", "the transit state is published outside the board lock"),
+    ("split_check", "the pending check and the read are two moments"),
     ("reason", "a promotion carries the unadmitted reason"),
     ("folded", "the new case is recorded as entry_confirmed"),
     ("bypass", "the idle read does not flush"),

@@ -147,9 +147,12 @@ class ClosingLoops(Protocol):
 
         Never blocks -- and the controller leans on that: a vend's read that
         begins while this call is in flight waits for it to return before
-        asking the board, so the two reads never overlap. A `poll_sequence`
-        that blocked would hold the vend's read for exactly as long, and it
-        would hold `run_once` too, since that is the thread it runs on.
+        asking the board, so the two reads never overlap, and a vend that
+        begins while this call is in flight waits for it before its pending
+        entry is published, so this call never reads a board a beginning vend
+        has a car on. A `poll_sequence` that blocked would hold both for
+        exactly as long, and it would hold `run_once` too, since that is the
+        thread it runs on.
         Returns the sequence the loops completed since they were last read by
         EITHER call, and consumes it: a crossing is reported once, by whichever
         read asked first. No window applies here -- there is

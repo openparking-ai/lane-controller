@@ -210,8 +210,9 @@ def _break_the_confirmation(monkeypatch):
 #
 # scripts/unadmitted_fail_control.py sets BREAK_UNADMITTED and requires
 # tests/test_unadmitted.py to FAIL. Each mode breaks one decision point in the
-# controller -- a gate on the idle read, a name, a reason, the flush, or what
-# the idle read writes -- and never the fixture that drives it.
+# controller -- a gate on the idle read, the lock a gate is taken under, a
+# name, a reason, the flush, or what the idle read writes -- and never the
+# fixture that drives it.
 # ---------------------------------------------------------------------------
 
 
@@ -286,6 +287,41 @@ def _break_the_unadmitted_entry(monkeypatch):
             self._board = _Yes()
 
         monkeypatch.setattr(LaneController, "__init__", init_with_a_board_lock_that_always_opens)
+
+    elif mode == "unlocked_transit":
+        # HALF OF THE STRADDLE FIX REVERTED: the transit state is published
+        # outside `_board` again. The poll's "nothing pending" check is still
+        # taken under the lock, but a vend can now begin between that check
+        # and the poll's read, and the crossing that follows the vend is read
+        # by the poll -- a car admitted, recorded as one nothing admitted.
+        assert hasattr(LaneController, "_transit"), "the transit publisher's anchor has moved"
+
+        def publish_outside_the_lock(self, state, at):
+            self.transit_state = state.value
+            self.transit_since = at
+
+        monkeypatch.setattr(LaneController, "_transit", publish_outside_the_lock)
+
+    elif mode == "split_check":
+        # THE OTHER HALF REVERTED: the "nothing pending" check is taken OUTSIDE
+        # `_board` and the read inside it -- two moments, the shape the re-gate
+        # of 2026-09-19 blocked. `_transit` still publishes under the lock, and
+        # it does not help: the check is stale by the time the board is read.
+        assert hasattr(LaneController, "observe_closing_loops"), "the poll's anchor has moved"
+        original_poll = LaneController.observe_closing_loops
+
+        def check_outside_then_read(self):
+            if self.closing_loops is None:
+                return None
+            if not LaneController._nothing_pending(self):  # outside the lock
+                return None
+            self._nothing_pending = lambda: True  # the check under the lock is now a formality
+            try:
+                return original_poll(self)
+            finally:
+                del self._nothing_pending
+
+        monkeypatch.setattr(LaneController, "observe_closing_loops", check_outside_then_read)
 
     elif mode == "reason":
         # An ordinary promotion is answered with the new reason: the record
