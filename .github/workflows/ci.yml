@@ -70,6 +70,15 @@ jobs:
         # fail under every break, and this reports that.
         run: python scripts/confirmation_fail_control.py
 
+      - name: Unadmitted-entry fail-control
+        # Breaks the entry-nothing-admitted guarantees on purpose -- the two
+        # gates on the idle read of the loops after the gate, the name, the
+        # reason, the flush, and a session opened on no identity -- and
+        # requires tests/test_unadmitted.py to fail each time. A crossing
+        # with no vend behind it was in no record until this round; this is
+        # what keeps it in one.
+        run: python scripts/unadmitted_fail_control.py
+
       - name: Lane-contract fail-control
         # Breaks each property the read contract exists to have -- the geometry
         # it publishes, the completeness of the health table, `unknown` not

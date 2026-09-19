@@ -128,6 +128,32 @@ class ClosingLoops(Protocol):
         than the window -- the window is what makes the confirmation mean "a
         vehicle went through in a plausible time" rather than "something
         happened here eventually".
+
+        This is the read a VEND makes: something is pending and the loops are
+        asked what became of it. It is the only blocking read.
+        """
+        ...
+
+    def poll_sequence(self) -> ClosingSequence:
+        """Report a completed crossing without waiting, or NONE if there is none.
+
+        THE READ NOBODY MADE. `wait_for_sequence` is called after a vend, so a
+        crossing with no vend behind it -- a car the lane refused and that
+        drove in anyway, a car following the one that was admitted, a car
+        going through a barrier that is simply up -- was never read at all,
+        and a vehicle that is inside was in no record. The controller makes
+        this call on every poll of the arming loop while nothing is pending,
+        and records what it finds as an entry nothing admitted.
+
+        Never blocks. Returns the sequence the loops completed since they were
+        last read by EITHER call, and consumes it: a crossing is reported once,
+        by whichever read asked first. No window applies here -- there is
+        nothing to confirm inside one -- so a slow crossing that has finished
+        is still a crossing, and the controller records it as such.
+
+        Every implementation, simulated or real, supplies this;
+        `tests/test_unadmitted.py` walks the implementations and refuses one
+        that leaves it to the protocol.
         """
         ...
 

@@ -314,6 +314,10 @@ class LateForwardLoops(ClosingLoops):
         self._clock.advance(self._took)
         return ClosingSequence.FORWARD
 
+    def poll_sequence(self) -> ClosingSequence:
+        # Nothing idle here: this fixture exists for the blocking read.
+        return ClosingSequence.NONE
+
 
 def test_a_forward_reported_after_the_window_is_held_not_confirmed():
     """The window is applied by the CONTROLLER, not trusted to the loops.

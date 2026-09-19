@@ -206,6 +206,112 @@ def _break_the_confirmation(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Deliberate breakage, for the unadmitted-entry fail-control.
+#
+# scripts/unadmitted_fail_control.py sets BREAK_UNADMITTED and requires
+# tests/test_unadmitted.py to FAIL. Each mode breaks one decision point in the
+# controller -- a gate on the idle read, a name, a reason, the flush, or what
+# the idle read writes -- and never the fixture that drives it.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_unadmitted_entry(monkeypatch):
+    mode = os.environ.get("BREAK_UNADMITTED")
+    if not mode:
+        return
+
+    from lane_controller import controller as controller_module
+    from lane_controller.controller import LaneController
+    from lane_controller.sync import (
+        CONFIRMED,
+        ENTRY_CONFIRMED,
+        ENTRY_UNADMITTED,
+        REASON_NO_PENDING_ENTRY,
+        SESSION_OPEN,
+    )
+
+    if mode == "pending":
+        # The idle read no longer stands down while a vend is pending, so the
+        # crossing that arrives between `begin_transit` and the settle's read
+        # is recorded as unadmitted -- and then the settle, reading the same
+        # loops, gets nothing and holds an entry for a car that went through.
+        assert hasattr(LaneController, "_nothing_pending"), "the pending gate's anchor has moved"
+        monkeypatch.setattr(LaneController, "_nothing_pending", lambda self: True)
+
+    elif mode == "lock":
+        # The idle read no longer stands down while a settle holds the loops:
+        # two readers of one board. The lock is swapped for one that always
+        # says yes, at construction, so both the settle's `with` and the
+        # poll's `acquire(blocking=False)` go through it.
+        class _Yes:
+            def acquire(self, blocking=True):
+                return True
+
+            def release(self):
+                return None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        original_init = LaneController.__init__
+
+        def init_with_a_lock_that_always_opens(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            assert hasattr(self, "_loops_read"), "the reader lock's anchor has moved"
+            self._loops_read = _Yes()
+
+        monkeypatch.setattr(LaneController, "__init__", init_with_a_lock_that_always_opens)
+
+    elif mode == "reason":
+        # An ordinary promotion is answered with the new reason: the record
+        # of a vend's car going through says a car went through that no vend
+        # let in.
+        monkeypatch.setattr(controller_module, "REASON_FORWARD", REASON_NO_PENDING_ENTRY)
+
+    elif mode == "folded":
+        # The new case is recorded under the ordinary name. A stream of
+        # `entry_confirmed` with no vend behind any of them is a broken boom
+        # that looks like business as usual.
+        monkeypatch.setattr(controller_module, "ENTRY_UNADMITTED", ENTRY_CONFIRMED)
+
+    elif mode == "bypass":
+        # The idle read records and does not flush, which every other path
+        # that writes a record does. The record sits on a box whose next
+        # arrival may never vend.
+        assert hasattr(LaneController, "_unadmitted_leaves_the_box"), (
+            "the flush seam's anchor has moved"
+        )
+        monkeypatch.setattr(LaneController, "_unadmitted_leaves_the_box", lambda self: None)
+
+    elif mode == "session":
+        # The idle read opens a session: the phantom occupant, with no
+        # identity, wearing a different hat.
+        original = LaneController.observe_closing_loops
+
+        def observe_and_open(self):
+            recorded = original(self)
+            if recorded == ENTRY_UNADMITTED:
+                self.events.record(
+                    SESSION_OPEN,
+                    self.config.lane_id,
+                    plate=None,
+                    identity_kind="plate",
+                    at=None,
+                    entry_confirmation=CONFIRMED,
+                )
+            return recorded
+
+        monkeypatch.setattr(LaneController, "observe_closing_loops", observe_and_open)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_UNADMITTED mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
 # Deliberate breakage, for the fallback-cause fail-control.
 #
 # scripts/fallback_cause_fail_control.py sets BREAK_FALLBACK_CAUSE and requires
