@@ -45,6 +45,20 @@ ENTRY_CONFIRMED = "entry_confirmed"
 ENTRY_BACKED_OUT = "entry_backed_out"
 ENTRY_HELD = "entry_held"
 ENTRY_UNCONFIRMABLE = "entry_unconfirmable"
+#: A crossing with NO pending entry behind it: the loops after the gate saw a
+#: vehicle go through and no vend preceded it. A car the lane refused that
+#: drove in anyway, a car following the one admitted, a car going through a
+#: barrier that is simply up -- the lane cannot tell which, and says so in the
+#: detail rather than guessing. It is an ENTRY because a vehicle is inside; it
+#: is a DIFFERENT entry because nothing admitted it, and it is never folded
+#: into `entry_confirmed`, which had a vend behind it. It opens no session and
+#: moves no `TransitState`: that enum says what became of the last VEND, and
+#: this had none.
+#:
+#: THE SAME LITERAL as `platform/src/app.js` `LANE_EVENT_KINDS`, which must
+#: accept a kind before a lane may emit it -- a lane ahead of its platform is
+#: refused 400. Nothing in either CI compares the two lists.
+ENTRY_UNADMITTED = "entry_unadmitted"
 
 EXIT_PENDING = "exit_pending"
 EXIT_CONFIRMED = "exit_confirmed"
@@ -66,6 +80,10 @@ REASON_ARMING_INCOMPLETE = "only_one_arming_loop_occupied"
 #: crossed: this is the loops not answering at all, and the two want different
 #: repairs.
 REASON_LOOP_DRIVER_TIMEOUT = "loop_driver_timeout"
+#: The loops after the gate completed a crossing and nothing was pending. Its
+#: own reason, never `closing_sequence_forward`: that one says a vend's car
+#: went through, and this says a car went through that no vend let in.
+REASON_NO_PENDING_ENTRY = "crossing_with_no_pending_entry"
 
 #: What the platform is told confirmed a session. `confirmed` means two loops
 #: after the gate saw a vehicle cross them forward. `unconfirmable` means this

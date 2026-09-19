@@ -160,6 +160,13 @@ class ScriptedClosingLoops(ClosingLoops):
     A crossing that takes longer than the window is not reported as a crossing.
     Real loops would still be waiting when the window expired, and the whole
     meaning of the window is "a vehicle went through in a plausible time".
+
+    ONE SCRIPT, TWO READERS. The script is what physically happens at the
+    loops, in order, and whichever read asks first gets the next crossing --
+    the blocking read a vend makes, or the idle poll the controller makes when
+    nothing is pending. A crossing scripted after a car the lane refused is
+    therefore sitting there unread until something polls, which is exactly the
+    gap `poll_sequence` exists to close, and `unread` says how many are.
     """
 
     def __init__(self, crossings: Sequence[tuple[ClosingSequence, float]] | None = None) -> None:
@@ -179,3 +186,16 @@ class ScriptedClosingLoops(ClosingLoops):
         if took_seconds > window_seconds:
             return ClosingSequence.NONE
         return sequence
+
+    def poll_sequence(self) -> ClosingSequence:
+        """The next scripted crossing, or NONE. No window: nothing is being confirmed."""
+        if self._index >= len(self._crossings):
+            return ClosingSequence.NONE
+        sequence, _took_seconds = self._crossings[self._index]
+        self._index += 1
+        return sequence
+
+    @property
+    def unread(self) -> int:
+        """How many scripted crossings nothing has read yet."""
+        return len(self._crossings) - self._index

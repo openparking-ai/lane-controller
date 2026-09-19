@@ -12,6 +12,9 @@ arming loops ─▶ grab frames ─▶ identify ─▶ decide ─▶ vend ─▶
                                              │                    ├─▶ B→A  backed out → nothing
                                              │                    └─▶ none held       → flagged
                                              └─▶ fallback (named, logged, never a guess)
+
+          (idle) ─────────────────────────────────────────────▶ closing loops
+                                                                    └─▶ A→B with nothing pending → entry_unadmitted
 ```
 
 **The ticket is not the entry.** A driver can pull up, take a ticket and drive
@@ -24,6 +27,17 @@ flagged — never voided silently, and never turned into a session.
 **It narrows the fraud rather than closing it**: a ticket with no car becomes a
 ticket with *a* car, because nothing here binds the crossing to the vehicle that
 took the ticket, and that binding is unbuilt.
+
+**A crossing with nothing pending is recorded too.** The three answers above are
+what becomes of a vend, and the loops after the barrier used to be read only
+after one — so a car the lane refused that drove in anyway, a car following the
+one admitted, and every car through a barrier that is simply up were in no
+record at all. The lane now polls those loops on every idle turn, and a forward
+crossing found with nothing pending is an `entry_unadmitted` event: an entry,
+because a vehicle is inside; a different one, because nothing admitted it. It
+opens no session, moves no transit state, and is never folded into
+`entry_confirmed`. A stream of them on `GET /v1/lane/events` is what a broken
+boom looks like from here; what broke it is not measured in this package.
 
 **An EXIT is the other way round.** The vend there is the payment moment and the
 barrier opened, so an exit the loops did not confirm still closes the session and

@@ -128,6 +128,44 @@ class ClosingLoops(Protocol):
         than the window -- the window is what makes the confirmation mean "a
         vehicle went through in a plausible time" rather than "something
         happened here eventually".
+
+        This is the read a VEND makes: something is pending and the loops are
+        asked what became of it. It is the only blocking read.
+        """
+        ...
+
+    def poll_sequence(self) -> ClosingSequence:
+        """Report a completed crossing without waiting, or NONE if there is none.
+
+        THE READ NOBODY MADE. `wait_for_sequence` is called after a vend, so a
+        crossing with no vend behind it -- a car the lane refused and that
+        drove in anyway, a car following the one that was admitted, a car
+        going through a barrier that is simply up -- was never read at all,
+        and a vehicle that is inside was in no record. The controller makes
+        this call on every poll of the arming loop while nothing is pending
+        and no vend's read of these loops is outstanding, and records what it
+        finds as an entry nothing admitted.
+
+        Never blocks -- and the controller leans on that: a vend's read that
+        begins while this call is in flight waits for it to return before
+        asking the board, so the two reads never overlap, and a vend that
+        begins while this call is in flight waits for it before its pending
+        entry is published, so this call is never made once a pending entry
+        is published. What that does NOT cover: the relay is pulsed before
+        the pending entry is published, so a crossing that completes in that
+        gap is this call's, not the vend's -- stated, with what the lock proves
+        and what it does not, at `LaneController._reads_outstanding`. A
+        `poll_sequence` that blocked would hold both for exactly as long, and
+        it would hold `run_once` too, since that is the thread it runs on.
+        Returns the sequence the loops completed since they were last read by
+        EITHER call, and consumes it: a crossing is reported once, by whichever
+        read asked first. No window applies here -- there is
+        nothing to confirm inside one -- so a slow crossing that has finished
+        is still a crossing, and the controller records it as such.
+
+        Every implementation, simulated or real, supplies this;
+        `tests/test_unadmitted.py` walks the implementations and refuses one
+        that leaves it to the protocol.
         """
         ...
 
