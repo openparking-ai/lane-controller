@@ -142,17 +142,21 @@ class ClosingLoops(Protocol):
         drove in anyway, a car following the one that was admitted, a car
         going through a barrier that is simply up -- was never read at all,
         and a vehicle that is inside was in no record. The controller makes
-        this call on every poll of the arming loop while nothing is pending,
-        and records what it finds as an entry nothing admitted.
+        this call on every poll of the arming loop while nothing is pending
+        and no vend's read of these loops is outstanding, and records what it
+        finds as an entry nothing admitted.
 
         Never blocks -- and the controller leans on that: a vend's read that
         begins while this call is in flight waits for it to return before
         asking the board, so the two reads never overlap, and a vend that
         begins while this call is in flight waits for it before its pending
-        entry is published, so this call never reads a board a beginning vend
-        has a car on. A `poll_sequence` that blocked would hold both for
-        exactly as long, and it would hold `run_once` too, since that is the
-        thread it runs on.
+        entry is published, so this call is never made once a pending entry
+        is published. What that does NOT cover: the relay is pulsed before
+        the pending entry is published, so a crossing that completes in that
+        gap is this call's, not the vend's -- stated, with what the lock proves
+        and what it does not, at `LaneController._reads_outstanding`. A
+        `poll_sequence` that blocked would hold both for exactly as long, and
+        it would hold `run_once` too, since that is the thread it runs on.
         Returns the sequence the loops completed since they were last read by
         EITHER call, and consumes it: a crossing is reported once, by whichever
         read asked first. No window applies here -- there is
