@@ -26,6 +26,11 @@ what the idle read writes -- and never on the fixture that drives it.
             inside it: two moments -- the defect the re-gate of 2026-09-19
             found. Either half reverted, the poll takes the crossing of a car
             the lane admitted and writes it down as one nothing admitted
+  route_waits
+            the poll's read is taken under the board lock again, so a poll
+            driver that hangs holds PENDING's publication and with it the vend
+            route, after the relay has pulsed -- the defect the outside review
+            of 2026-09-19 measured
   reason    an ordinary promotion is answered with the new reason
   folded    the new case is recorded under `entry_confirmed`, so a broken boom
             reads as business as usual
@@ -52,6 +57,7 @@ BREAKAGES = [
     ("starve", "a settle's read waits behind an abandoned one"),
     ("unlocked_transit", "the transit state is published outside the board lock"),
     ("split_check", "the pending check and the read are two moments"),
+    ("route_waits", "the vend route waits on the poll's read"),
     ("reason", "a promotion carries the unadmitted reason"),
     ("folded", "the new case is recorded as entry_confirmed"),
     ("bypass", "the idle read does not flush"),

@@ -15,9 +15,12 @@ that moved is one this change names. `tests/test_transit_matrix.py` pins it.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
+import urllib.error
+import urllib.request
 
 from lane_controller import (
     CameraConfig,
@@ -33,7 +36,7 @@ from lane_controller import (
 )
 from lane_controller.events import SESSION_KINDS, EventQueue
 from lane_controller.interfaces import ClosingLoops, ClosingSequence
-from lane_controller.service import LaneService
+from lane_controller.service import LaneService, make_server
 from lane_controller.simulated import (
     CannedCameraFeed,
     RecordingVendOutput,
@@ -50,6 +53,7 @@ from lane_controller.sync import (
     to_iso,
 )
 from lane_controller.vend import _Once
+from serving import serving
 
 WINDOW = 10.0
 
@@ -420,13 +424,17 @@ def test_a_vend_that_begins_while_the_poll_is_inside_its_check_waits_for_the_rea
     """THE STRADDLE. The poll has answered "nothing pending" and has not yet
     read the board; a vend begins now. Two moments here is a car admitted and
     then written down as one nothing admitted: the poll's read, still to come,
-    takes the crossing the vend's own read is waiting for -- measured 26 to 42
+    takes the crossing the vend's own read is waiting for -- measured 23 to 42
     of 200 when the check sat outside the lock. One critical section is the
-    fix, and this holds the poll inside it to prove the beginning vend waits.
+    fix, and this holds the poll inside it to prove the beginning vend waits
+    for the CLAIM -- not for the read, which is outside the lock and is the
+    route-never-waits test's business below.
 
     Two independent assertions, each red on its own when either half of the
     fix is reverted: `begin_transit` must still be waiting while the poll is
-    held mid-check, and the crossing that follows the vend must be the vend's.
+    held mid-check, and the crossing that follows the vend must be the vend's
+    -- either never seen by the poll, or seen and handed over, whichever way
+    the scheduler orders the poll's read and the car.
     """
     board = BoardWithOneCar()
     controller, _, _ = build(arrivals=0, loops_impl=board)
@@ -475,7 +483,9 @@ def test_a_vend_that_begins_while_the_poll_is_inside_its_check_waits_for_the_rea
     assert controller.transit_state == TransitState.PENDING.value
 
     controller.resolve_transit(ALLOWED, at)
-    assert board.poll_hits == 0, "the idle poll took the crossing of a vend that had begun"
+    assert board.poll_hits == controller._crossings_handed, (
+        "the idle poll took the crossing of a vend that had begun and kept it"
+    )
     assert controller.transit_state == TransitState.CONFIRMED.value
     assert ENTRY_UNADMITTED not in kinds(controller), (
         "a car the lane admitted was recorded as one nothing admitted"
@@ -491,7 +501,9 @@ def test_a_vend_that_begins_while_the_poll_is_inside_its_check_waits_for_the_rea
 UNREADABLE = VehicleIdentity(plate=None, confidence=0.10, presence=True)
 
 
-def a_lane_that_completes(*identities, window: float = 0.1, grace: float = 0.05):
+def a_lane_that_completes(
+    *identities, window: float = 0.1, grace: float = 0.05, loops_impl: ClosingLoops | None = None
+):
     """The assisted vend's lane: a fallback case held, `vend.py` reachable
     through `LaneService`, a settle bounded by a short window and grace."""
     config = LaneConfig(
@@ -512,7 +524,7 @@ def a_lane_that_completes(*identities, window: float = 0.1, grace: float = 0.05)
         camera=CannedCameraFeed(),
         vend=RecordingVendOutput(),
         identifier=StubVehicleIdentifier(list(identities) or [UNREADABLE]),
-        closing_loops=ScriptedClosingLoops([]),
+        closing_loops=loops_impl if loops_impl is not None else ScriptedClosingLoops([]),
         cache=cache,
     )
     controller.run_once()
@@ -644,6 +656,255 @@ def test_the_idle_read_stands_down_behind_an_abandoned_driver_and_only_that():
     assert controller._nothing_reading(), "the count did not come down when the driver returned"
     assert controller.run_once(timeout=0) is None
     assert polls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The vend route waits on no loop driver, in either direction.
+# ---------------------------------------------------------------------------
+
+READ_TOKEN = "read-token-aaaa"
+ACT_TOKEN = "act-token-bbbb"
+
+
+class PollThatHangs(ClosingLoops):
+    """A board whose idle read does not return until told to, and whose
+    blocking read answers at once: the poll driver hung, the settle driver
+    fine. The direction the outside review of 2026-09-19 measured."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.answer = ClosingSequence.NONE
+        self.blocking_reads = 0
+
+    def wait_for_sequence(self, window_seconds: float) -> ClosingSequence:
+        self.blocking_reads += 1
+        return ClosingSequence.FORWARD
+
+    def poll_sequence(self) -> ClosingSequence:
+        self.entered.set()
+        self.release.wait(timeout=10)
+        return self.answer
+
+
+def a_hung_poll(controller):
+    """One idle turn on its own thread -- the loop thread's shape -- parked
+    inside the poll driver, with the car still on the arming loop."""
+    controller.loop._remaining = 0
+    idle = threading.Thread(target=controller.run_once, kwargs={"timeout": 0}, daemon=True)
+    idle.start()
+    assert controller.closing_loops.entered.wait(timeout=5), (
+        "the idle poll never reached the driver"
+    )
+    # The simulated arming loop reads clear after an idle turn; the real car
+    # is still sitting on it while the loop thread is inside the driver.
+    controller.loop._occupied = True
+    return idle
+
+
+def post_vend(base, controller, key, *, timeout):
+    """`POST /v1/lane/vend` over the socket, exactly as the intercom sends it."""
+    payload = {
+        "authorised_by": "human_open_now",
+        "identity": {"kind": "ticket", "ticket_ref": "TKT-4RS9WQ2M"},
+        "decision_at": controller.last_decision_at,
+    }
+    request = urllib.request.Request(
+        f"{base}/v1/lane/vend",
+        data=json.dumps(payload).encode(),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {ACT_TOKEN}",
+            "Idempotency-Key": key,
+        },
+    )
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, json.loads(response.read() or b"{}"), time.monotonic() - started
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"{}"), time.monotonic() - started
+    except TimeoutError:
+        return None, {}, time.monotonic() - started
+
+
+def test_the_vend_route_never_waits_on_a_hung_poll_driver():
+    """THE DEFECT THE OUTSIDE REVIEW FOUND. The poll's read sat under the
+    board lock, `_transit` publishes PENDING under it, so a poll driver that
+    hung held `POST /v1/lane/vend` inside `complete_vend` AFTER the relay had
+    pulsed: no 202, a retry refused `already_completed`, the lane `busy` for as
+    long as the driver hung -- measured no answer in 3 s at `0c91190` and 202
+    in 20 ms at `df982e2`, where the poll did not exist. Now the route
+    answers with the poll driver still hung, and the vend it opened settles
+    once the driver comes back."""
+    loops = PollThatHangs()
+    controller = a_lane_that_completes(loops_impl=loops)
+    service = LaneService(controller)
+    idle = a_hung_poll(controller)
+    try:
+        with serving(make_server(service, port=0, token=READ_TOKEN, act_token=ACT_TOKEN)) as base:
+            status, answered, took = post_vend(base, controller, "KEY-001", timeout=2.0)
+            assert status == 202, (
+                f"the vend route answered {status} after {took:.2f}s with the poll driver hung "
+                f"(relay pulsed: {controller.vend.vend_count == 1}, "
+                f"transit={controller.transit_state})"
+            )
+            assert answered["transit"] == TransitState.PENDING.value
+            assert took < 1.0, f"202 took {took:.2f}s: the route waited on something"
+            assert controller.vend.vend_count == 1
+            assert idle.is_alive(), "the poll driver is still hung; that is the premise"
+            assert controller.transit_state == TransitState.PENDING.value
+
+            # The settle is waiting behind the poll's read -- on its own
+            # thread, under its own deadline -- and not the route.
+            assert loops.blocking_reads == 0, "the vend's read overlapped the poll's read in flight"
+            loops.release.set()
+            service.assisted.settling.join(timeout=5)
+            assert not service.assisted.settling.is_alive()
+    finally:
+        loops.release.set()
+    idle.join(timeout=5)
+    assert not idle.is_alive()
+    assert controller.transit_state == TransitState.CONFIRMED.value
+    assert loops.blocking_reads == 1
+    assert ENTRY_UNADMITTED not in kinds(controller)
+    assert controller.events.pending_sessions == 1
+
+
+def test_begin_transit_never_waits_on_a_hung_poll_driver():
+    """The same property at the seam the route reaches, with no socket in
+    the way, so a failure here names the lock and not the server."""
+    loops = PollThatHangs()
+    controller = a_lane_that_completes(loops_impl=loops)
+    idle = a_hung_poll(controller)
+    at = to_iso(controller.now())
+    identity = VehicleIdentity(plate=None, presence=True, ticket_ref="TKT-4RS9WQ2M")
+    vend = threading.Thread(target=controller.begin_transit, args=(identity, at), daemon=True)
+    vend.start()
+    vend.join(timeout=1.0)
+    alive = vend.is_alive()
+    loops.release.set()
+    idle.join(timeout=5)
+    assert not alive, (
+        "begin_transit waited on the poll driver: "
+        "PENDING is published under a lock a driver call holds"
+    )
+    assert controller.transit_state == TransitState.PENDING.value
+
+
+def test_the_vend_route_never_waits_on_a_hung_settle_driver_either():
+    """THE OTHER DIRECTION, kept measured: hang the blocking read instead and
+    the route still answers in the same time. The deadline design from this
+    round's first blocker; it must not regress while the poll's is fixed."""
+    controller = a_lane_that_completes()
+    service = LaneService(controller)
+    released = hang_the_driver(controller)
+    polls = {"n": 0}
+
+    def poll():
+        polls["n"] += 1
+        return ClosingSequence.NONE
+
+    controller.closing_loops.poll_sequence = poll
+    controller.loop._remaining = 0
+    assert controller.run_once(timeout=0) is None
+    controller.loop._occupied = True
+    with serving(make_server(service, port=0, token=READ_TOKEN, act_token=ACT_TOKEN)) as base:
+        status, answered, took = post_vend(base, controller, "KEY-001", timeout=2.0)
+        assert status == 202, f"{status} after {took:.2f}s"
+        assert took < 1.0
+        service.assisted.settling.join(timeout=5)
+    assert controller.transit_state == TransitState.UNCONFIRMABLE.value
+    released.set()
+
+
+def test_a_hung_poll_driver_costs_the_held_case_its_confirmation_and_nothing_on_the_route():
+    """What `docs/CONTRACT.md` says a hung idle read costs, measured: the
+    case the lane was holding is answered 202, its settle waits behind the
+    hung read under the settle's own deadline and lands `unconfirmable` with
+    `loop_driver_timeout`, the lane's route is free again, and the worker is
+    the one leaked thread. The loop thread itself is inside the driver, and
+    nothing here pretends otherwise: no further car is decided."""
+    loops = PollThatHangs()
+    loops.answer = ClosingSequence.FORWARD  # and when it comes back, it comes back with a car
+    controller = a_lane_that_completes(loops_impl=loops)
+    service = LaneService(controller)
+    leaked_before = leaked_workers()
+    idle = a_hung_poll(controller)
+    try:
+        complete(service, controller, "KEY-001")  # 202, and the settle joined at its deadline
+        assert controller.transit_state == TransitState.UNCONFIRMABLE.value
+        assert controller.loop_driver_timed_out
+        assert service.assisted._in_progress is False, "the route is not free after the deadline"
+        assert leaked_workers() == leaked_before + 1, (
+            "the settle behind the hung read is the one leaked worker"
+        )
+        assert idle.is_alive(), "the loop thread is still inside the driver; that is the cost"
+        assert loops.blocking_reads == 0
+    finally:
+        loops.release.set()
+    idle.join(timeout=5)
+    deadline = time.monotonic() + 2
+    while leaked_workers() > leaked_before and time.monotonic() < deadline:
+        time.sleep(0.005)
+    # The driver came back with FORWARD. A vend began during that read, so
+    # the crossing is that vend's and not a new `entry_unadmitted` -- the car
+    # the lane admitted and then gave up on may be exactly what crossed. The
+    # abandoned worker took it, found its claim gone, and recorded nothing.
+    # Unconfirmable it stays, as a late driver return has always left it.
+    assert controller._crossings_handed == 1
+    assert controller._handed is None, "the handed crossing was not consumed"
+    assert controller.transit_state == TransitState.UNCONFIRMABLE.value
+    assert ENTRY_CONFIRMED not in kinds(controller)
+    assert ENTRY_UNADMITTED not in kinds(controller), (
+        "a car the lane admitted was recorded as one nothing admitted"
+    )
+
+
+def test_a_crossing_the_poll_holds_when_a_vend_begins_during_its_read_is_the_vends():
+    """P3. The poll claimed the board and is inside its read; a vend begins
+    -- and, the route no longer waiting, its PENDING goes up while the poll is
+    out. The poll comes back holding FORWARD. That crossing is neither thrown
+    away (a lost promotion) nor recorded as `entry_unadmitted` (an admitted
+    car mislabelled): it is handed to the vend, whose read takes it without
+    asking the driver, and the vend is confirmed on it."""
+    loops = PollThatHangs()
+    loops.answer = ClosingSequence.FORWARD
+    controller, _, _ = build(arrivals=0, loops_impl=loops)
+    idle = a_hung_poll(controller)
+    at = to_iso(controller.now())
+
+    controller.begin_transit(ALLOWED, at)  # returns at once: the read is outside the lock
+    assert controller.transit_state == TransitState.PENDING.value
+    settle = threading.Thread(target=controller.resolve_transit, args=(ALLOWED, at), daemon=True)
+    settle.start()
+    settle.join(timeout=0.3)
+    assert settle.is_alive(), "the vend's read did not wait for the poll's read in flight"
+    assert loops.blocking_reads == 0
+
+    loops.release.set()
+    settle.join(timeout=5)
+    idle.join(timeout=5)
+    assert not settle.is_alive() and not idle.is_alive()
+    assert loops.blocking_reads == 0, (
+        "the vend asked the driver instead of taking the handed crossing"
+    )
+    assert controller._crossings_handed == 1
+    assert controller._handed is None, "the handed crossing was not consumed"
+    assert controller.transit_state == TransitState.CONFIRMED.value
+    assert ENTRY_CONFIRMED in kinds(controller)
+    assert ENTRY_UNADMITTED not in kinds(controller), (
+        "an admitted car was recorded as one nothing admitted"
+    )
+    assert SESSION_OPEN in kinds(controller)
+
+    # And with nothing pending, the next idle read records what it finds.
+    loops.entered.clear()
+    loops.release.clear()
+    loops.release.set()
+    assert controller.run_once(timeout=0) is None
+    assert kinds(controller)[-1] == ENTRY_UNADMITTED
 
 
 # ---------------------------------------------------------------------------

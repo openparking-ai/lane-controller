@@ -279,6 +279,15 @@ def _break_the_unadmitted_entry(monkeypatch):
             def __exit__(self, *exc):
                 return False
 
+            # The board is a `Condition` since the vend route stopped waiting
+            # on the poll's read: a lock that always opens also never waits
+            # for a poll's claim to be released, and wakes nobody.
+            def wait_for(self, predicate, timeout=None):
+                return True
+
+            def notify_all(self):
+                return None
+
         original_init = LaneController.__init__
 
         def init_with_a_board_lock_that_always_opens(self, *args, **kwargs):
@@ -322,6 +331,22 @@ def _break_the_unadmitted_entry(monkeypatch):
                 del self._nothing_pending
 
         monkeypatch.setattr(LaneController, "observe_closing_loops", check_outside_then_read)
+
+    elif mode == "route_waits":
+        # THE POLL'S READ IS PUT BACK UNDER THE BOARD LOCK -- the shape the
+        # outside review of 2026-09-19 measured. `_transit` publishes PENDING
+        # under that lock, so a poll driver that hangs holds `begin_transit`,
+        # and with it `POST /v1/lane/vend` after the relay has pulsed: no 202
+        # for as long as the driver hangs. The board is a re-entrant
+        # `Condition`, so the poll's own claim and release still work inside.
+        assert hasattr(LaneController, "observe_closing_loops"), "the poll's anchor has moved"
+        original_poll = LaneController.observe_closing_loops
+
+        def read_under_the_lock(self):
+            with self._board:
+                return original_poll(self)
+
+        monkeypatch.setattr(LaneController, "observe_closing_loops", read_under_the_lock)
 
     elif mode == "reason":
         # An ordinary promotion is answered with the new reason: the record
