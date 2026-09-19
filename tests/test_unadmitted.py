@@ -47,6 +47,7 @@ from lane_controller.simulated import (
 from lane_controller.sync import (
     ENTRY_CONFIRMED,
     ENTRY_UNADMITTED,
+    ENTRY_UNCONFIRMABLE,
     REASON_FORWARD,
     REASON_NO_PENDING_ENTRY,
     SESSION_OPEN,
@@ -905,6 +906,108 @@ def test_a_crossing_the_poll_holds_when_a_vend_begins_during_its_read_is_the_ven
     loops.release.set()
     assert controller.run_once(timeout=0) is None
     assert kinds(controller)[-1] == ENTRY_UNADMITTED
+
+
+def test_a_handed_crossing_is_taken_by_the_transit_it_was_handed_for_and_by_nothing_else():
+    """P5. The poll is inside its read when V1 begins; the poll comes back
+    holding FORWARD and hands it over WITH V1's `at`. Before V1's read has
+    taken it, a second transit begins through the other door -- the loop
+    thread's own next arrival, allowed by plate. Its read must leave the slot
+    alone and ask the driver; V1's read, when it comes, takes its own crossing
+    without asking. Unbound, the slot went to whichever read came first, and
+    car 2 was confirmed on V1's crossing before it had crossed."""
+    loops = PollThatHangs()
+    loops.answer = ClosingSequence.FORWARD
+    controller, _, _ = build(arrivals=0, loops_impl=loops)
+    idle = a_hung_poll(controller)
+    at_v1 = to_iso(controller.now())
+    controller.begin_transit(ALLOWED, at_v1)  # V1: PENDING published during the poll's read
+    loops.release.set()
+    idle.join(timeout=5)
+    assert controller._crossings_handed == 1
+    assert controller._handed == (ClosingSequence.FORWARD, at_v1), "the slot does not carry V1's at"
+
+    # Car 2, through the other door, before V1's read: an ordinary arrival
+    # the loop thread serves, allowed, vended, and read -- with its own `at`.
+    controller.loop._remaining = 1
+    decision = controller.run_once()
+    assert decision is not None and decision.outcome is Outcome.ALLOW
+    assert loops.blocking_reads == 1, "car 2's read took the slot instead of asking the driver"
+    assert controller._handed == (ClosingSequence.FORWARD, at_v1), "car 2's read took V1's crossing"
+    assert controller.transit_state == TransitState.CONFIRMED.value  # on its OWN crossing
+
+    # V1's read, late: it takes its own slot and asks nothing.
+    controller.resolve_transit(ALLOWED, at_v1)
+    assert loops.blocking_reads == 1, "V1's read asked the driver instead of taking its slot"
+    assert controller._handed is None, "V1's handed crossing was not consumed"
+    assert kinds(controller).count(ENTRY_CONFIRMED) == 2
+    assert kinds(controller).count(SESSION_OPEN) == 2
+    assert ENTRY_UNADMITTED not in kinds(controller)
+
+
+def test_a_timed_out_vends_handed_crossing_is_not_the_next_cars():
+    """The door the gate of 2026-09-19 measured: V1 (assisted) begins during
+    the poll's read and is answered `unconfirmable` by the settle's deadline
+    before the poll's driver returns FORWARD. The crossing is handed with V1's
+    `at`; the next car -- allowed on the loop thread, its read racing V1's
+    abandoned worker -- must not take it: it asks the driver and is confirmed
+    on its own crossing. V1's abandoned worker takes its own slot, finds its
+    claim gone, and records nothing: no `entry_confirmed` for V1, no session,
+    and NOT `entry_unadmitted` -- the lane admitted that car. The crossing is
+    invisible in the record; `entry_unconfirmable` is what says why."""
+    loops = PollThatHangs()
+    loops.answer = ClosingSequence.FORWARD
+    controller = a_lane_that_completes(loops_impl=loops)
+    service = LaneService(controller)
+    leaked_before = leaked_workers()
+    # V1's worker is parked on its way to the board -- inside the window
+    # read `resolve_transit` makes just before `_read_closing_loops` -- so the
+    # race the gate measured (19 to 38 of 200) is decided the same way every
+    # time: car 2's read reaches the board FIRST. Only the first caller parks;
+    # car 2's own resolve goes straight through.
+    parked = threading.Event()
+    window = controller._confirmation_window
+    calls = []
+
+    def park_the_first_reader():
+        calls.append(1)
+        if len(calls) == 1:
+            parked.wait(timeout=10)
+        return window()
+
+    controller._confirmation_window = park_the_first_reader
+    idle = a_hung_poll(controller)
+    complete(service, controller, "KEY-001")  # 202, and the settle joined at its deadline
+    assert controller.transit_state == TransitState.UNCONFIRMABLE.value
+    at_v1 = controller.transit_since
+    loops.release.set()
+    idle.join(timeout=5)
+    assert controller._crossings_handed == 1
+    assert controller._handed == (ClosingSequence.FORWARD, at_v1)
+
+    # Car 2 at once, allowed by plate, on the loop thread, ahead of V1's read.
+    controller.identifier = StubVehicleIdentifier([ALLOWED])
+    controller.loop._remaining = 1
+    decision = controller.run_once()
+    assert decision is not None and decision.outcome is Outcome.ALLOW
+    assert controller.transit_state == TransitState.CONFIRMED.value
+    assert loops.blocking_reads == 1, "car 2's read took V1's crossing instead of asking the driver"
+    assert controller._handed == (ClosingSequence.FORWARD, at_v1), "car 2's read took V1's slot"
+
+    parked.set()  # V1's abandoned worker reaches the board now
+    deadline = time.monotonic() + 2
+    while leaked_workers() > leaked_before and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert leaked_workers() == leaked_before, "V1's abandoned worker never took its slot"
+    assert controller._handed is None, "V1's handed crossing was not consumed"
+    assert controller.transit_since != at_v1  # car 2's transit, not V1's, is what is published
+    recorded = kinds(controller)
+    assert recorded.count(ENTRY_UNCONFIRMABLE) == 1
+    assert recorded.count(ENTRY_CONFIRMED) == 1, "V1 was confirmed after its deadline"
+    assert recorded.count(SESSION_OPEN) == 1, "the timed-out vend opened a session"
+    assert ENTRY_UNADMITTED not in recorded, (
+        "a car the lane admitted was recorded as one nothing admitted"
+    )
 
 
 # ---------------------------------------------------------------------------

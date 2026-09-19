@@ -152,7 +152,9 @@ class ClosingLoops(Protocol):
         while this call is in flight waits for it to return before asking the
         board, so the two reads never overlap. A crossing this call returns
         after a vend began during it is handed to that vend rather than
-        recorded, because it may be that vend's car. What that does NOT
+        recorded, because it may be that vend's car -- and to that vend's read
+        only, keyed by the transit's timestamp, so a transit that begins later
+        never takes it. What that does NOT
         cover: the relay is pulsed before the pending entry is published, so
         a crossing that completes in that gap, read by a call that also
         completes in that gap, is this call's -- stated, with what the lock

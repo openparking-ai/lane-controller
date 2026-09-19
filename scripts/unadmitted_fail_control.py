@@ -31,6 +31,12 @@ what the idle read writes -- and never on the fixture that drives it.
             driver that hangs holds PENDING's publication and with it the vend
             route, after the relay has pulsed -- the defect the outside review
             of 2026-09-19 measured
+  unbound_slot
+            a handed crossing is taken by whichever read reaches the board
+            first instead of by the transit it was handed for, so when that
+            transit has already been answered by the settle's deadline the
+            next car is confirmed on a crossing that is not its own -- the
+            defect the gate of 2026-09-19 found
   reason    an ordinary promotion is answered with the new reason
   folded    the new case is recorded under `entry_confirmed`, so a broken boom
             reads as business as usual
@@ -58,6 +64,7 @@ BREAKAGES = [
     ("unlocked_transit", "the transit state is published outside the board lock"),
     ("split_check", "the pending check and the read are two moments"),
     ("route_waits", "the vend route waits on the poll's read"),
+    ("unbound_slot", "a handed crossing is taken by a read it was not handed to"),
     ("reason", "a promotion carries the unadmitted reason"),
     ("folded", "the new case is recorded as entry_confirmed"),
     ("bypass", "the idle read does not flush"),
