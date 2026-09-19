@@ -239,18 +239,39 @@ def _break_the_unadmitted_entry(monkeypatch):
         assert hasattr(LaneController, "_nothing_pending"), "the pending gate's anchor has moved"
         monkeypatch.setattr(LaneController, "_nothing_pending", lambda self: True)
 
-    elif mode == "lock":
-        # The idle read no longer stands down while a settle holds the loops:
-        # two readers of one board. The lock is swapped for one that always
-        # says yes, at construction, so both the settle's `with` and the
-        # poll's `acquire(blocking=False)` go through it.
+    elif mode == "outstanding":
+        # The idle read no longer stands down while a settle's read of the
+        # loops is outstanding: two readers of one board.
+        assert hasattr(LaneController, "_nothing_reading"), (
+            "the outstanding gate's anchor has moved"
+        )
+        monkeypatch.setattr(LaneController, "_nothing_reading", lambda self: True)
+
+    elif mode == "starve":
+        # THE MUTEX IS PUT BACK. A settle's read waits until no other read is
+        # outstanding -- which is what a lock held across the read did. One
+        # loop driver that never returns then holds every later settle behind
+        # it until its own deadline (unconfirmable, no session) and holds the
+        # next ordinary arrival's `run_once` with no deadline at all.
+        import time as _time
+
+        assert hasattr(LaneController, "_read_closing_loops"), "the counted read's anchor has moved"
+        original_read = LaneController._read_closing_loops
+
+        def read_behind_the_others(self, window):
+            while not self._nothing_reading():
+                _time.sleep(0.005)
+            return original_read(self, window)
+
+        monkeypatch.setattr(LaneController, "_read_closing_loops", read_behind_the_others)
+
+    elif mode == "overlap":
+        # The board's bookkeeping lock is swapped for one that always says
+        # yes at construction, so the poll's check and its read are two
+        # moments again and a vend's read no longer waits for a poll's read in
+        # flight: the two reads overlap on one board, and a crossing that
+        # completes inside the overlap goes to whichever driver call wins.
         class _Yes:
-            def acquire(self, blocking=True):
-                return True
-
-            def release(self):
-                return None
-
             def __enter__(self):
                 return self
 
@@ -259,12 +280,12 @@ def _break_the_unadmitted_entry(monkeypatch):
 
         original_init = LaneController.__init__
 
-        def init_with_a_lock_that_always_opens(self, *args, **kwargs):
+        def init_with_a_board_lock_that_always_opens(self, *args, **kwargs):
             original_init(self, *args, **kwargs)
-            assert hasattr(self, "_loops_read"), "the reader lock's anchor has moved"
-            self._loops_read = _Yes()
+            assert hasattr(self, "_board"), "the board lock's anchor has moved"
+            self._board = _Yes()
 
-        monkeypatch.setattr(LaneController, "__init__", init_with_a_lock_that_always_opens)
+        monkeypatch.setattr(LaneController, "__init__", init_with_a_board_lock_that_always_opens)
 
     elif mode == "reason":
         # An ordinary promotion is answered with the new reason: the record

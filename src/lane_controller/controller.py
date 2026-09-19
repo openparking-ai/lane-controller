@@ -224,14 +224,50 @@ class LaneController:
         #: Whether an assisted vend's settle has ever exceeded this lane's own
         #: deadline. `closing_loops_never_firing` is derived from it.
         self._loop_driver_timed_out = False
-        #: ONE READER OF THE LOOPS AFTER THE GATE AT A TIME. A vend's settle
-        #: holds this for the whole of its blocking read; the idle poll takes
-        #: it without waiting and stands down if it cannot. Two readers of one
-        #: loop board would be a crossing that belongs to a pending entry
-        #: consumed by the poll and recorded as unadmitted, with the entry then
-        #: held for a car that did go through -- one crossing, two wrong
-        #: answers. The lock is what makes that impossible rather than unlikely.
-        self._loops_read = threading.Lock()
+        #: HOW MANY READS OF THE LOOPS AFTER THE GATE ARE OUTSTANDING. A vend's
+        #: settle counts itself in before its blocking read and out when the
+        #: driver returns; the idle poll reads only while this is zero and
+        #: otherwise skips its turn. Two readers of one loop board would be a
+        #: crossing that belongs to a pending entry consumed by the poll and
+        #: recorded as unadmitted, with the entry then held for a car that did
+        #: go through -- one crossing, two wrong answers. The count is what
+        #: makes that impossible rather than unlikely.
+        #:
+        #: A COUNT, NOT A MUTEX, and the difference took a lane down. This was
+        #: a `threading.Lock` held across the settle's read. `vend.py` bounds a
+        #: settle by ABANDONING a worker whose driver never returns -- and that
+        #: worker was still inside the read, holding the lock, so every later
+        #: vend's settle waited behind it until its own deadline (`unconfirmable`,
+        #: no session, one more leaked thread each) and the next ordinary
+        #: arrival's `run_once` waited on it with no deadline at all: the barrier
+        #: opened and the lane's one loop thread hung. The vend's read must never
+        #: wait on anything a hung thread can hold. It reads unconditionally,
+        #: exactly as it did before the idle poll existed; the poll is the only
+        #: reader that stands down, and it stands down without waiting.
+        #:
+        #: The count is released when the DRIVER RETURNS, never at abandonment:
+        #: an abandoned worker is still blocked on this board, and a poll that
+        #: read behind it would be the second reader the count exists to stop.
+        #: So a driver that never returns leaves the idle read of the loops off
+        #: at this lane until restart -- and nothing else: vends settle,
+        #: arrivals are served, and `closing_loops_never_firing` is already
+        #: `active` from the same event.
+        #:
+        #: `_board` is the bookkeeping lock for this count and it is held by
+        #: exactly three things: the poll across its check AND its
+        #: `poll_sequence` call, and the vend's read across `+= 1` and across
+        #: `-= 1`. NEVER across `wait_for_sequence`. So the one wait left in
+        #: this design is a vend counting itself in while a poll's read is in
+        #: flight -- a read the seam says never blocks -- and that wait exists
+        #: because without it the poll's check and its read were two moments,
+        #: and a vend that began between them, with a crossing behind it, lost
+        #: that crossing to the poll (measured: 3 of 200 under a stress that
+        #: crosses the instant the driver is asked). A `poll_sequence` that
+        #: blocked would hang `run_once` on its own, count or no count, so this
+        #: adds no way to lose the lane that the seam's contract does not
+        #: already forbid.
+        self._reads_outstanding = 0
+        self._board = threading.Lock()
 
     def now(self) -> float:
         """This lane's clock, which is the authority for WHEN.
@@ -583,8 +619,7 @@ class LaneController:
         # session out of a window this lane published on the event and never
         # applied.
         started = self._clock()
-        with self._loops_read:
-            crossing = self.closing_loops.wait_for_sequence(window)
+        crossing = self._read_closing_loops(window)
         elapsed = self._clock() - started
 
         # THE DRIVER RETURNED. Whether this call is still the one that may say
@@ -695,15 +730,46 @@ class LaneController:
     # A crossing with nothing pending: the read nobody made.
     # ------------------------------------------------------------------
 
+    def _read_closing_loops(self, window: float) -> ClosingSequence:
+        """The vend's read of the loops after the gate: counted in, counted out.
+
+        UNCONDITIONAL. Nothing here waits on another vend, ever: the count goes
+        up, the driver is asked, the count comes down when -- and only when --
+        the driver returns. A driver that never returns leaves the count up for
+        ever, which is one idle poll standing down at this lane for ever, and
+        that is the whole of its cost; see `_reads_outstanding`. The `+= 1`
+        waits for a poll's read in flight, if there is one, and for nothing
+        else.
+
+        Its own method so the fail-control can put the mutex back and watch
+        the lane starve.
+        """
+        with self._board:
+            self._reads_outstanding += 1
+        try:
+            return self.closing_loops.wait_for_sequence(window)
+        finally:
+            with self._board:
+                self._reads_outstanding -= 1
+
     def _nothing_pending(self) -> bool:
         """Whether an idle read of the loops may happen right now.
 
         Not while a vend is pending: from `begin_transit` until the settle
-        thread reaches its blocking read there is a moment where the lock
-        below is free and the crossing that arrives belongs to that vend. The
-        published transit state covers that moment; the lock covers the read.
+        thread reaches its blocking read there is a moment where nothing is
+        counted outstanding and the crossing that arrives belongs to that
+        vend. The published transit state covers that moment; the count covers
+        the read.
         """
         return self.transit_state != TransitState.PENDING.value
+
+    def _nothing_reading(self) -> bool:
+        """Whether no read of the loops is outstanding right now. Never waits.
+
+        The poll calls this holding `_board`, so its answer and the read that
+        follows are one moment; anything else may call it unlocked.
+        """
+        return self._reads_outstanding == 0
 
     def observe_closing_loops(self) -> str | None:
         """Poll the loops after the gate while nothing is pending, and record what crossed.
@@ -720,7 +786,8 @@ class LaneController:
         fired -- the seam reports sequences, not times.
 
         Returns the kind recorded, or None when nothing was: because there are
-        no loops, because a settle owns them, or because nothing crossed.
+        no loops, because a read of them is outstanding, or because nothing
+        crossed.
 
         WHAT IT RECORDS. A FORWARD crossing at an ENTRY lane is
         `entry_unadmitted`, with its own reason and with what this lane last
@@ -742,13 +809,13 @@ class LaneController:
         """
         if self.closing_loops is None or not self._nothing_pending():
             return None
-        if not self._loops_read.acquire(blocking=False):
-            # A settle is reading. Whatever crosses now is that vend's answer.
-            return None
-        try:
+        with self._board:
+            if not self._nothing_reading():
+                # A settle is reading -- or was, and its driver has not come
+                # back. Whatever crosses now is that read's answer. Skip the
+                # turn; never wait for it.
+                return None
             crossing = self.closing_loops.poll_sequence()
-        finally:
-            self._loops_read.release()
         if crossing is ClosingSequence.NONE:
             return None
 

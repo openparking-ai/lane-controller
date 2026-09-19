@@ -1312,12 +1312,20 @@ def test_a_loop_driver_that_never_returns_does_not_leave_the_lane_busy():
         service.derived_states()[MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING].value == "active"
     )
 
-    # THE LANE ACCEPTS AGAIN: a second car, a second decision, a second vend.
+    # THE LANE ACCEPTS AGAIN: a second car, a second decision, a second vend --
+    # AND IT SETTLES. The 202 alone is not the recovery: a settle that waits
+    # behind the abandoned worker still answers 202 and then times out with no
+    # session, which is exactly what a mutex held across the read did (gate of
+    # 2026-09-19). The hung thread is still hung while this runs.
     controller.loop._remaining = 1
     controller.closing_loops.wait_for_sequence = lambda window: ClosingSequence.FORWARD
     controller.run_once()
     assert complete(service, controller, key="KEY-002")[0] == 202
     settled(service)
+    assert service.state().to_dict()["transit"]["state"] == TransitState.CONFIRMED.value, (
+        "the second vend did not settle: it waited behind the abandoned read"
+    )
+    assert len(controller.events._sessions) == 1, "the second stay was not billed"
     hung.set()
 
 

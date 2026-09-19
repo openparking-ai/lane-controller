@@ -902,7 +902,12 @@ There is no flag that turns any of that off.
   again. The thread waiting on the driver is ABANDONED, not killed — Python
   cannot kill one — so a driver that eventually returns finds the outcome
   already published and records nothing. What that costs is one leaked thread
-  per occurrence, which is a fault somebody is being paged about.
+  per occurrence, which is a fault somebody is being paged about — and, for as
+  long as that thread is still inside the driver, the idle read of the loops
+  after the gate (`entry_unadmitted`) stands down at this lane, because a read
+  is outstanding on the board. It costs nothing else: later vends settle and
+  arrivals are served exactly as before, and none of them waits on the
+  abandoned read.
 - **No measurement of the boom.** `vend_commanded` is what this lane can stand
   behind; whether the barrier rose is `no_source` and stays that way.
 - **No verification of a ticket.** Shape only. No signature, no expiry, no

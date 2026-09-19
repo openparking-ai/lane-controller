@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 from lane_controller import (
     CameraConfig,
@@ -283,10 +284,11 @@ class HeldLoops(ClosingLoops):
 def test_a_crossing_while_a_vend_is_pending_is_the_vends_answer_not_a_new_entry():
     """Two gates, one crossing. Between `begin_transit` and the settle's
     blocking read the transit is PENDING and the poll stands down on that.
-    Once the settle is inside its read it holds the loops, and the poll stands
-    down on the lock -- including after the lane's own deadline has moved the
-    transit off PENDING with the driver still blocked. Either gate failing is
-    one crossing recorded as unadmitted AND answered to the vend."""
+    Once the settle is inside its read that read is OUTSTANDING, and the poll
+    stands down on the count -- including after the lane's own deadline has
+    moved the transit off PENDING with the driver still blocked, because the
+    abandoned worker is still on the board. Either gate failing is one crossing
+    recorded as unadmitted AND answered to the vend."""
     loops = HeldLoops()
     controller, _, _ = build(arrivals=0, loops_impl=loops)
     at = to_iso(controller.now())
@@ -313,7 +315,7 @@ def test_a_crossing_while_a_vend_is_pending_is_the_vends_answer_not_a_new_entry(
     assert controller.transit_state == TransitState.UNCONFIRMABLE.value
 
     assert controller.run_once() is None
-    assert loops.polls == 0, "the idle poll read the loops while a settle was reading them"
+    assert loops.polls == 0, "the idle poll read the loops while a settle's read was outstanding"
     assert ENTRY_UNADMITTED not in kinds(controller)
 
     loops.release.set()
@@ -325,6 +327,222 @@ def test_a_crossing_while_a_vend_is_pending_is_the_vends_answer_not_a_new_entry(
     assert controller.run_once() is None
     assert loops.polls == 1
     assert kinds(controller)[-1] == ENTRY_UNADMITTED
+
+
+class PollThatStartsAVend(ClosingLoops):
+    """A board whose idle read, while it is IN FLIGHT, sees a vend begin on
+    another thread -- the moment the count alone could not cover. Records
+    whether the vend's read entered the board before the poll's read left it."""
+
+    def __init__(self, controller_ref: dict) -> None:
+        self.ref = controller_ref
+        self.poll_in_flight = False
+        self.overlapped = False
+        self.settle: threading.Thread | None = None
+
+    def wait_for_sequence(self, window_seconds: float) -> ClosingSequence:
+        self.overlapped = self.overlapped or self.poll_in_flight
+        return ClosingSequence.FORWARD
+
+    def poll_sequence(self) -> ClosingSequence:
+        self.poll_in_flight = True
+        controller = self.ref["controller"]
+        at = to_iso(controller.now())
+
+        def vend():
+            controller.begin_transit(ALLOWED, at)
+            controller.resolve_transit(ALLOWED, at)
+
+        self.settle = threading.Thread(target=vend, daemon=True)
+        self.settle.start()
+        self.settle.join(timeout=0.2)  # a vend's read that does not wait gets in here
+        self.poll_in_flight = False
+        return ClosingSequence.NONE
+
+
+def test_a_vends_read_never_overlaps_a_polls_read_in_flight():
+    """The check and the read are ONE moment, and a vend that begins inside a
+    poll's read waits for that read to finish -- microseconds, by the seam's
+    own promise -- rather than reading the same board at the same time. Two
+    overlapping driver calls on one board give one crossing to whichever
+    wins, and the first count-only design measured 3 of 200 lost that way."""
+    ref: dict = {}
+    board = PollThatStartsAVend(ref)
+    controller, _, _ = build(arrivals=0, loops_impl=board)
+    ref["controller"] = controller
+
+    assert controller.run_once() is None  # the idle poll, and a vend inside it
+    assert board.settle is not None
+    board.settle.join(timeout=5)
+    assert not board.settle.is_alive(), "the vend's read never ran: it must wait, not starve"
+    assert board.overlapped is False, (
+        "the vend's read entered the board while the poll's read was in flight"
+    )
+    assert controller.transit_state == TransitState.CONFIRMED.value
+    assert ENTRY_UNADMITTED not in kinds(controller)
+
+
+# ---------------------------------------------------------------------------
+# One hung loop driver must cost what it cost before the idle read existed:
+# one leaked thread, and nothing else.
+# ---------------------------------------------------------------------------
+
+UNREADABLE = VehicleIdentity(plate=None, confidence=0.10, presence=True)
+
+
+def a_lane_that_completes(*identities, window: float = 0.1, grace: float = 0.05):
+    """The assisted vend's lane: a fallback case held, `vend.py` reachable
+    through `LaneService`, a settle bounded by a short window and grace."""
+    config = LaneConfig(
+        lane_id="lane-test",
+        site_id="site-test",
+        camera=CameraConfig(camera_id="sim-cam-1", rtsp_url="", frames_per_read=1),
+        gate=GateConfig(),
+        direction="entry",
+        confidence_threshold=0.85,
+        loops=LoopConfig(arming_loops=1, closing_loops=2, confirmation_window_seconds=window),
+        settle_grace_s=grace,
+    )
+    cache = DecisionCache()
+    cache.load([], default_action="allow")
+    controller = LaneController(
+        config,
+        loop=SimulatedLoopInput(arrivals=1),
+        camera=CannedCameraFeed(),
+        vend=RecordingVendOutput(),
+        identifier=StubVehicleIdentifier(list(identities) or [UNREADABLE]),
+        closing_loops=ScriptedClosingLoops([]),
+        cache=cache,
+    )
+    controller.run_once()
+    assert controller.last_decision.outcome is Outcome.FALLBACK
+    return controller
+
+
+def complete(service, controller, key):
+    from lane_controller.vend import parse
+
+    body = {
+        "authorised_by": "human_open_now",
+        "identity": {"kind": "ticket", "ticket_ref": "TKT-4RS9WQ2M"},
+        "decision_at": controller.last_decision_at,
+    }
+    status, _ = service.assisted.complete(parse(body, key))
+    assert status == 202
+    service.assisted.settling.join(timeout=5)
+    assert not service.assisted.settling.is_alive()
+
+
+def hang_the_driver(controller):
+    """A `wait_for_sequence` that does not return until told to. The thread
+    inside it is the one `vend.py` abandons at the deadline."""
+    released = threading.Event()
+    controller.closing_loops.wait_for_sequence = lambda window: (
+        released.wait(timeout=10) or ClosingSequence.NONE
+    )
+    return released
+
+
+def leaked_workers() -> int:
+    return sum(1 for t in threading.enumerate() if t.name == "assisted-vend-resolve")
+
+
+def test_after_one_hung_driver_the_next_vends_still_settle_and_bill():
+    """THE DEFECT THE GATE FOUND. The first idle-read design held a mutex
+    across the settle's read; `vend.py` abandons a worker whose driver never
+    returns, and that worker was still inside the read, holding the mutex --
+    so every later vend's settle waited behind it until its own deadline:
+    `unconfirmable`, no session, one more leaked thread each, while every one
+    of them still answered 202. `main` bills them. This lane must too."""
+    controller = a_lane_that_completes()
+    service = LaneService(controller)
+    leaked_before = leaked_workers()
+    released = hang_the_driver(controller)
+
+    complete(service, controller, "KEY-001")
+    assert controller.transit_state == TransitState.UNCONFIRMABLE.value
+    assert service.assisted._in_progress is False
+    assert leaked_workers() == leaked_before + 1, "the hung worker is the one leaked thread"
+
+    # The driver recovers: a NEW call answers at once. The hung one is still
+    # hung. Two more cars, two more completions.
+    controller.closing_loops.wait_for_sequence = lambda window: ClosingSequence.FORWARD
+    for n, key in ((2, "KEY-002"), (3, "KEY-003")):
+        controller.loop._remaining = 1
+        controller.run_once()
+        complete(service, controller, key)
+        assert controller.transit_state == TransitState.CONFIRMED.value, (
+            f"vend {n} settled to {controller.transit_state}: it waited behind the hung read"
+        )
+        assert controller.events.pending_sessions == n - 1, f"vend {n} billed nobody"
+
+    assert leaked_workers() == leaked_before + 1, "a later vend leaked a thread of its own"
+    released.set()
+
+
+def test_after_one_hung_driver_the_next_ordinary_arrival_is_served():
+    """The same hang, then a car the lane admits on its own. `handle_arrival`
+    settles on the loop thread with no deadline of its own: waiting on the
+    abandoned read there is the barrier opening and `run_once` never
+    returning -- no arrivals, no idle polls, and a `held` for a car that
+    crossed forward once the driver finally came back."""
+    controller = a_lane_that_completes(UNREADABLE, ALLOWED)
+    service = LaneService(controller)
+    released = hang_the_driver(controller)
+    complete(service, controller, "KEY-001")
+    assert controller.transit_state == TransitState.UNCONFIRMABLE.value
+
+    controller.closing_loops.wait_for_sequence = lambda window: ClosingSequence.FORWARD
+    controller.loop._remaining = 1
+    served = threading.Event()
+    outcome = {}
+
+    def serve():
+        outcome["decision"] = controller.run_once()
+        served.set()
+
+    threading.Thread(target=serve, daemon=True).start()
+    returned = served.wait(timeout=3)
+    released.set()
+    assert returned, (
+        "run_once did not return in 3s: the ordinary settle waited behind the abandoned read "
+        f"(vends={controller.vend.vend_count}, transit={controller.transit_state})"
+    )
+    assert outcome["decision"].outcome is Outcome.ALLOW
+    assert controller.transit_state == TransitState.CONFIRMED.value
+    assert controller.events.pending_sessions == 1
+
+
+def test_the_idle_read_stands_down_behind_an_abandoned_driver_and_only_that():
+    """What the hang DOES cost, stated: while the abandoned worker is still on
+    the board the idle read skips its turn -- a poll behind it would be the
+    second reader the count exists to stop -- and it resumes the moment the
+    driver returns. Nothing waits."""
+    controller = a_lane_that_completes()
+    service = LaneService(controller)
+    polls = {"n": 0}
+
+    def poll():
+        polls["n"] += 1
+        return ClosingSequence.NONE
+
+    controller.closing_loops.poll_sequence = poll
+    released = hang_the_driver(controller)
+    complete(service, controller, "KEY-001")
+
+    for _ in range(20):
+        assert controller.run_once(timeout=0) is None
+    assert polls["n"] == 0, "the idle read polled a board with a read outstanding"
+    assert not controller._nothing_reading()
+
+    released.set()
+    service.assisted.settling.join(timeout=5)
+    deadline = time.monotonic() + 2
+    while not controller._nothing_reading() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert controller._nothing_reading(), "the count did not come down when the driver returned"
+    assert controller.run_once(timeout=0) is None
+    assert polls["n"] == 1
 
 
 # ---------------------------------------------------------------------------

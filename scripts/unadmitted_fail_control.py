@@ -8,8 +8,16 @@ what the idle read writes -- and never on the fixture that drives it.
 
   pending   the idle read runs while a vend is pending, so the crossing that
             belongs to the vend is recorded as unadmitted and the vend is held
-  lock      the idle read runs while a settle is reading the same loops: two
-            readers of one board
+  outstanding
+            the idle read runs while a settle's read of the same loops is
+            outstanding: two readers of one board
+  overlap   the poll's check and its read are two moments again, and a vend's
+            read no longer waits for a poll's read in flight: two reads of one
+            board overlap
+  starve    the mutex is put back: a settle's read waits behind an outstanding
+            read, so one hung loop driver leaves every later vend unconfirmable
+            and the next ordinary arrival's `run_once` hung -- the defect the
+            gate of 2026-09-19 found
   reason    an ordinary promotion is answered with the new reason
   folded    the new case is recorded under `entry_confirmed`, so a broken boom
             reads as business as usual
@@ -31,7 +39,9 @@ from _control import intact, judge, run
 SUITE = ["-q", "tests/test_unadmitted.py"]
 BREAKAGES = [
     ("pending", "the idle read ignores a pending vend"),
-    ("lock", "the idle read ignores a settle reading the loops"),
+    ("outstanding", "the idle read ignores an outstanding read of the loops"),
+    ("overlap", "a vend's read overlaps a poll's read in flight"),
+    ("starve", "a settle's read waits behind an abandoned one"),
     ("reason", "a promotion carries the unadmitted reason"),
     ("folded", "the new case is recorded as entry_confirmed"),
     ("bypass", "the idle read does not flush"),
