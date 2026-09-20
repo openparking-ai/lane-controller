@@ -182,6 +182,7 @@ class PlatformClient:
         plate: str | None = None,
         ticket_ref: str | None = None,
         session_id: str | None = None,
+        descriptor: str | None = None,
     ) -> dict:
         body = {
             "event_id": event_id,
@@ -191,6 +192,12 @@ class PlatformClient:
         }
         if session_id:
             body["session_id"] = session_id
+        # The exit read's descriptor, ONLY when there is one -- the open's rule,
+        # at the other end. It rides the close and no other channel: the
+        # platform's search snapshots inside the close transaction, so what it
+        # compares has to be in this call.
+        if descriptor is not None:
+            body["descriptor"] = descriptor
         return self._request("POST", "/api/v1/lane/sessions/close", body)
 
 

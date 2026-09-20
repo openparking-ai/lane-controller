@@ -1080,6 +1080,16 @@ def test_the_open_carries_a_descriptor_key_only_when_the_read_produced_one():
     assert bodies[1]["descriptor"] == "opvid-fp/1:eJwBDiTx2wire"
     assert {k: v for k, v in bodies[1].items() if k != "descriptor"} == bodies[0]
 
+    # And the close, the same way: the exit read's descriptor rides the close
+    # and no other channel, and only when there is one.
+    closes = dict(event_id="e2", plate="SIM-0001", exit_at="2026-08-30T16:03:11+00:00",
+                  exit_confirmation="confirmed", session_id="s1")
+    client.close_session(**closes)
+    client.close_session(**closes, descriptor="opvid-fp/1:eJwBDiTx2exit")
+    assert "descriptor" not in bodies[2]
+    assert bodies[3]["descriptor"] == "opvid-fp/1:eJwBDiTx2exit"
+    assert {k: v for k, v in bodies[3].items() if k != "descriptor"} == bodies[2]
+
 
 def test_a_session_action_carrying_both_identities_never_leaves_this_lane():
     """The lane refuses its own malformed request rather than the platform.

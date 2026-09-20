@@ -479,9 +479,12 @@ policy for both surfaces.
 closed — are not on it. They are the ledger's: they become
 `POST /lane/sessions/open` and `/close` on the platform this lane reports to,
 they carry the plate — and, when the identity service produced one, the
-**appearance descriptor** of the read, which the open carries and the platform
-holds on the session (`entry_descriptor`) and must echo back, or the lane
-counts the open undelivered — and the platform is the durable record of them.
+**appearance descriptor** of the read, which the open and the close each carry
+and the platform holds on the session (`entry_descriptor`, `exit_descriptor`)
+and must echo back, or the lane counts the action undelivered. The exit's rides
+the **close and no other channel**: the two channels a lane reports on arrive
+at the platform in no specified order, and the search that compares the two
+snapshots inside the close — and the platform is the durable record of them.
 What happened at the lane is answered here and by `GET /v1/lane/state`; who was
 in the vehicle is not on this contract at all, and neither is what it looked
 like: the descriptor is identity on the same terms the plate is, and

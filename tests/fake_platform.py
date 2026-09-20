@@ -161,6 +161,7 @@ class FakePlatform:
         plate: str | None = None,
         ticket_ref: str | None = None,
         session_id: str | None = None,
+        descriptor: str | None = None,
     ) -> dict:
         self._check()
         identity = self._identity(plate, ticket_ref)
@@ -175,6 +176,7 @@ class FakePlatform:
                 "exit_at": exit_at,
                 "session_id": session_id,
                 "exit_confirmation": exit_confirmation,
+                "descriptor": descriptor,
             }
         )
         if event_id in self.sessions_by_close_event:
@@ -194,6 +196,9 @@ class FakePlatform:
             "exit_at": exit_at,
             "fee_minor": 250,
             "exit_confirmation": exit_confirmation,
+            # Echoed as the close route does (migration 0010): null when the
+            # close sent none, the value when it did.
+            "exit_descriptor": descriptor,
         }
         self.sessions_by_close_event[event_id] = session
         return {"session": session, "closed": True}
