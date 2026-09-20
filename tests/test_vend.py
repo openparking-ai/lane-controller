@@ -1063,6 +1063,24 @@ def test_the_session_action_sends_the_ticket_to_the_platform():
     assert sent["entry_confirmation"] == "confirmed"
 
 
+def test_the_open_carries_a_descriptor_key_only_when_the_read_produced_one():
+    """On the wire, not in the fake: an open with no descriptor is byte-for-byte
+    the open this lane sent before the field existed, so a lane with it
+    switched off is unchanged against any platform, old or new."""
+    from lane_controller.platform_client import PlatformClient
+
+    client = PlatformClient("http://127.0.0.1:1", "token")
+    bodies = []
+    client._request = lambda method, path, body=None: bodies.append(body) or {"session": {}}
+    common = dict(event_id="e1", plate="SIM-0001", entry_at="2026-08-30T14:03:11+00:00",
+                  entry_confirmation="confirmed")
+    client.open_session(**common)
+    client.open_session(**common, descriptor="opvid-fp/1:eJwBDiTx2wire")
+    assert "descriptor" not in bodies[0]
+    assert bodies[1]["descriptor"] == "opvid-fp/1:eJwBDiTx2wire"
+    assert {k: v for k, v in bodies[1].items() if k != "descriptor"} == bodies[0]
+
+
 def test_a_session_action_carrying_both_identities_never_leaves_this_lane():
     """The lane refuses its own malformed request rather than the platform.
 

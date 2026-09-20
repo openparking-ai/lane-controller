@@ -801,6 +801,7 @@ def test_with_a_token_every_route_requires_it():
 # ---------------------------------------------------------------------------
 
 PLATE_ON_THE_WIRE = "PURGEME9"
+DESCRIPTOR_ON_THE_WIRE = "opvid-fp/1:DESCRIPTORONTHEWIRE9"
 
 
 def a_lane_that_saw_a_car(events=None):
@@ -812,7 +813,14 @@ def a_lane_that_saw_a_car(events=None):
     controller = full_lane(
         identities=[
             VehicleIdentity(
-                plate=PLATE_ON_THE_WIRE, plate_region="TR", confidence=0.97, presence=True
+                plate=PLATE_ON_THE_WIRE,
+                plate_region="TR",
+                confidence=0.97,
+                presence=True,
+                # And a descriptor: identity on the same terms the plate is,
+                # and the second thing a session action carries that a route
+                # never may.
+                descriptor=DESCRIPTOR_ON_THE_WIRE,
             )
         ],
         crossings=[(ClosingSequence.FORWARD, 3.0)],
@@ -850,6 +858,7 @@ def test_no_route_publishes_identity_text():
 
     for route, body in served.items():
         assert PLATE_ON_THE_WIRE not in body, f"{route} published plate text: {body}"
+        assert DESCRIPTOR_ON_THE_WIRE not in body, f"{route} published the descriptor: {body}"
 
     # THE CONTROL, per route: the same sweep run over the same payload with a
     # plate planted in it must find one. Run route by route rather than once,
@@ -866,6 +875,8 @@ def test_no_route_publishes_identity_text():
             f"the sweep cannot see a plate planted in {route}'s payload, so its "
             "absence there says nothing"
         )
+        planted = json.dumps({**payload, "planted": DESCRIPTOR_ON_THE_WIRE})
+        assert DESCRIPTOR_ON_THE_WIRE in planted
 
     # And the lane really did handle that vehicle, so the run is not vacuous:
     # a lane that decided nothing publishes no identity either.

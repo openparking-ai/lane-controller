@@ -148,6 +148,36 @@ def sync_rules(client: PlatformClient, cache: DecisionCache) -> dict | None:
     return payload
 
 
+def require_descriptor_echo(result: dict | None, sent: str | None) -> None:
+    """Refuse an open the platform accepted without recording the descriptor it was sent.
+
+    The same silence as `require_confirmation_echo` below, on a different field
+    and with one difference: the descriptor is OPTIONAL. An open that sent none
+    has nothing to require, and this returns. An open that sent one requires
+    the platform to hand it back on the row -- because the open route
+    destructures the keys it knows and ignores the rest, so a platform older
+    than `sessions.entry_descriptor` (its migration 0009) answers 201, opens
+    the session, and drops the field with nothing anywhere saying so. To the
+    exit, that stay is then unmatchable, silently. So an open that does not
+    come back carrying the descriptor it was sent is NOT DELIVERED: counted,
+    logged at error, dropped rather than re-sent for ever -- the same path as
+    the confirmation, and for the same reason. The barrier already opened; what
+    is lost is this lane's report, and the log line is what says so.
+
+    A seam on purpose (`BREAK_DESCRIPTOR=echo` in the fail-control).
+    """
+    if sent is None:
+        return
+    echoed = ((result or {}).get("session") or {}).get("entry_descriptor")
+    if echoed != sent:
+        raise PlatformRejected(
+            None,
+            "the open was accepted but the platform did not echo the descriptor it was sent "
+            f"(it said {'nothing' if echoed is None else 'a different value'}). That platform "
+            "does not record an entry descriptor: its migration 0009 goes before this lane build.",
+        )
+
+
 def require_confirmation_echo(
     result: dict | None, declared: str, *, end: str, action: str
 ) -> None:
@@ -261,6 +291,9 @@ class PlatformTransport(EventTransport):
         confirmed it. The rule is `require_confirmation_echo` above.
         """
         declared = event.detail["entry_confirmation"]
+        # `.get`, and no key on most opens: only a read the identity service
+        # produced a descriptor for carries one (`_session_descriptor`).
+        descriptor = event.detail.get("descriptor")
         result = self._client.open_session(
             event_id=event.event_id,
             # EXACTLY ONE of the two, and which one is decided where the record
@@ -273,8 +306,10 @@ class PlatformTransport(EventTransport):
             entry_at=event.detail.get("at") or to_iso(event.at),
             plate_region=event.detail.get("plate_region"),
             entry_confirmation=declared,
+            descriptor=descriptor,
         )
         require_confirmation_echo(result, declared, end="entry", action="open")
+        require_descriptor_echo(result, descriptor)
         return result
 
     def _close_session(self, event: LaneEvent) -> dict:

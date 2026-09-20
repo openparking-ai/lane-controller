@@ -239,6 +239,90 @@ def test_a_platform_that_does_record_it_delivers_the_open():
     assert platform.opened[0]["entry_confirmation"] == "unconfirmable"
 
 
+DESCRIPTOR = "opvid-fp/1:eJwBDiTx2offline"
+
+
+def test_an_open_carries_the_descriptor_the_read_produced_and_the_platform_echoes_it():
+    """The read produced a descriptor; the open carries it; the platform hands
+    it back on the row; the lane counts the open delivered."""
+    platform = FakePlatform()
+    controller, vend, transport = build(
+        platform,
+        identities=[VehicleIdentity(plate="OFF-D", confidence=0.97, descriptor=DESCRIPTOR)],
+    )
+
+    controller.run_once()
+
+    assert vend.vend_count == 1
+    assert transport.rejected == 0
+    assert platform.opened[0]["descriptor"] == DESCRIPTOR
+    assert platform.opened[0]["plate"] == "OFF-D", "beside the identity, not instead of it"
+
+
+def test_an_open_whose_read_produced_no_descriptor_sends_none():
+    """The default. The service produces a descriptor only when a deployment
+    switches it on, so most opens carry none -- and the lane requires no echo
+    for a value it did not send."""
+    platform = FakePlatform()
+    controller, _, transport = build(platform)
+
+    controller.run_once()
+
+    assert transport.rejected == 0
+    assert platform.opened[0]["descriptor"] is None
+
+
+class PlatformWithoutTheDescriptorColumn(FakePlatform):
+    """The platform as it is BEFORE migration 0009.
+
+    It accepts the open, answers with the session, and the row it echoes has no
+    `entry_descriptor` -- exactly as the real route behaves, because it
+    destructures the keys it knows and ignores the rest. Not an error, not a
+    400: a 201 and a silent loss, which is why the echo is the check.
+    """
+
+    def open_session(self, **kwargs) -> dict:
+        result = super().open_session(**kwargs)
+        session = {k: v for k, v in result["session"].items() if k != "entry_descriptor"}
+        return {**result, "session": session}
+
+
+def test_a_platform_that_does_not_record_the_descriptor_is_refused_loudly(caplog):
+    caplog.set_level(logging.ERROR)
+    platform = PlatformWithoutTheDescriptorColumn()
+    controller, vend, transport = build(
+        platform,
+        identities=[VehicleIdentity(plate="OFF-D2", confidence=0.97, descriptor=DESCRIPTOR)],
+    )
+
+    controller.run_once()
+
+    assert vend.vend_count == 1, "the barrier still opened; the car is not the one being refused"
+    assert transport.rejected == 1, (
+        "an open the platform silently dropped the descriptor from was counted as delivered"
+    )
+    assert controller.events.pending == 0, "poison must not block everything behind it"
+    assert any("descriptor" in record.getMessage() for record in caplog.records), (
+        "the drop must name what the platform did not record"
+    )
+    assert not any(DESCRIPTOR in record.getMessage() for record in caplog.records), (
+        "and it must not copy the descriptor into a log line"
+    )
+
+
+def test_a_lane_with_no_descriptor_is_unchanged_against_that_platform():
+    """THE CONTROL on the refusal above, and the compatibility rule: a lane
+    whose service produces no descriptor sends the open it always sent, and a
+    platform older than the column delivers it exactly as before."""
+    platform = PlatformWithoutTheDescriptorColumn()
+    controller, _, transport = build(platform)
+
+    controller.run_once()
+
+    assert transport.rejected == 0
+    assert platform.unique_opens == 1
+
+
 def test_a_platform_that_does_not_record_the_exit_confirmation_is_refused_loudly(caplog):
     """C4, at the other end of the stay. The exit is where the money is written,
     and against a platform that predates the column the close is accepted, the

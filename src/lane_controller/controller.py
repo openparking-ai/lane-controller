@@ -1235,6 +1235,28 @@ class LaneController:
             detail["plate_region"] = identity.plate_region
         return detail
 
+    @staticmethod
+    def _session_descriptor(identity) -> dict:
+        """The appearance descriptor an OPEN carries, and only when there is one.
+
+        Beside the identity, not part of it: a descriptor is a READ of the car
+        that arrived, and it is kept whichever way the car was identified -- a
+        plate the camera read, or a ticket a person completed for a car whose
+        plate it could not. The exit's search compares descriptors against
+        every open stay, and a ticket stay is a stay.
+
+        NO KEY when there is none, rather than `descriptor: None`, for the
+        reason `_identity_detail` gives for the plate: the record says what was
+        measured, and a lane whose service does not produce descriptors sends
+        exactly the open it sent before this field existed.
+
+        A seam on purpose (`BREAK_DESCRIPTOR=record` in the fail-control): the
+        one place the descriptor crosses from a reading into a session action.
+        """
+        if identity.descriptor is None:
+            return {}
+        return {"descriptor": identity.descriptor}
+
     def _record_session(self, identity, at: str, *, confirmation: str) -> None:
         """Put the session action on the queue, saying what confirmed it."""
         lane = self.config.lane_id
@@ -1243,6 +1265,7 @@ class LaneController:
                 SESSION_OPEN,
                 lane,
                 **self._identity_detail(identity, with_region=True),
+                **self._session_descriptor(identity),
                 at=at,
                 entry_confirmation=confirmation,
             )

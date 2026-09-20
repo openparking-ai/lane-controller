@@ -99,6 +99,7 @@ class FakePlatform:
         plate: str | None = None,
         ticket_ref: str | None = None,
         plate_region=None,
+        descriptor: str | None = None,
     ) -> dict:
         self._check()
         identity = self._identity(plate, ticket_ref)
@@ -115,6 +116,7 @@ class FakePlatform:
                 "ticket_ref": ticket_ref,
                 "entry_at": entry_at,
                 "entry_confirmation": entry_confirmation,
+                "descriptor": descriptor,
             }
         )
         # Keyed on the event, exactly as the platform is. An entry replayed
@@ -135,6 +137,10 @@ class FakePlatform:
             "entry_at": entry_at,
             "fee_minor": None,
             "entry_confirmation": entry_confirmation,
+            # Echoed on the row exactly as the route does (migration 0009):
+            # null when the open sent none, the value when it did. The lane
+            # requires the echo only when it sent one.
+            "entry_descriptor": descriptor,
         }
         self.open_sessions[identity] = session
         self.sessions_by_open_event[event_id] = session

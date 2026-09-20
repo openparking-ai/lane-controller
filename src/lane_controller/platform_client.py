@@ -133,6 +133,7 @@ class PlatformClient:
         plate: str | None = None,
         ticket_ref: str | None = None,
         plate_region: str | None = None,
+        descriptor: str | None = None,
     ) -> dict:
         # event_id is the lane's own, and it is what makes a re-sent flush safe.
         # The platform keys the session on it, so this exact arrival can only
@@ -149,6 +150,12 @@ class PlatformClient:
                 # default would be a second copy of a claim about what
                 # confirmed an entry, and the copy is the one that lies.
                 "entry_confirmation": entry_confirmation,
+                # The appearance descriptor, ONLY when this read produced one.
+                # Absent is NOT MEASURED, and an open without one is
+                # byte-identical to the open this lane sent before the field
+                # existed -- so a lane with the descriptor switched off is
+                # unchanged against any platform, old or new.
+                **({"descriptor": descriptor} if descriptor is not None else {}),
             },
         )
 

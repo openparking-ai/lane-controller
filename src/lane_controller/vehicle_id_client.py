@@ -200,6 +200,14 @@ class VehicleIdClient:
             # only logged. A consumer told the lane fell back can now ask which
             # read it fell back on; before this it could not.
             read_ref=read.read_id,
+            # The appearance descriptor, CARRIED. This translation used to stop
+            # at the fields the lane had a use for and the descriptor was not
+            # one of them, so a service with it switched on produced one per
+            # read and the lane dropped it here. Null from a service that did
+            # not measure one, and null from a service pinned before the field
+            # existed -- `Identity` reads it with a default, so an older
+            # service is unchanged by this line.
+            descriptor=identity.descriptor,
         )
 
     def operating_threshold(self) -> float | None:

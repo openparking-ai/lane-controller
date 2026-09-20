@@ -525,6 +525,7 @@ def test_the_same_unmeasured_presence_with_a_real_car_opens_exactly_one_session(
 # ---------------------------------------------------------------------------
 
 PLATE_IN_THE_LOG = "PLATETEXT1"
+DESCRIPTOR_IN_THE_LOG = "opvid-fp/1:DESCRIPTORTEXT1"
 
 
 def _log_events(controller):
@@ -643,3 +644,47 @@ def test_no_log_event_carries_plate_text(case):
             f"{event.kind} put plate text in events.detail, which the purge cannot reach: "
             f"{rendered}"
         )
+
+
+def test_the_descriptor_rides_the_session_open_and_never_the_log():
+    """The appearance descriptor is identity on the same terms the plate is --
+    one specific car's appearance -- and it is tens of kilobytes. `events.detail`
+    is what the retention purge cannot reach, so it goes on the SESSION ACTION
+    only, which becomes `POST /lane/sessions/open` and is not on the read
+    window.
+
+    Both halves are asserted, and the second is the control on the first: the
+    outbox item must carry it, or the sweep over the log is searching for a
+    value the lane never held.
+    """
+    seen = VehicleIdentity(
+        plate=PLATE_IN_THE_LOG, confidence=0.97, presence=True, descriptor=DESCRIPTOR_IN_THE_LOG
+    )
+    controller, vend, _ = build(
+        identities=[seen], crossings=[(ClosingSequence.FORWARD, 3.0)], default_action="allow"
+    )
+    controller.run_once()
+    assert vend.vend_count == 1
+
+    logged = _log_events(controller)
+    assert logged, "no log events, so this asserts nothing"
+    for event in logged:
+        rendered = json.dumps(event.as_dict()["detail"], default=str)
+        assert DESCRIPTOR_IN_THE_LOG not in rendered, (
+            f"{event.kind} put the descriptor in events.detail, which the purge cannot reach"
+        )
+
+    # THE CONTROL: the open carries it, so the value was in the lane and the
+    # sweep above was searching for something real.
+    assert detail(controller, SESSION_OPEN)["descriptor"] == DESCRIPTOR_IN_THE_LOG
+    assert detail(controller, SESSION_OPEN)["plate"] == PLATE_IN_THE_LOG
+
+    # And a read with none puts NO KEY on the open -- the open this lane sent
+    # before the field existed.
+    controller, _, _ = build(
+        identities=[VehicleIdentity(plate=PLATE_IN_THE_LOG, confidence=0.97, presence=True)],
+        crossings=[(ClosingSequence.FORWARD, 3.0)],
+        default_action="allow",
+    )
+    controller.run_once()
+    assert "descriptor" not in detail(controller, SESSION_OPEN)
