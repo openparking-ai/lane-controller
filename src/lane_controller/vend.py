@@ -279,6 +279,21 @@ class AssistedVend:
                 ),
             )
 
+        # 3b. vehicle_too_close -- the deactivate loop, `run_once`'s own check
+        # again. A completion that opened the boom with a second car on that
+        # loop is the tailgate the loop exists to prevent, arriving through the
+        # intercom instead of the camera. A lane with no such loop is never
+        # refused here.
+        if controller.held_by_deactivate_loop(controller.deactivate_loop):
+            return VendRefused(
+                code=VendRefusal.VEHICLE_TOO_CLOSE.value,
+                error=(
+                    "a second vehicle is on the deactivate loop behind the one at the "
+                    "barrier; this lane does not arm for it and does not complete a vend "
+                    "for it either, until the vehicle behind backs off"
+                ),
+            )
+
         # 4. decision_in_future, then decision_stale -- a completion is an
         # answer to a driver who is at the barrier NOW.
         #

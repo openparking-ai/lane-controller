@@ -58,6 +58,17 @@ measures a spacing. A site with one arming loop and no
 closing loops runs exactly as it always did; what it does not get is named in
 the record on every vehicle rather than described in a document.
 
+**A third loop, before the arming loops, HOLDS arming**: the deactivate loop.
+While it reads occupied the lane does not arm — a second vehicle that close
+behind the one at the barrier would follow it through an open boom, so the
+boom stays down until it backs off, and the assisted vend refuses for the same
+reason (`vehicle_too_close`). The hold is a level re-read on every turn, never
+an edge, and it is recorded at both ends (`arming_suppressed`,
+`arming_suppression_ended`), because a car that was held and then followed the
+one ahead anyway left neither picture nor event of its own. Zero or one per
+lane, declared like every other loop, with a spacing bounded below so the loop
+cannot sit under the tail of the very car it is meant to protect.
+
 ## Two properties worth stating plainly
 
 **It works with the internet down.** Every decision is made from a local cache
@@ -180,6 +191,7 @@ ruff check .
 python scripts/offline_fail_control.py       # breaks the outbox, requires the tests to fail
 python scripts/confirmation_fail_control.py  # breaks the confirmation, same requirement
 python scripts/contract_fail_control.py      # breaks the read contract, same requirement
+python scripts/deactivate_fail_control.py    # breaks the deactivate loop's hold, same requirement
 ```
 
 ## Vehicle ID
@@ -225,7 +237,7 @@ None of it is required to run this package, and none of it has been purchased ye
 |---|---|
 | Controller | Seeed reComputer Industrial J3011 (Jetson Orin NX), in the gate housing |
 | Barrier | Q-SAQ, driven by a dry-contact vend relay |
-| Detection | Inductive arming loops before the barrier, and two confirmation loops after it; plus the barrier's own closing loop, which is wired to the barrier |
+| Detection | Inductive arming loops before the barrier, an optional deactivate loop before those, and two confirmation loops after it; plus the barrier's own closing loop, which is wired to the barrier |
 | Cameras — default | Reolink RLC-810A |
 | Cameras — upper tiers | Axis P1465-LE, Hanwha XNO-9082R |
 

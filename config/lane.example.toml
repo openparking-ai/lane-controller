@@ -82,7 +82,10 @@ settle_grace_s = 5.0
 # How long an arming loop may read occupied, across this lane's own
 # observations, before `arming_loop_stuck_occupied` reads `active` -- which
 # refuses `POST /v1/lane/vend`, because a stuck loop tells the route's first
-# refusal that there is a car in front of the barrier.
+# refusal that there is a car in front of the barrier. THE SAME BOUND governs
+# the deactivate loop and `deactivate_loop_stuck_occupied`: a loop stuck
+# occupied there holds every arming cycle, so the lane silently stops
+# photographing cars, and the same dwell says the same thing about it.
 #
 # A PER-SITE SETTING AND AN ASSUMPTION, and this one is worth reading twice:
 # NOTHING HAS MEASURED A DWELL. No site exists, no arrival has been timed, and
@@ -134,7 +137,7 @@ vend_pulse_ms = 500
 # `geometry_assumed`, so nobody reading the record can mistake them for
 # something that was measured here.
 #
-# ALL FIVE KEYS ARE REQUIRED. There is no default for any of them: a file with
+# ALL SEVEN KEYS ARE REQUIRED. There is no default for any of them: a file with
 # no [loops] table, or with one of these spelt wrong, is refused at startup and
 # told which key is missing. A defaulted geometry is indistinguishable from a
 # mistyped one -- both write `unconfirmable` on every session -- and only one of
@@ -168,3 +171,14 @@ closing_spacing_m = 1.5
 # Held is its own answer: never voided silently (that is the abandoned-ticket
 # fraud) and never turned into a session (that is a phantom occupant).
 confirmation_window_seconds = 10.0
+# THE DEACTIVATE LOOP, before the arming loops: 0 or 1. While it reads occupied
+# the lane does not arm -- a second vehicle that close behind the one at the
+# barrier would follow it through, so the boom stays down until it backs off,
+# and the hold is recorded (`arming_suppressed` / `arming_suppression_ended`).
+# The spacing is from this loop to the NEAREST arming loop and must be at least
+# 6.0 m: a loop closer than the longest vehicle sits under that vehicle's own
+# tail while its nose is on the arming loop, and it holds itself for ever. A
+# lane that admits longer vehicles declares more. A site with no such loop
+# declares 0 and 0.0, and runs exactly as it did.
+deactivate_loops     = 0
+deactivate_spacing_m = 0.0

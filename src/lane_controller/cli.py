@@ -112,6 +112,7 @@ def _simulated_lane(config: LaneConfig) -> LaneController:
         identifier=StubVehicleIdentifier(),
         arming_loop_b=OccupancyLoopInput() if config.loops.arming_loops == 2 else None,
         closing_loops=ScriptedClosingLoops() if config.loops.confirms_entry else None,
+        deactivate_loop=OccupancyLoopInput() if config.loops.has_deactivate_loop else None,
     )
 
 

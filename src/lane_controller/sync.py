@@ -39,6 +39,19 @@ SESSION_CLOSE = "session_close"
 # ---------------------------------------------------------------------------
 ARMED = "armed"
 ARMING_INCOMPLETE = "arming_incomplete"
+#: THE DEACTIVATE LOOP HELD THE ARMING CYCLE. A vehicle is on the arming loop
+#: and a second one is on the deactivate loop behind it -- too close to be let
+#: through separately -- so the lane did not arm, did not photograph, did not
+#: vend. Recorded at the START of the held interval, once, with its reason;
+#: the interval is re-evaluated on every turn and ends in one of two ways,
+#: each recorded as ARMING_SUPPRESSION_ENDED. Never silent: a car that was
+#: held and then followed the one ahead anyway left neither picture nor event
+#: of its own, and this pair is the only record that anything was there.
+#:
+#: THE SAME LITERALS as `platform/src/app.js` `LANE_EVENT_KINDS`, which
+#: accepted both before this lane emitted either (platform PR #15).
+ARMING_SUPPRESSED = "arming_suppressed"
+ARMING_SUPPRESSION_ENDED = "arming_suppression_ended"
 
 ENTRY_PENDING = "entry_pending"
 ENTRY_CONFIRMED = "entry_confirmed"
@@ -74,6 +87,14 @@ REASON_REVERSE = "closing_sequence_reverse"
 REASON_WINDOW_ELAPSED = "confirmation_window_elapsed"
 REASON_NO_CLOSING_LOOPS = "no_closing_loops_configured"
 REASON_ARMING_INCOMPLETE = "only_one_arming_loop_occupied"
+#: Why an arming cycle was held: the deactivate loop read occupied.
+REASON_VEHICLE_TOO_CLOSE = "vehicle_too_close"
+#: How a held interval ended. `armed`: the deactivate loop cleared while the
+#: vehicle was still on the arming loop, and the lane armed for it.
+#: `arming_loop_cleared`: the vehicle left the arming loop without ever being
+#: armed for -- it backed out, or it followed the one ahead.
+SUPPRESSION_ENDED_ARMED = "armed"
+SUPPRESSION_ENDED_ARMING_LOOP_CLEARED = "arming_loop_cleared"
 #: The closing-loop driver did not return inside the lane's own settle deadline
 #: -- the confirmation window plus `[lane] settle_grace_s`. NOT the same fact as
 #: `confirmation_window_elapsed`, which is the loops answering that nothing

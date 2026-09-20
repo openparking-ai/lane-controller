@@ -168,6 +168,11 @@ class VendRefusal(StrEnum):
     #: before it arms, so an object that cannot span the gap cannot be
     #: completed into an open barrier either.
     GEOMETRY_INCOMPLETE = "geometry_incomplete"
+    #: The deactivate loop reads occupied NOW: a second vehicle is too close
+    #: behind the one at the barrier. The same check `run_once` makes before
+    #: it arms, so a completion cannot open a boom that a following car would
+    #: come through -- the intercom is not a door around the loop.
+    VEHICLE_TOO_CLOSE = "vehicle_too_close"
     #: `decision_at` is AHEAD of this lane's clock. `age > max_age` has no lower
     #: bound of its own, so a clock that stepped backwards would otherwise
     #: widen the staleness window by however far it stepped -- a negative age is
@@ -509,6 +514,13 @@ class MalfunctionCode(StrEnum):
     BOOM_DID_NOT_CLOSE = "boom_did_not_close"
     VEND_RELAY_FAULT = "vend_relay_fault"
     ARMING_LOOP_STUCK_OCCUPIED = "arming_loop_stuck_occupied"
+    #: The deactivate loop has read occupied for longer than any vehicle waits.
+    #: The same measurement as the arming loop's, on the loop before it, and a
+    #: code of its own because the repair is at a different loop: a stuck
+    #: deactivate loop holds EVERY arming cycle, so the lane silently stops
+    #: photographing, vending and recording cars -- the shape this contract
+    #: refuses to leave unnamed.
+    DEACTIVATE_LOOP_STUCK_OCCUPIED = "deactivate_loop_stuck_occupied"
     ARMING_LOOPS_DISAGREE = "arming_loops_disagree"
     CLOSING_LOOPS_NEVER_FIRING = "closing_loops_never_firing"
     CAMERA_FEED_LOST = "camera_feed_lost"
@@ -566,6 +578,7 @@ SOURCES: dict[MalfunctionCode, Source] = {
     MalfunctionCode.BOOM_DID_NOT_CLOSE: Source.NO_SOURCE,
     MalfunctionCode.VEND_RELAY_FAULT: Source.NO_SOURCE,
     MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED: Source.MEASURED,
+    MalfunctionCode.DEACTIVATE_LOOP_STUCK_OCCUPIED: Source.MEASURED,
     MalfunctionCode.ARMING_LOOPS_DISAGREE: Source.NOT_MEASURED,
     MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING: Source.MEASURED,
     MalfunctionCode.CAMERA_FEED_LOST: Source.NOT_MEASURED,
@@ -610,6 +623,7 @@ VEND_BLOCKING: tuple[MalfunctionCode, ...] = (
     MalfunctionCode.BOOM_DID_NOT_CLOSE,
     MalfunctionCode.VEND_RELAY_FAULT,
     MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED,
+    MalfunctionCode.DEACTIVATE_LOOP_STUCK_OCCUPIED,
     MalfunctionCode.ARMING_LOOPS_DISAGREE,
 )
 

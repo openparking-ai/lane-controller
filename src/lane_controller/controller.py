@@ -59,6 +59,8 @@ from .interfaces import (
 from .sync import (
     ARMED,
     ARMING_INCOMPLETE,
+    ARMING_SUPPRESSED,
+    ARMING_SUPPRESSION_ENDED,
     CONFIRMED,
     ENTRY_BACKED_OUT,
     ENTRY_CONFIRMED,
@@ -78,9 +80,12 @@ from .sync import (
     REASON_NO_CLOSING_LOOPS,
     REASON_NO_PENDING_ENTRY,
     REASON_REVERSE,
+    REASON_VEHICLE_TOO_CLOSE,
     REASON_WINDOW_ELAPSED,
     SESSION_CLOSE,
     SESSION_OPEN,
+    SUPPRESSION_ENDED_ARMED,
+    SUPPRESSION_ENDED_ARMING_LOOP_CLEARED,
     UNCONFIRMABLE,
     to_iso,
 )
@@ -140,6 +145,7 @@ class LaneController:
         identifier: VehicleIdentifier,
         arming_loop_b: LoopInput | None = None,
         closing_loops: ClosingLoops | None = None,
+        deactivate_loop: LoopInput | None = None,
         cache: DecisionCache | None = None,
         events: EventQueue | None = None,
         clock: Callable[[], float] = time.time,
@@ -168,6 +174,16 @@ class LaneController:
             raise ValueError(
                 f"loops.closing_loops = {config.loops.closing_loops} but closing_loops was "
                 f"{'supplied' if closing_loops else 'not supplied'}: "
+                "the declared geometry and the wired hardware must agree"
+            )
+        # The third loop, held to the same rule: declared and not wired would
+        # be a lane that publishes a hold it can never make; wired and not
+        # declared would be a hold the record never explains.
+        self.deactivate_loop = deactivate_loop
+        if config.loops.has_deactivate_loop != (deactivate_loop is not None):
+            raise ValueError(
+                f"loops.deactivate_loops = {config.loops.deactivate_loops} but deactivate_loop "
+                f"was {'supplied' if deactivate_loop else 'not supplied'}: "
                 "the declared geometry and the wired hardware must agree"
             )
         # `cache or DecisionCache(...)` would be wrong, and was: DecisionCache
@@ -221,6 +237,16 @@ class LaneController:
         #: observation read it clear. `arming_loop_stuck_occupied` is derived
         #: from it; see `observe_arming_loop`.
         self._arming_occupied_since: float | None = None
+        #: The same measurement on the DEACTIVATE loop, for
+        #: `deactivate_loop_stuck_occupied`; see `observe_deactivate_loop`.
+        self._deactivate_occupied_since: float | None = None
+        #: WHEN the current held arming interval began, on this lane's clock,
+        #: or `None` when no interval is open. Opened by `run_once` when a
+        #: vehicle is at the arming loop and the deactivate loop reads
+        #: occupied; closed by `run_once` on the next turn that finds either
+        #: loop changed. A LEVEL, re-read every turn, never an edge: an edge
+        #: would fire once and leave two queued cars waiting for each other.
+        self._suppressed_since: float | None = None
         #: Whether an assisted vend's settle has ever exceeded this lane's own
         #: deadline. `closing_loops_never_firing` is derived from it.
         self._loop_driver_timed_out = False
@@ -637,6 +663,19 @@ class LaneController:
         existing in one place and not in the other.
         """
         return loop_b is None or loop_b.is_occupied()
+
+    @staticmethod
+    def held_by_deactivate_loop(deactivate_loop: LoopInput | None) -> bool:
+        """The deactivate loop reads occupied NOW: a vehicle too close behind.
+
+        Public for the same reason as `arming_complete`, and applied by
+        `POST /v1/lane/vend` as `vehicle_too_close`: a completion that opened
+        the boom with a second car on this loop is the tailgate arriving
+        through the intercom instead of through the camera. A lane with no
+        deactivate loop is never held, and says so with `deactivate_loops: 0`
+        rather than with silence.
+        """
+        return deactivate_loop is not None and deactivate_loop.is_occupied()
 
     def _transit(self, state: TransitState, at: str) -> None:
         """Move the published transit, beside the event that says the same thing.
@@ -1104,6 +1143,74 @@ class LaneController:
             return 0.0
         return now - self._arming_occupied_since
 
+    def observe_deactivate_loop(self) -> float | None:
+        """Sample the deactivate loop, and return how long it has read occupied.
+
+        The same measurement as `observe_arming_loop`, on the loop before it,
+        and `None` when there is no such loop as well as when it reads clear:
+        a lane without one has nothing to observe, and
+        `deactivate_loop_stuck_occupied` answers `unknown` for it.
+        """
+        if self.deactivate_loop is None or not self.deactivate_loop.is_occupied():
+            self._deactivate_occupied_since = None
+            return None
+        now = self._clock()
+        if self._deactivate_occupied_since is None:
+            self._deactivate_occupied_since = now
+            return 0.0
+        return now - self._deactivate_occupied_since
+
+    @property
+    def arming_suppressed(self) -> bool:
+        """Whether a held arming interval is open right now."""
+        return self._suppressed_since is not None
+
+    def _hold_arming(self, geometry: dict) -> None:
+        """Open a held interval, or leave the open one open. Recorded ONCE.
+
+        The start is the event; the turns that follow while both loops still
+        read the same are not, because an interval is one thing and a record
+        that repeats it every poll is a log nobody can read. What each of
+        those turns DOES do is re-read the level, so the hold ends the moment
+        it should and not on the next arrival.
+        """
+        if self._suppressed_since is not None:
+            return
+        self._suppressed_since = self._clock()
+        log.info(
+            "lane %s: a vehicle is on the deactivate loop behind the one at the arming loop; "
+            "not arming until it backs off",
+            self.config.lane_id,
+        )
+        self.events.record(
+            ARMING_SUPPRESSED,
+            self.config.lane_id,
+            reason=REASON_VEHICLE_TOO_CLOSE,
+            geometry_assumed=geometry,
+        )
+        self.events.flush()
+
+    def _release_arming(self, ended_by: str, geometry: dict) -> None:
+        """Close the held interval, saying which of its two ends this was.
+
+        `armed`: the deactivate loop cleared with the vehicle still at the
+        arming loop, and the lane arms for it on this same turn.
+        `arming_loop_cleared`: the vehicle left without being armed for -- it
+        backed out, or it followed the car ahead through. Either way the
+        record closes; an interval that only ever started would be a car
+        nobody photographed and a record that never ends.
+        """
+        held_for = self._clock() - self._suppressed_since
+        self._suppressed_since = None
+        self.events.record(
+            ARMING_SUPPRESSION_ENDED,
+            self.config.lane_id,
+            ended_by=ended_by,
+            held_for_s=round(held_for, 3),
+            geometry_assumed=geometry,
+        )
+        self.events.flush()
+
     def _identity_detail(self, identity, *, with_region: bool) -> dict:
         """The identity fields a SESSION ACTION carries, and only those.
 
@@ -1179,6 +1286,23 @@ class LaneController:
             # timeout branch is the one an actually-stuck loop takes for ever --
             # and it is the branch where the observation matters most.
             self.observe_arming_loop()
+            self.observe_deactivate_loop()
+            if self._suppressed_since is not None:
+                # THE HELD INTERVAL, RE-READ ON THE IDLE TURN, because a loop
+                # driver that reports an ARRIVAL once per vehicle will never
+                # report the held one again: this turn is the only place its
+                # hold can end. Two ends. The vehicle left the arming loop --
+                # backed out, or followed the car ahead -- and the interval
+                # closes the second way, now, not when the next car comes.
+                # Or the deactivate loop cleared with the vehicle still there,
+                # and the lane arms for it on this turn exactly as it would
+                # have on the arrival it already served.
+                geometry = self.config.loops.as_published()
+                if not self.loop.is_occupied():
+                    self._release_arming(SUPPRESSION_ENDED_ARMING_LOOP_CLEARED, geometry)
+                elif not self.held_by_deactivate_loop(self.deactivate_loop):
+                    self._release_arming(SUPPRESSION_ENDED_ARMED, geometry)
+                    return self._arm(geometry)
             # THE LOOPS AFTER THE GATE, on the idle turns. Every turn that
             # serves no arrival asks them whether anything crossed since they
             # were last read, and a lane with its barrier up is a lane where
@@ -1186,9 +1310,36 @@ class LaneController:
             self.observe_closing_loops()
             return None
         self.observe_arming_loop()
+        self.observe_deactivate_loop()
 
-        lane = self.config.lane_id
         geometry = self.config.loops.as_published()
+        if self.held_by_deactivate_loop(self.deactivate_loop):
+            # A vehicle is at the arming loop and another is on the deactivate
+            # loop behind it. The boom stays down: an arm now is a vend the
+            # second car follows through. Recorded once per interval, and the
+            # LEVEL is read again on every turn -- this branch when the driver
+            # reports the vehicle again, the idle branch above when it does
+            # not -- so the hold ends the moment the second car backs off and
+            # not on some later arrival. An edge here would leave both cars
+            # waiting for each other.
+            self._hold_arming(geometry)
+            return None
+        if self._suppressed_since is not None:
+            # The deactivate loop cleared with the vehicle still at the arming
+            # loop: the first way an interval ends, and the lane arms for it
+            # now, through the same checks as any arrival.
+            self._release_arming(SUPPRESSION_ENDED_ARMED, geometry)
+        return self._arm(geometry)
+
+    def _arm(self, geometry: dict) -> Decision | None:
+        """A vehicle is at the arming loop and nothing holds it: arm, or say why not.
+
+        The tail of `run_once` in its own method, because it is now reached
+        from two places -- the arrival the driver reported, and the idle turn
+        on which a held vehicle's hold ended -- and the arming check must be
+        the same check on both.
+        """
+        lane = self.config.lane_id
         if not self.arming_complete(self.arming_loop_b):
             log.info("lane %s: one arming loop only, not arming", lane)
             self.events.record(

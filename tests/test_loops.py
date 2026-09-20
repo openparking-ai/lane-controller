@@ -183,6 +183,8 @@ def test_the_geometry_travels_with_the_record_as_an_assumption():
         "closing_loops": 2,
         "closing_spacing_m": 1.5,
         "confirmation_window_seconds": 7.5,
+        "deactivate_loops": 0,
+        "deactivate_spacing_m": 0.0,
     }
 
 

@@ -83,6 +83,16 @@ jobs:
         # until this round; this is what keeps it in one.
         run: python scripts/unadmitted_fail_control.py
 
+      - name: Deactivate-loop fail-control
+        # Breaks the third loop's guarantees on purpose -- the level (an edge
+        # deadlocks two queued cars), each end of the held interval, its
+        # record at both ends, the assisted vend's own application of the
+        # check, the stuck measurement and the spacing bound -- and requires
+        # tests/test_deactivate_loop.py to fail each time. A hold that the
+        # record cannot show is the silent non-event this lane refuses to
+        # write; this is what keeps it written.
+        run: python scripts/deactivate_fail_control.py
+
       - name: Lane-contract fail-control
         # Breaks each property the read contract exists to have -- the geometry
         # it publishes, the completeness of the health table, `unknown` not

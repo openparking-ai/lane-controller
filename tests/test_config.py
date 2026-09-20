@@ -179,6 +179,8 @@ def test_the_example_config_is_the_standard_installation():
             "confirmation_window_second = 10.0",
             "confirmation_window_seconds",
         ),
+        (r"^deactivate_loops\b", "deactivate_loop      = 0", "deactivate_loops"),
+        (r"^deactivate_spacing_m\b", "deactivate_spacing = 0.0", "deactivate_spacing_m"),
     ],
 )
 def test_a_mistyped_loop_key_refuses_to_start_and_names_the_key(
