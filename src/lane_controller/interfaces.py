@@ -146,22 +146,30 @@ class ClosingLoops(Protocol):
         and no vend's read of these loops is outstanding, and records what it
         finds as an entry nothing admitted.
 
-        Never blocks -- and the controller leans on that: a vend's read that
-        begins while this call is in flight waits for it to return before
-        asking the board, so the two reads never overlap, and a vend that
-        begins while this call is in flight waits for it before its pending
-        entry is published, so this call is never made once a pending entry
-        is published. What that does NOT cover: the relay is pulsed before
-        the pending entry is published, so a crossing that completes in that
-        gap is this call's, not the vend's -- stated, with what the lock proves
-        and what it does not, at `LaneController._reads_outstanding`. A
-        `poll_sequence` that blocked would hold both for exactly as long, and
-        it would hold `run_once` too, since that is the thread it runs on.
-        Returns the sequence the loops completed since they were last read by
-        EITHER call, and consumes it: a crossing is reported once, by whichever
-        read asked first. No window applies here -- there is
-        nothing to confirm inside one -- so a slow crossing that has finished
-        is still a crossing, and the controller records it as such.
+        Never blocks -- and the controller holds nothing across it that a
+        vend's ROUTE needs: a vend that begins while this call is in flight
+        publishes its pending entry at once, and a vend's READ that begins
+        while this call is in flight waits for it to return before asking the
+        board, so the two reads never overlap. A crossing this call returns
+        after a vend began during it is handed to that vend rather than
+        recorded, because it may be that vend's car -- and to the read that
+        carries that transit's timestamp, so a read carrying a different one
+        asks the board instead. What makes a later transit's timestamp differ,
+        and the one way it might not, is stated at `LaneController._handed`
+        rather than promised here. What that does NOT
+        cover: the relay is pulsed before the pending entry is published, so
+        a crossing that completes in that gap, read by a call that also
+        completes in that gap, is this call's -- stated, with what the lock
+        proves and what it does not, at `LaneController._reads_outstanding`.
+        A `poll_sequence` that blocked would hold the vend's read for exactly
+        as long, on the settle thread and under the settle's deadline; and it
+        would hold `run_once`, since that is the thread it runs on. It would
+        not hold the vend route. Returns the sequence the loops completed since
+        they were last read by EITHER call, and consumes it: a crossing is
+        reported once, by whichever read asked first. No window applies here
+        -- there is nothing to confirm inside one -- so a slow crossing that
+        has finished is still a crossing, and the controller records it as
+        such.
 
         Every implementation, simulated or real, supplies this;
         `tests/test_unadmitted.py` walks the implementations and refuses one

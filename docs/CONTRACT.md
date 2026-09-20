@@ -907,7 +907,17 @@ There is no flag that turns any of that off.
   after the gate (`entry_unadmitted`) stands down at this lane, because a read
   is outstanding on the board. It costs nothing else: later vends settle and
   arrivals are served exactly as before, and none of them waits on the
-  abandoned read.
+  abandoned read. **The idle read's driver call can hang too, and the cost is
+  not symmetric.** `POST /v1/lane/vend` answers in either case — nothing on
+  the route waits on a driver call. But the idle read runs on the lane's one
+  loop thread, so a driver that never returns from it leaves that thread
+  inside the driver: no further arrival is decided and no further idle read
+  happens until restart. The one case the lane was holding when the read
+  hung can still be completed: it is answered 202, and its settle waits
+  behind the hung read under the settle's own deadline — `unconfirmable`,
+  `loop_driver_timeout`, one more leaked thread. So a hung settle read costs
+  one vend its confirmation and nothing after it; a hung idle read costs the
+  lane every car after the one it was holding.
 - **No measurement of the boom.** `vend_commanded` is what this lane can stand
   behind; whether the barrier rose is `no_source` and stays that way.
 - **No verification of a ticket.** Shape only. No signature, no expiry, no

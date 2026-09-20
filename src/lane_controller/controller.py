@@ -255,46 +255,143 @@ class LaneController:
         #: arrivals are served, and `closing_loops_never_firing` is already
         #: `active` from the same event.
         #:
-        #: `_board` is the bookkeeping lock for this count and for the published
-        #: transit state, and it is held by exactly three things: the poll
-        #: across BOTH its checks (nothing pending, nothing reading) AND its
-        #: `poll_sequence` call; the vend's read across `+= 1` and across
-        #: `-= 1`; and `_transit` across the two assignments that publish a
-        #: transit state. NEVER across `wait_for_sequence`, never across the
-        #: relay, never across anything else that leaves this process. So the
-        #: waits left in this design are a vend counting itself in, or a
-        #: transit state being published, while a poll's read is in flight --
-        #: a read the seam says never blocks. A `poll_sequence` that blocked
-        #: would hang `run_once` on its own, count or no count, so this adds no
-        #: way to lose the lane that the seam's contract does not already
-        #: forbid.
+        #: `_board` is the bookkeeping lock for this count, for the published
+        #: transit state, and for the poll's claim -- and it is held across
+        #: NOTHING that leaves this process. Not across `wait_for_sequence`,
+        #: not across `poll_sequence`, not across the relay. Held by exactly
+        #: four things: the poll across its two checks (nothing pending,
+        #: nothing reading) AND the claim that follows them (`_poll_reading`);
+        #: the poll again, after its read, to release the claim and decide
+        #: whose the crossing is; the vend's read across `+= 1` (after waiting
+        #: for a poll read in flight to release its claim) and across `-= 1`;
+        #: and `_transit` across the two assignments that publish a transit
+        #: state. So the waits left in this design are: a vend counting itself
+        #: in behind a poll's read in flight, on the settle thread, bounded by
+        #: the settle's own deadline; and everything else waiting on a handful
+        #: of assignments. THE VEND ROUTE WAITS ON NO DRIVER. The version before
+        #: this one held `_board` across `poll_sequence` itself, and `_transit`
+        #: publishes PENDING under `_board`, so a poll driver that hung held
+        #: `POST /v1/lane/vend` inside `complete_vend` AFTER the relay had
+        #: pulsed: no 202, a retry refused `already_completed`, the lane `busy`
+        #: for as long as the driver hung, and the record of who opened the
+        #: barrier sitting unflushed (measured 2026-09-19: no answer in 3 s at
+        #: `0c91190`, 202 in 20 ms at `df982e2`). The seam says `poll_sequence`
+        #: never blocks, and `wait_for_sequence` said the same, and this lane
+        #: bounded the settle anyway because a driver breaks its contract on
+        #: the day somebody is being paged about it.
         #:
         #: THE RULE, because it was broken twice in one round: A CHECK AND THE
-        #: READ THAT DEPENDS ON IT ARE ONE CRITICAL SECTION. The first version
+        #: CLAIM THAT DEPENDS ON IT ARE ONE CRITICAL SECTION. The first version
         #: checked the count and then read, two moments, and a vend that began
         #: between them lost its crossing. The second checked "nothing pending"
         #: OUTSIDE this lock and read inside it: a poll that passed that check,
         #: was parked by the interpreter, and read after a vend had begun and
         #: its car had crossed, took that car's crossing -- the vend held, no
         #: session, and an `entry_unadmitted` written for a car that WAS
-        #: admitted (measured: 26 to 42 of 200 with the crossing placed the
+        #: admitted (measured: 23 to 42 of 200 with the crossing placed the
         #: instant the vend route answered). Now `_transit` publishes PENDING
         #: under this lock and the poll checks it under this lock, so either
-        #: the poll's whole check-and-read completes before PENDING exists, or
-        #: it sees PENDING and stands down. THAT interleaving cannot happen, and
+        #: the poll's check-and-claim completes before PENDING exists, or it
+        #: sees PENDING and stands down. THAT interleaving cannot happen, and
         #: `tests/test_unadmitted.py` holds the poll inside its critical section
-        #: to prove a beginning vend waits for it.
+        #: to prove a beginning vend waits for the claim -- and only for it.
+        #:
+        #: WHAT HAPPENS TO A CROSSING THE POLL IS HOLDING WHEN A VEND BEGAN
+        #: DURING ITS READ: it is that vend's, and it is taken by that vend's
+        #: read and by no read carrying a different `at` (what makes two
+        #: differ, and the one way they might not, is stated at `_handed`).
+        #: The poll claimed first, so the vend's own
+        #: read waits behind it; when the poll's driver returns, the poll
+        #: checks under `_board` whether a transit was published while it was
+        #: out, and if one was it hands the crossing over (`_handed`) WITH THE
+        #: TRANSIT'S `at` -- the timestamp `begin_transit` published and
+        #: `resolve_transit` carries -- and a read takes the slot only when its
+        #: own `at` is the slot's. Unbound, the slot went to whichever read
+        #: reached it first: when the vend it was handed for had already been
+        #: answered by the settle's deadline, the next read through either
+        #: door -- a second assisted vend, or the loop thread's own next ALLOW
+        #: arrival -- took it, and that car was `confirmed` with a session
+        #: before it had crossed, its own crossing recorded `entry_unadmitted`
+        #: at the next idle read (measured 2026-09-19: 18 to 38 of 200, no
+        #: pause planted). Neither discarded -- that loses the promotion --
+        #: nor labelled `entry_unadmitted` -- that mislabels an admitted car,
+        #: the one thing this event exists not to do. WHAT A HANDED CROSSING
+        #: BECOMES WHEN ITS VEND NEVER RETURNS -- the deadline answered it
+        #: `unconfirmable` before the poll's driver came back -- is nothing:
+        #: its own read, abandoned but still waiting, takes the slot, finds its
+        #: claim gone and records nothing, exactly as a driver that returns
+        #: after the deadline has always been treated. The lane admitted that
+        #: car (the relay pulsed), so it is not `entry_unadmitted`; nothing
+        #: confirmed it inside the deadline, so it is not `entry_confirmed`;
+        #: the crossing is invisible in the record, and `entry_unconfirmable`
+        #: is the only thing that says why. A RESIDUAL, stated, not called
+        #: complete. What the hand-over itself costs is the residual
+        #: `observe_closing_loops` states already: a car nothing admitted that
+        #: crossed inside the poll's read, in the same instant a vend began, is
+        #: promoted as the vend's car, and the vend's own crossing is the next
+        #: idle read's -- count right, attribution one car off, in a window the
+        #: seam's own contract puts at microseconds. Nothing here says that
+        #: cannot happen.
         #:
         #: WHAT THE LOCK DOES NOT PROVE, said here so nobody stops checking: the
         #: relay is pulsed BEFORE `begin_transit` publishes PENDING
-        #: (`complete_vend`, and it is the order the vend tests pin), so a
-        #: crossing that completed in the microseconds between the relay firing
-        #: and PENDING being published would still be the poll's. That is a
-        #: barrier that rose and a car that crossed two loops inside one
-        #: function call; no measurement here says it happens, and nothing here
-        #: proves it cannot.
+        #: (`complete_vend`, and it is the order the vend tests pin), so a poll
+        #: whose whole check, claim and read complete in the microseconds
+        #: between the relay firing and PENDING being published keeps a
+        #: crossing that completed in that gap. That is a barrier that rose and
+        #: a car that crossed two loops inside one function call; no
+        #: measurement here says it happens, and nothing here proves it cannot.
         self._reads_outstanding = 0
-        self._board = threading.Lock()
+        #: Whether the idle read's driver call is in flight: claimed under
+        #: `_board`, released under it, and the one thing a vend's read waits
+        #: for. A `Condition` over the same lock so that wait is a wait and
+        #: not a spin.
+        self._poll_reading = False
+        #: A crossing the poll read while a vend began, held for that vend's
+        #: read with that vend's `at`, so no read carrying a different `at`
+        #: can take it. One slot is enough: at most one transit can be
+        #: published during one poll read. The loop thread is inside the
+        #: read, so only the route can publish; the route's first vend
+        #: consumed the decision, so a second POST -- even after the settle's
+        #: deadline has cleared `_in_progress` -- is refused
+        #: `already_completed` (`vend.py`, one decision one vend), and a new
+        #: decision needs `handle_arrival`, which is the loop thread, which is
+        #: inside the read. And the poll does not read again while a transit
+        #: is pending or a read is outstanding. Not "a second vend cannot
+        #: begin while the first is pending": the first stops being pending at
+        #: the settle's deadline, and a second transit can then begin through
+        #: either door with the slot still full -- which is why the `at`
+        #: travels with the crossing.
+        #:
+        #: WHAT MAKES TWO `at`s DIFFER, since the binding is an equality test
+        #: on them: nothing in this file. The key is `to_iso(self._clock())`,
+        #: a wall-clock timestamp at ONE MICROSECOND of resolution (that is
+        #: `to_iso`'s, whatever the clock's), and two transits' samples are
+        #: separated by at least the first's `begin_transit` and a whole
+        #: door's work -- an arrival served, or an HTTP request -- so on a
+        #: clock that only moves forward they never share a microsecond. The
+        #: clock is `time.time`, which is NOT guaranteed to move forward: a
+        #: wall-clock step backwards that lands a later transit's sample on
+        #: the exact microsecond of a slot still full would let that read take
+        #: the earlier transit's crossing -- one pair's attribution, the
+        #: outcome this binding exists to prevent, in a window that needs the
+        #: clock to step onto a single microsecond while an abandoned worker
+        #: is between its notify and its take. Not guarded here; STATED, a
+        #: residual smaller than the ones above it. An injected clock that
+        #: does not advance would collide every time, and `demo.py` injects
+        #: frozen ones -- it runs one arrival per lane and never an idle turn,
+        #: so nothing is ever handed over there. Measured 2026-09-19 on the
+        #: re-gate's box: 2000 of 2000 transits through the loop door carried
+        #: distinct `at`s.
+        self._handed: tuple[ClosingSequence, str] | None = None
+        self._crossings_handed = 0
+        #: How many transit states have ever been published. The poll notes
+        #: it at its claim and compares after its read: a vend that began
+        #: during the read moved it -- whether that vend is still pending or
+        #: the lane's deadline has already answered it -- and the crossing
+        #: in hand is that vend's either way.
+        self._transits_published = 0
+        self._board = threading.Condition()
 
     def now(self) -> float:
         """This lane's clock, which is the authority for WHEN.
@@ -550,16 +647,19 @@ class LaneController:
         collapsed them would be the first place they got confused.
 
         UNDER `_board`, because the idle poll's "nothing pending" check reads
-        this state under the same lock: the check and the poll's read are one
+        this state under the same lock: the check and the poll's claim are one
         critical section, and publishing PENDING is the other side of it. Two
-        assignments, nothing that can block. No caller holds `_board` when it
-        gets here -- `resolve_transit` has released it inside
+        assignments, nothing that can block, and nothing that waits on a
+        driver: `_board` is never held across one, so this returns in the time
+        it takes a handful of assignments elsewhere to finish. No caller holds
+        `_board` when it gets here -- `resolve_transit` has released it inside
         `_read_closing_loops` before it decides anything, and the poll never
         moves the transit.
         """
         with self._board:
             self.transit_state = state.value
             self.transit_since = at
+            self._transits_published += 1
 
     @staticmethod
     def _identity_kind(identity) -> str:
@@ -655,7 +755,7 @@ class LaneController:
         # session out of a window this lane published on the event and never
         # applied.
         started = self._clock()
-        crossing = self._read_closing_loops(window)
+        crossing = self._read_closing_loops(window, at)
         elapsed = self._clock() - started
 
         # THE DRIVER RETURNED. Whether this call is still the one that may say
@@ -766,23 +866,42 @@ class LaneController:
     # A crossing with nothing pending: the read nobody made.
     # ------------------------------------------------------------------
 
-    def _read_closing_loops(self, window: float) -> ClosingSequence:
+    def _read_closing_loops(self, window: float, at: str) -> ClosingSequence:
         """The vend's read of the loops after the gate: counted in, counted out.
 
-        UNCONDITIONAL. Nothing here waits on another vend, ever: the count goes
-        up, the driver is asked, the count comes down when -- and only when --
-        the driver returns. A driver that never returns leaves the count up for
-        ever, which is one idle poll standing down at this lane for ever, and
-        that is the whole of its cost; see `_reads_outstanding`. The `+= 1`
-        waits for a poll's read in flight, or for a transit state being
-        published -- two assignments -- if there is one, and for nothing else.
+        It waits for exactly one thing: a poll's read in flight, which claimed
+        the board first and must return before a second driver call is made on
+        it -- microseconds by the seam's promise, and as long as the driver
+        takes if the driver breaks it. That wait is on THIS thread: the
+        `assisted-vend-resolve` worker, which `vend.py` abandons at the settle
+        deadline exactly as it abandons a hung blocking read, or the loop
+        thread on an ordinary arrival, which is the poll's own thread and so
+        never finds one in flight. It is never the vend route's wait.
+
+        Then: if the poll handed over a crossing that completed while THIS
+        transit was beginning -- the slot carries the transit's `at`, and only
+        a read carrying the same `at` takes it; a read carrying a different
+        `at` leaves it and asks the driver. What makes a later transit's `at`
+        differ is stated at `_handed`, with the one way it might not -- that
+        crossing is this read's answer and the driver is not asked. Otherwise
+        the count goes up, the driver is asked, and the
+        count comes down when -- and only when -- the driver returns. A driver
+        that never returns leaves the count up for ever, which is one idle poll
+        standing down at this lane for ever, and that is the whole of its
+        cost; see `_reads_outstanding`.
 
         Its own method so the fail-control can put the mutex back and watch
         the lane starve.
         """
         with self._board:
+            self._board.wait_for(lambda: not self._poll_reading)
+            handed = None
+            if self._handed is not None and self._handed[1] == at:
+                handed, self._handed = self._handed[0], None
             self._reads_outstanding += 1
         try:
+            if handed is not None:
+                return handed
             return self.closing_loops.wait_for_sequence(window)
         finally:
             with self._board:
@@ -796,18 +915,21 @@ class LaneController:
         counted outstanding and the crossing that arrives belongs to that
         vend. The published transit state covers that moment -- PROVIDED this
         is read under `_board`, which is where `_transit` publishes it. The poll
-        calls this holding `_board`, so its answer and the read that follows
+        calls this holding `_board`, so its answer and the claim that follows
         are one moment relative to `begin_transit`; read unlocked, the answer
         is stale by the time it is used, and that is the gap that let a poll
-        take a beginning vend's crossing. The count covers the read itself.
+        take a beginning vend's crossing. The claim covers the read itself,
+        and a vend that begins during the read gets what the read found.
         """
         return self.transit_state != TransitState.PENDING.value
 
     def _nothing_reading(self) -> bool:
         """Whether no read of the loops is outstanding right now. Never waits.
 
-        The poll calls this holding `_board`, so its answer and the read that
-        follows are one moment; anything else may call it unlocked.
+        The poll calls this holding `_board`, so its answer and the claim that
+        follows are one moment; anything else may call it unlocked. The poll's
+        own read in flight is not counted here -- it is `_poll_reading`, and
+        the poll cannot be asking while it is out.
         """
         return self._reads_outstanding == 0
 
@@ -820,14 +942,20 @@ class LaneController:
         by that arrival's vend and promoted as though it were that vehicle, and
         the vehicle's own crossing is then the one recorded here: the count is
         right and the attribution is one car off, for at most one poll interval
-        of unread crossing. Reading before the arrival is served would fix the
-        attribution and is not done, because nothing in this package can say
-        whether a crossing it holds happened before or after the arming loop
-        fired -- the seam reports sequences, not times.
+        of unread crossing. The same one-car-off, in a window of microseconds
+        rather than a poll interval, when a vend begins WHILE this read is in
+        flight: the crossing this read comes back with is then handed to that
+        vend rather than recorded here (see `_reads_outstanding`), because the
+        alternative is an admitted car written down as one nothing admitted.
+        Reading before the arrival is served would fix the attribution and is
+        not done, because nothing in this package can say whether a crossing it
+        holds happened before or after the arming loop fired -- the seam
+        reports sequences, not times.
 
         Returns the kind recorded, or None when nothing was: because there are
-        no loops, because a read of them is outstanding, or because nothing
-        crossed.
+        no loops, because a read of them is outstanding, because nothing
+        crossed, or because what crossed was handed to a vend that began
+        during the read.
 
         WHAT IT RECORDS. A FORWARD crossing at an ENTRY lane is
         `entry_unadmitted`, with its own reason and with what this lane last
@@ -850,9 +978,9 @@ class LaneController:
         if self.closing_loops is None:
             return None
         with self._board:
-            # BOTH CHECKS AND THE READ UNDER ONE LOCK. `_transit` publishes
+            # BOTH CHECKS AND THE CLAIM UNDER ONE LOCK. `_transit` publishes
             # PENDING under this same lock, so a vend cannot begin between the
-            # pending check and the read: either this whole block runs first,
+            # pending check and the claim: either this whole block runs first,
             # or the vend's PENDING is already published and this stands down.
             # Checked outside the lock, "nothing pending" was true when asked
             # and false by the time the board was read, and the poll took a
@@ -862,7 +990,45 @@ class LaneController:
                 # driver has not come back. Whatever crosses now is that vend's
                 # answer. Skip the turn; never wait for it.
                 return None
+            self._poll_reading = True
+            claimed_at = self._transits_published
+        # THE READ, OUTSIDE THE LOCK. Under it, a poll driver that hung held
+        # `_transit`, and with it `POST /v1/lane/vend` after the relay had
+        # pulsed. The claim above is what a vend's read waits for instead.
+        try:
             crossing = self.closing_loops.poll_sequence()
+        except BaseException:
+            with self._board:
+                self._poll_reading = False
+                self._board.notify_all()
+            raise
+        with self._board:
+            self._poll_reading = False
+            # A VEND BEGAN WHILE THIS WAS OUT. Its PENDING went up under this
+            # lock after the claim -- and, if the driver was out long enough,
+            # the lane's deadline may already have answered it -- so the
+            # crossing in hand, if there is one, is that vend's: it is handed
+            # over, not recorded, WITH THAT TRANSIT'S `at` (`transit_since`
+            # is still its `at` after the deadline, which republishes under
+            # the same one), and only the read carrying that `at` takes it
+            # before asking the driver. That vend's read, if the deadline has
+            # already answered it, finds its claim taken and records nothing,
+            # exactly as a late driver return; a later transit's read leaves
+            # the slot alone. Whose the crossing REALLY was is the residual
+            # stated in this method's docstring.
+            handed = (
+                crossing is not ClosingSequence.NONE and self._transits_published != claimed_at
+            )
+            if handed:
+                self._handed = (crossing, self.transit_since)
+                self._crossings_handed += 1
+            self._board.notify_all()
+        if handed:
+            log.info(
+                "lane %s: a vend began during the idle read; the crossing it found is the vend's",
+                self.config.lane_id,
+            )
+            return None
         if crossing is ClosingSequence.NONE:
             return None
 
