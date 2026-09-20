@@ -309,6 +309,24 @@ class VehicleIdentity:
     #: KIND and not this value; the session action carries it, and that goes to
     #: the platform's `vehicles.ticket_ref`, which the retention purge redacts.
     ticket_ref: str | None = None
+    #: THE APPEARANCE DESCRIPTOR: the identity service's opaque, versioned,
+    #: compact string (`opvid-fp/<version>:…`) computed from this read -- a
+    #: bounded set of keypoints, a colour histogram and a coarse edge grid.
+    #: Not an image, and not parsed here: this lane carries it, and the exit's
+    #: search compares it against the descriptors of every open stay.
+    #:
+    #: A READING, like the plate, and `None` means NOT MEASURED: the service
+    #: produces one only when a deployment switches it on, so most reads carry
+    #: none and a lane without one is unchanged. It used to be dropped on the
+    #: translation from the service's `Identity`; now it survives it.
+    #:
+    #: IT NEVER REACHES THE READ CONTRACT OR `events.detail`. It describes one
+    #: specific car's appearance, which makes it identity on the same terms the
+    #: plate is, and `events.detail` is what the retention purge cannot reach
+    #: (a descriptor is also tens of kilobytes, per event, for ever). It rides
+    #: the SESSION ACTION only -- `POST /lane/sessions/open` -- to the
+    #: platform's `sessions.entry_descriptor`, which its purge nulls.
+    descriptor: str | None = None
 
     def __post_init__(self) -> None:
         """The seam. Anything not in the set is refused, never carried.

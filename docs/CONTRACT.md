@@ -478,9 +478,14 @@ policy for both surfaces.
 **This route serves LOG events.** Session actions — a session opened, a session
 closed — are not on it. They are the ledger's: they become
 `POST /lane/sessions/open` and `/close` on the platform this lane reports to,
-they carry the plate, and the platform is the durable record of them. What
-happened at the lane is answered here and by `GET /v1/lane/state`; who was in
-the vehicle is not on this contract at all.
+they carry the plate — and, when the identity service produced one, the
+**appearance descriptor** of the read, which the open carries and the platform
+holds on the session (`entry_descriptor`) and must echo back, or the lane
+counts the open undelivered — and the platform is the durable record of them.
+What happened at the lane is answered here and by `GET /v1/lane/state`; who was
+in the vehicle is not on this contract at all, and neither is what it looked
+like: the descriptor is identity on the same terms the plate is, and
+`events.detail` is what the retention purge cannot reach.
 
 `detail` is opaque to this contract. It is whatever the lane recorded with the
 event, and a consumer ignores keys it does not recognise. **No plate text goes

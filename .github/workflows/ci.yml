@@ -110,6 +110,16 @@ jobs:
         # cannot go red on it is not evidence that it does not happen.
         run: python scripts/fallback_cause_fail_control.py
 
+      - name: Descriptor fail-control
+        # The appearance descriptor crosses three points on its way from the
+        # identity service to the platform's session -- the translation from
+        # the service's contract, the session action, and the echo the lane
+        # requires back -- and each is broken in turn. The third is the one
+        # that matters: a platform older than the column answers 201 and
+        # drops the field, and a lane that did not require the echo would
+        # count that open delivered.
+        run: python scripts/descriptor_fail_control.py
+
       - name: Assisted-vend fail-control
         # THE ROUND'S OWN CONTROL, and the most important one in this file.
         # `POST /v1/lane/vend` is the first route in this project that can open

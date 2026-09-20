@@ -87,6 +87,22 @@ def test_the_engine_never_inventing_a_field_survives_the_translation():
     assert identity.make is None and identity.model is None and identity.color is None
     assert identity.plate_region is None
     assert identity.marks == ()
+    assert identity.descriptor is None, "no descriptor measured reaches the lane as none"
+
+
+def test_the_descriptor_survives_the_translation():
+    """The appearance descriptor used to be dropped HERE: the translation copied
+    the fields the lane had a use for, and this was not one of them, so a
+    service with it switched on produced one per read and the lane threw it
+    away. The exit's search rests on it reaching the session open.
+    """
+    descriptor = "opvid-fp/1:eJwBDiTx2planted"
+    c = client_returning(
+        {"cursor": 1, "read": a_read(identity=Identity(plate="ABC123", descriptor=descriptor))}
+    )
+    identity = c.identify([a_frame()])
+    assert identity.descriptor == descriptor
+    assert identity.plate == "ABC123", "and the plate is unchanged beside it"
 
 
 def test_no_frames_asks_nothing_of_the_service():

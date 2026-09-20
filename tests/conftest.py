@@ -206,6 +206,57 @@ def _break_the_confirmation(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Deliberate breakage, for the descriptor fail-control.
+#
+# scripts/descriptor_fail_control.py sets BREAK_DESCRIPTOR and requires the
+# suites that carry the appearance descriptor to FAIL. Each mode breaks exactly
+# one of the three points the descriptor crosses on its way to the platform --
+# the translation from the service's contract, the session action, and the
+# echo the lane requires back -- so a control that passes says the suite
+# measures that crossing and not something beside it.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_descriptor(monkeypatch):
+    mode = os.environ.get("BREAK_DESCRIPTOR")
+    if not mode:
+        return
+
+    from dataclasses import replace as _replace
+
+    from lane_controller import sync as _sync
+    from lane_controller.controller import LaneController
+    from lane_controller.vehicle_id_client import VehicleIdClient
+
+    if mode == "translation":
+        # The client drops the descriptor on translation again, as it did
+        # before this round: the service produced one, the lane never held it.
+        original = VehicleIdClient.identify
+
+        def identify_without_descriptor(self, frames):
+            return _replace(original(self, frames), descriptor=None)
+
+        monkeypatch.setattr(VehicleIdClient, "identify", identify_without_descriptor)
+
+    elif mode == "record":
+        # The lane holds it and the session action does not carry it, so the
+        # open goes out exactly as it did before the field existed.
+        monkeypatch.setattr(
+            LaneController, "_session_descriptor", staticmethod(lambda identity: {})
+        )
+
+    elif mode == "echo":
+        # The lane sends it and does not require it back. A platform older
+        # than the column then answers 201, drops it, and the lane counts the
+        # open delivered -- the silent loss the echo exists to make loud.
+        monkeypatch.setattr(_sync, "require_descriptor_echo", lambda result, sent: None)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_DESCRIPTOR mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
 # Deliberate breakage, for the unadmitted-entry fail-control.
 #
 # scripts/unadmitted_fail_control.py sets BREAK_UNADMITTED and requires
