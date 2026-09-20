@@ -32,7 +32,7 @@ class LoopConfig:
     something this software established.
 
     THE VALUES BELOW ARE NOT WHAT A CONFIGURATION FILE GETS. A file declares all
-    five or it is refused -- see `_declared_loops`. These defaults exist for a
+    seven or it is refused -- see `_declared_loops`. These defaults exist for a
     `LaneConfig` built in code, and they describe the lane this package shipped
     before the loops existed.
 
@@ -45,6 +45,13 @@ class LoopConfig:
     did, and what it does not get is named in the record on every vehicle
     (`arming_loops: 1`, and an `entry_unconfirmable` event) rather than being
     absent from it.
+
+    A third kind of loop, BEFORE the arming loops: the DEACTIVATE loop. While it
+    reads occupied the lane does not arm -- a second vehicle that close behind
+    the one at the barrier is a vehicle that would follow it through an open
+    boom, so the boom stays down until it backs off. Zero or one of these; a
+    site with none runs exactly as it did, and its record says
+    `deactivate_loops: 0` on every vehicle rather than saying nothing.
     """
 
     #: 1 or 2. With 2, one loop alone arms nothing and is recorded instead.
@@ -58,10 +65,46 @@ class LoopConfig:
     #: How long after a vend the closing sequence may take before the entry is
     #: HELD. Assumed, never measured here.
     confirmation_window_seconds: float = 10.0
+    #: 0 or 1. With 1, an occupied deactivate loop holds the arming cycle.
+    deactivate_loops: int = 0
+    #: Metres from the deactivate loop to the NEAREST arming loop. Assumed,
+    #: never measured here -- and BOUNDED BELOW, see __post_init__: a loop
+    #: closer than the longest vehicle the lane admits is under that vehicle's
+    #: own tail while its nose is on the arming loop, and it holds itself.
+    deactivate_spacing_m: float = 0.0
 
     def __post_init__(self) -> None:
         if self.arming_loops not in (1, 2):
             raise ValueError(f"arming_loops must be 1 or 2, got {self.arming_loops!r}")
+        if self.deactivate_loops not in (0, 1):
+            raise ValueError(f"deactivate_loops must be 0 or 1, got {self.deactivate_loops!r}")
+        if self.deactivate_loops == 1:
+            # THE LOWER BOUND, and why it is a refusal and not a warning: a
+            # deactivate loop nearer the arming loop than a vehicle is long
+            # reads occupied under the tail of the very car whose nose is on
+            # the arming loop. That car suppresses its own arming cycle, for
+            # as long as it sits there, and the lane has built a barrier that
+            # holds every long vehicle for ever. The number is an assumption
+            # about vehicles, stated once as `DEACTIVATE_SPACING_MIN_M`, and a
+            # site whose lane admits longer ones declares a larger spacing.
+            if not (
+                isinstance(self.deactivate_spacing_m, (int, float))
+                and math.isfinite(self.deactivate_spacing_m)
+                and self.deactivate_spacing_m >= DEACTIVATE_SPACING_MIN_M
+            ):
+                raise ValueError(
+                    f"deactivate_spacing_m must be a finite number of at least "
+                    f"{DEACTIVATE_SPACING_MIN_M} m, got {self.deactivate_spacing_m!r}: a "
+                    "deactivate loop closer than the longest vehicle sits under that "
+                    "vehicle's own tail and holds it at the barrier for ever"
+                )
+        elif self.deactivate_spacing_m != 0.0:
+            # No loop, no spacing. A number here would be published under
+            # `geometry_assumed` as the distance to a loop that does not exist.
+            raise ValueError(
+                f"deactivate_spacing_m must be 0.0 when deactivate_loops is 0, got "
+                f"{self.deactivate_spacing_m!r}: there is no loop for it to be the spacing of"
+            )
         if self.closing_loops not in (0, 2):
             # Not an oversight and not a convenience to be relaxed. ONE closing
             # loop cannot tell a vehicle going in from one backing out -- it
@@ -83,6 +126,11 @@ class LoopConfig:
         """Whether this lane can confirm that a vehicle actually went through."""
         return self.closing_loops == 2
 
+    @property
+    def has_deactivate_loop(self) -> bool:
+        """Whether this lane holds its arming cycle for a vehicle too close behind."""
+        return self.deactivate_loops == 1
+
     def as_published(self) -> dict:
         """The geometry, for the event detail, under a name that says what it is."""
         return {
@@ -91,17 +139,32 @@ class LoopConfig:
             "closing_loops": self.closing_loops,
             "closing_spacing_m": self.closing_spacing_m,
             "confirmation_window_seconds": self.confirmation_window_seconds,
+            "deactivate_loops": self.deactivate_loops,
+            "deactivate_spacing_m": self.deactivate_spacing_m,
         }
 
 
-#: The five keys a `[loops]` table must declare. There is no default for any of
-#: them at the file boundary, and that is the whole point of the list.
+#: The least a deactivate loop may sit from the nearest arming loop, in metres.
+#:
+#: A PER-PACKAGE ASSUMPTION ABOUT VEHICLES, NOT A MEASUREMENT: nothing here has
+#: measured a vehicle, and 6 metres is not the length of one. It is drawn
+#: against what the loop MEANS -- "the vehicle behind is too close" -- which is
+#: only true of a loop that a single vehicle cannot cover together with the
+#: arming loop. A long car or a van is under six metres; a lane that admits
+#: anything longer declares a larger spacing, and the record says which value
+#: was in force.
+DEACTIVATE_SPACING_MIN_M = 6.0
+
+#: The seven keys a `[loops]` table must declare. There is no default for any
+#: of them at the file boundary, and that is the whole point of the list.
 LOOP_KEYS = (
     "arming_loops",
     "arming_spacing_m",
     "closing_loops",
     "closing_spacing_m",
     "confirmation_window_seconds",
+    "deactivate_loops",
+    "deactivate_spacing_m",
 )
 
 
@@ -364,5 +427,7 @@ class LaneConfig:
                 closing_loops=int(loops["closing_loops"]),
                 closing_spacing_m=float(loops["closing_spacing_m"]),
                 confirmation_window_seconds=float(loops["confirmation_window_seconds"]),
+                deactivate_loops=int(loops["deactivate_loops"]),
+                deactivate_spacing_m=float(loops["deactivate_spacing_m"]),
             ),
         )

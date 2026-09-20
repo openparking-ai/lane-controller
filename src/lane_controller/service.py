@@ -190,7 +190,6 @@ def assert_bind_allowed(
         )
 
 
-
 def _same(presented: str, configured: str) -> bool:
     """Constant-time comparison of two credentials, ON BYTES.
 
@@ -212,6 +211,7 @@ def _same(presented: str, configured: str) -> bool:
     a dropped connection.
     """
     return hmac.compare_digest(presented.encode("utf-8"), configured.encode("utf-8"))
+
 
 def bearer(header: str | None) -> str | None:
     """The token out of an Authorization header, or None if there is not one."""
@@ -422,6 +422,7 @@ class LaneService:
             MalfunctionCode.SESSION_ACTIONS_DEAD_LETTERED: self._dead_lettered(),
             MalfunctionCode.CLOCK_SKEW_REJECTED: self._clock_skew_rejected(),
             MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED: self._arming_loop_stuck(),
+            MalfunctionCode.DEACTIVATE_LOOP_STUCK_OCCUPIED: self._deactivate_loop_stuck(),
             MalfunctionCode.CLOSING_LOOPS_NEVER_FIRING: self._closing_loops_never_firing(),
         }
 
@@ -452,6 +453,29 @@ class LaneService:
         that something.
         """
         dwell = self.controller.observe_arming_loop()
+        if dwell is None:
+            return HealthState.UNKNOWN
+        if dwell > self.controller.config.arming_loop_max_occupied_s:
+            return HealthState.ACTIVE
+        return HealthState.UNKNOWN
+
+    def _deactivate_loop_stuck(self) -> HealthState:
+        """The deactivate loop has read occupied for longer than any dwell.
+
+        `_arming_loop_stuck`'s measurement, on the loop before the arming
+        loop, against the SAME bound -- `[lane] arming_loop_max_occupied_s` --
+        because the same dwell says the same thing about either loop: a
+        breakdown, a parked van, or a loop reading occupied with nothing on
+        it. Its own code because the repair is at a different loop and the
+        symptom is different: this one holds EVERY arming cycle, so the lane
+        stops photographing, vending and recording cars, and without this
+        entry it would do so silently.
+
+        `unknown` on a lane with no deactivate loop, and `unknown` when the
+        loop reads clear, for the reason `_arming_loop_stuck` gives: a loop
+        that is clear now has not been found healthy.
+        """
+        dwell = self.controller.observe_deactivate_loop()
         if dwell is None:
             return HealthState.UNKNOWN
         if dwell > self.controller.config.arming_loop_max_occupied_s:

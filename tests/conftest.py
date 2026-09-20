@@ -1274,3 +1274,118 @@ def _break_the_vend(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_VEND mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the deactivate-loop fail-control.
+#
+# scripts/deactivate_fail_control.py sets BREAK_DEACTIVATE and requires
+# tests/test_deactivate_loop.py to FAIL. Each mode breaks one decision point --
+# the level, an end of the interval, the record, the vend route's check, the
+# stuck measurement, the bound -- and never the fixture that drives it.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_deactivate_loop(monkeypatch):
+    mode = os.environ.get("BREAK_DEACTIVATE")
+    if not mode:
+        return
+
+    from lane_controller import config as config_module
+    from lane_controller import vend as vend_module
+    from lane_controller.controller import LaneController
+    from lane_controller.service import LaneService
+
+    if mode == "never_held":
+        # The loop is read and ignored: the lane arms with a car on it.
+        monkeypatch.setattr(
+            LaneController, "held_by_deactivate_loop", staticmethod(lambda _: False)
+        )
+
+    elif mode == "edge":
+        # THE EDGE. The idle turn no longer re-reads the level, so a driver
+        # that reported the held car once never gets it served: two queued
+        # cars wait for each other. Reverts the idle-turn release only.
+        original = LaneController.run_once
+
+        def run_once(self, timeout=None):
+            if self._suppressed_since is not None and not self.loop.wait_for_vehicle(
+                timeout=timeout
+            ):
+                self.observe_arming_loop()
+                self.observe_deactivate_loop()
+                self.observe_closing_loops()
+                return None
+            return original(self, timeout=timeout)
+
+        assert hasattr(LaneController, "_arm"), "the arming tail's anchor has moved"
+        monkeypatch.setattr(LaneController, "run_once", run_once)
+
+    elif mode == "silent_start":
+        # The hold happens and nothing is written: the silent non-event.
+        def hold(self, geometry):
+            if self._suppressed_since is None:
+                self._suppressed_since = self._clock()
+
+        monkeypatch.setattr(LaneController, "_hold_arming", hold)
+
+    elif mode == "silent_end":
+        # The interval closes in state and never in the record.
+        def release(self, ended_by, geometry):
+            self._suppressed_since = None
+
+        monkeypatch.setattr(LaneController, "_release_arming", release)
+
+    elif mode == "repeat_start":
+        # Every held turn writes the start again: a log nobody can read.
+        original_hold = LaneController._hold_arming
+
+        def hold(self, geometry):
+            self._suppressed_since = None
+            original_hold(self, geometry)
+
+        monkeypatch.setattr(LaneController, "_hold_arming", hold)
+
+    elif mode == "wrong_end":
+        # Both ends are reported as the same end.
+        from lane_controller.sync import SUPPRESSION_ENDED_ARMED
+
+        original_release = LaneController._release_arming
+        monkeypatch.setattr(
+            LaneController,
+            "_release_arming",
+            lambda self, ended_by, geometry: original_release(
+                self, SUPPRESSION_ENDED_ARMED, geometry
+            ),
+        )
+
+    elif mode == "vend_door":
+        # The assisted vend no longer applies the check: the intercom is a
+        # door around the loop.
+        original_complete = vend_module.AssistedVend.complete
+
+        def complete(self, request):
+            controller = self._service.controller
+            saved = controller.deactivate_loop
+            controller.deactivate_loop = None
+            try:
+                return original_complete(self, request)
+            finally:
+                controller.deactivate_loop = saved
+
+        assert hasattr(vend_module, "AssistedVend"), "the vend route's anchor has moved"
+        monkeypatch.setattr(vend_module.AssistedVend, "complete", complete)
+
+    elif mode == "unmeasured":
+        # The stuck code is never derived: `unknown` for ever.
+        from lane_controller.contract import HealthState
+
+        monkeypatch.setattr(LaneService, "_deactivate_loop_stuck", lambda self: HealthState.UNKNOWN)
+
+    elif mode == "no_bound":
+        # A loop under the car's own tail is accepted.
+        monkeypatch.setattr(config_module, "DEACTIVATE_SPACING_MIN_M", 0.0)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_DEACTIVATE mode: {mode}")

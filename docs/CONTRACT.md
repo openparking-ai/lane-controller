@@ -82,7 +82,9 @@ states, in the same words, so one consumer can hold one policy for both.
     "arming_spacing_m": 1.5,
     "closing_loops": 2,
     "closing_spacing_m": 1.5,
-    "confirmation_window_seconds": 10.0
+    "confirmation_window_seconds": 10.0,
+    "deactivate_loops": 0,
+    "deactivate_spacing_m": 0.0
   },
   "event_window_depth": 256,
   "capabilities": {
@@ -104,6 +106,24 @@ controller does one or the other, never both.
 geometry, because a second rendering is a second thing to go stale. Every value
 in it is a **per-site setting and an assumption** — nothing in this package
 measures a spacing.
+
+`deactivate_loops` is **0 or 1**: a loop BEFORE the arming loops. While it reads
+occupied the lane does not arm — a second vehicle that close behind the one at
+the barrier would follow it through an open boom, so the boom stays down until
+it backs off, and the hold is recorded as an `arming_suppressed` event with its
+reason (`vehicle_too_close`) at the START of the held interval and one
+`arming_suppression_ended` event at its END, saying which of the two ends it
+was: `armed` (the loop cleared with the vehicle still at the arming loop, and
+the lane armed for it) or `arming_loop_cleared` (the vehicle left without being
+armed for — it backed out, or it followed the car ahead). The hold is a LEVEL,
+re-read on every turn of the lane's sequence, never an edge: it ends the moment
+the loop clears, not on some later arrival. `deactivate_spacing_m` is the
+distance from that loop to the nearest arming loop and is **bounded below at
+6.0 m**: a loop closer than the longest vehicle sits under that vehicle's own
+tail while its nose is on the arming loop, and it would hold itself for ever.
+The bound is an assumption about vehicles, not a measurement; a lane that
+admits longer ones declares a larger spacing. A lane with no such loop declares
+`0` and `0.0` and is never held.
 
 `event_window_depth` is how many events `GET /v1/lane/events` can still serve
 behind the current cursor. Fall further behind than this and you are told
@@ -361,6 +381,13 @@ stuck loop says yes; `geometry_incomplete` asks the second loop the same
 question. Without this measure a lane with stuck arming loops would accept every
 assisted vend with nothing in front of it.
 
+`deactivate_loop_stuck_occupied` is the **same measurement on the deactivate
+loop**, against the **same bound**, and `unknown` on a lane that declares no such
+loop. Its own code because the repair is at a different loop and the symptom is
+different: a deactivate loop stuck occupied holds EVERY arming cycle, so the
+lane stops photographing, vending and recording cars — and without this entry
+it would do so silently.
+
 The state is `active` or `unknown` and **never `ok`**: what is observed is one
 way for a loop to be wrong, and a loop that reads clear at this instant has not
 been found healthy. The claim is about this lane's own observations and not
@@ -607,12 +634,13 @@ order. The full set is published under **The closed sets** as `vend_refusals`.
 | 1 | `no_vehicle` | the arming loop reads unoccupied **now**. Not the caller's word for it, and not what was true when the decision was made |
 | 2 | `malfunction_active` | a code in `vend_blocking` is `active`. The code is named in `malfunction` |
 | 3 | `geometry_incomplete` | a two-loop lane with one loop occupied — the same check that stops the lane arming |
-| 4 | `decision_in_future` | `decision_at` is **ahead of this lane's clock** |
-| 5 | `decision_stale` | `decision_at` is older than `[lane] completion_max_age_s` |
-| 6 | `decision_mismatch` | `decision_at` is not the moment of this lane's last decision — **or this lane has decided nothing**, which is the same fact to a caller |
-| 7 | `already_completed` | that decision **has already been completed**, whatever key this call carries |
-| 8 | `not_completable` | the last decision's outcome is `allow` or `deny`; see below |
-| 9 | `busy` | a vend is in progress on this lane |
+| 4 | `vehicle_too_close` | the deactivate loop reads occupied **now** — the same check that holds the lane's arming; a lane with no such loop is never refused here |
+| 5 | `decision_in_future` | `decision_at` is **ahead of this lane's clock** |
+| 6 | `decision_stale` | `decision_at` is older than `[lane] completion_max_age_s` |
+| 7 | `decision_mismatch` | `decision_at` is not the moment of this lane's last decision — **or this lane has decided nothing**, which is the same fact to a caller |
+| 8 | `already_completed` | that decision **has already been completed**, whatever key this call carries |
+| 9 | `not_completable` | the last decision's outcome is `allow` or `deny`; see below |
+| 10 | `busy` | a vend is in progress on this lane |
 
 `malfunction` is present on **every** refusal, `null` on all but
 `malfunction_active`. A field carried by one refusal and absent from six cannot
@@ -670,10 +698,11 @@ been unreachable long enough to grow its outbox refused every intercom
 completion at the site.
 
 **Two things about the subset, said plainly rather than left to be discovered.**
-Of the five, only `arming_loop_stuck_occupied` can be `active` in this build —
-it is measured, and how is under `GET /v1/lane/health` above. The other four are
+Of the six, only `arming_loop_stuck_occupied` and
+`deactivate_loop_stuck_occupied` can be `active` in this build — both are
+measured, and how is under `GET /v1/lane/health` above. The other four are
 `no_source`: nothing in this system produces them, so refusal 2 fires today on
-one code and not on five, and it will fire on the rest when something is built
+two codes and not on six, and it will fire on the rest when something is built
 that can answer them. And `arming_loop_stuck_occupied` is the one that matters
 most: it is the only member that defends the route's FIRST refusal, because a
 stuck loop tells `no_vehicle` there is a car there.
@@ -760,6 +789,7 @@ does adding one to the enum without adding it here.
     "boom_did_not_close",
     "vend_relay_fault",
     "arming_loop_stuck_occupied",
+    "deactivate_loop_stuck_occupied",
     "arming_loops_disagree",
     "closing_loops_never_firing",
     "camera_feed_lost",
@@ -800,6 +830,7 @@ does adding one to the enum without adding it here.
     "boom_did_not_close",
     "vend_relay_fault",
     "arming_loop_stuck_occupied",
+    "deactivate_loop_stuck_occupied",
     "arming_loops_disagree"
   ],
   "vend_authorities": [
@@ -811,6 +842,7 @@ does adding one to the enum without adding it here.
     "no_vehicle",
     "malfunction_active",
     "geometry_incomplete",
+    "vehicle_too_close",
     "decision_in_future",
     "decision_stale",
     "decision_mismatch",
