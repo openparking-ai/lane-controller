@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""The control for the appearance descriptor on the session open.
+"""The control for the appearance descriptor on the session open AND close.
 
 Runs the suites that carry the descriptor once intact, where they must pass,
 and once for each break below, where they must FAIL. Every break is on one of
 the three points the descriptor crosses between the identity service and the
 platform -- not on a fixture and not on a stub -- so a control that passes says
-the suite measures that crossing rather than something next to it.
+the suite measures that crossing rather than something next to it. The record
+and echo seams are ONE function each for both ends of a stay, so each break
+below reaches the close as well as the open, and the suites assert both.
 
   translation  the client drops the descriptor on translation from the
                service's contract, as it did before this round

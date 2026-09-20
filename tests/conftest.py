@@ -250,7 +250,7 @@ def _break_the_descriptor(monkeypatch):
         # The lane sends it and does not require it back. A platform older
         # than the column then answers 201, drops it, and the lane counts the
         # open delivered -- the silent loss the echo exists to make loud.
-        monkeypatch.setattr(_sync, "require_descriptor_echo", lambda result, sent: None)
+        monkeypatch.setattr(_sync, "require_descriptor_echo", lambda result, sent, **_: None)
 
     else:
         raise RuntimeError(f"unknown BREAK_DESCRIPTOR mode: {mode}")

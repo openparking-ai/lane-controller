@@ -688,3 +688,41 @@ def test_the_descriptor_rides_the_session_open_and_never_the_log():
     )
     controller.run_once()
     assert "descriptor" not in detail(controller, SESSION_OPEN)
+
+
+def test_the_exit_reads_descriptor_rides_the_session_close_and_never_the_log():
+    """The other end. The close carries the exit read's descriptor -- on the
+    close and no other channel, because the platform's search snapshots inside
+    the close -- and the log kinds an exit produces carry none of it."""
+    seen = VehicleIdentity(
+        plate=PLATE_IN_THE_LOG, confidence=0.97, presence=True, descriptor=DESCRIPTOR_IN_THE_LOG
+    )
+    controller, vend, _ = build(
+        direction="exit",
+        identities=[seen],
+        crossings=[(ClosingSequence.FORWARD, 3.0)],
+        default_action="allow",
+    )
+    controller.run_once()
+    assert vend.vend_count == 1
+
+    logged = _log_events(controller)
+    assert logged, "no log events, so this asserts nothing"
+    for event in logged:
+        rendered = json.dumps(event.as_dict()["detail"], default=str)
+        assert DESCRIPTOR_IN_THE_LOG not in rendered, (
+            f"{event.kind} put the descriptor in events.detail, which the purge cannot reach"
+        )
+
+    # THE CONTROL: the close carries it.
+    assert detail(controller, SESSION_CLOSE)["descriptor"] == DESCRIPTOR_IN_THE_LOG
+    assert detail(controller, SESSION_CLOSE)["exit_confirmation"] == CONFIRMED
+
+    controller, _, _ = build(
+        direction="exit",
+        identities=[VehicleIdentity(plate=PLATE_IN_THE_LOG, confidence=0.97, presence=True)],
+        crossings=[(ClosingSequence.FORWARD, 3.0)],
+        default_action="allow",
+    )
+    controller.run_once()
+    assert "descriptor" not in detail(controller, SESSION_CLOSE)

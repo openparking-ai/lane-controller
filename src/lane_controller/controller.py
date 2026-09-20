@@ -1250,6 +1250,11 @@ class LaneController:
         measured, and a lane whose service does not produce descriptors sends
         exactly the open it sent before this field existed.
 
+        BOTH ENDS. The open carries the entry read's, and the close carries the
+        exit read's -- on the CLOSE and on no other channel, because the two
+        channels a lane reports on arrive at the platform in no specified
+        order and the search that compares the two snapshots inside the close.
+
         A seam on purpose (`BREAK_DESCRIPTOR=record` in the fail-control): the
         one place the descriptor crosses from a reading into a session action.
         """
@@ -1289,6 +1294,7 @@ class LaneController:
             SESSION_CLOSE,
             lane,
             **self._identity_detail(identity, with_region=False),
+            **self._session_descriptor(identity),
             at=at,
             session_id=session_id,
             exit_confirmation=confirmation,

@@ -148,33 +148,41 @@ def sync_rules(client: PlatformClient, cache: DecisionCache) -> dict | None:
     return payload
 
 
-def require_descriptor_echo(result: dict | None, sent: str | None) -> None:
-    """Refuse an open the platform accepted without recording the descriptor it was sent.
+def require_descriptor_echo(
+    result: dict | None, sent: str | None, *, end: str = "entry", action: str = "open"
+) -> None:
+    """Refuse a session action the platform accepted without recording the descriptor it was sent.
 
     The same silence as `require_confirmation_echo` below, on a different field
-    and with one difference: the descriptor is OPTIONAL. An open that sent none
-    has nothing to require, and this returns. An open that sent one requires
-    the platform to hand it back on the row -- because the open route
-    destructures the keys it knows and ignores the rest, so a platform older
-    than `sessions.entry_descriptor` (its migration 0009) answers 201, opens
-    the session, and drops the field with nothing anywhere saying so. To the
-    exit, that stay is then unmatchable, silently. So an open that does not
-    come back carrying the descriptor it was sent is NOT DELIVERED: counted,
-    logged at error, dropped rather than re-sent for ever -- the same path as
-    the confirmation, and for the same reason. The barrier already opened; what
-    is lost is this lane's report, and the log line is what says so.
+    and with one difference: the descriptor is OPTIONAL. An action that sent
+    none has nothing to require, and this returns. One that sent a descriptor
+    requires the platform to hand it back on the row -- because both routes
+    destructure the keys they know and ignore the rest, so a platform older
+    than the column (`sessions.entry_descriptor`, migration 0009;
+    `sessions.exit_descriptor`, 0010) accepts the call, does the thing, and
+    drops the field with nothing anywhere saying so. To the search, that stay
+    is then unmatchable, or that exit uncomparable, silently. So an action that
+    does not come back carrying the descriptor it was sent is NOT DELIVERED:
+    counted, logged at error, dropped rather than re-sent for ever -- the same
+    path as the confirmation, and for the same reason. The barrier already
+    opened; what is lost is this lane's report, and the log line is what says
+    so.
 
-    A seam on purpose (`BREAK_DESCRIPTOR=echo` in the fail-control).
+    ONE function for both ends, as the confirmation's is, and a seam on purpose
+    (`BREAK_DESCRIPTOR=echo` in the fail-control).
     """
     if sent is None:
         return
-    echoed = ((result or {}).get("session") or {}).get("entry_descriptor")
+    field = f"{end}_descriptor"
+    migration = {"entry": "0009", "exit": "0010"}[end]
+    echoed = ((result or {}).get("session") or {}).get(field)
     if echoed != sent:
         raise PlatformRejected(
             None,
-            "the open was accepted but the platform did not echo the descriptor it was sent "
-            f"(it said {'nothing' if echoed is None else 'a different value'}). That platform "
-            "does not record an entry descriptor: its migration 0009 goes before this lane build.",
+            f"the {action} was accepted but the platform did not echo the descriptor it was sent "
+            f"(it said {'nothing' if echoed is None else 'a different value'} for {field}). That "
+            f"platform does not record an {end} descriptor: its migration {migration} goes before "
+            "this lane build.",
         )
 
 
@@ -327,6 +335,7 @@ class PlatformTransport(EventTransport):
         does not say what closed the stay.
         """
         declared = event.detail["exit_confirmation"]
+        descriptor = event.detail.get("descriptor")
         result = self._client.close_session(
             event_id=event.event_id,
             plate=event.detail.get("plate"),
@@ -337,8 +346,10 @@ class PlatformTransport(EventTransport):
             # may not be.
             session_id=event.detail.get("session_id"),
             exit_confirmation=declared,
+            descriptor=descriptor,
         )
         require_confirmation_echo(result, declared, end="exit", action="close")
+        require_descriptor_echo(result, descriptor, end="exit", action="close")
         return result
 
     def _guarded(self, call):

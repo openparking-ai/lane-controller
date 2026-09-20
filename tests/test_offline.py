@@ -323,6 +323,83 @@ def test_a_lane_with_no_descriptor_is_unchanged_against_that_platform():
     assert platform.unique_opens == 1
 
 
+class PlatformWithoutTheExitDescriptorColumn(FakePlatform):
+    """The platform as it is BEFORE migration 0010: it has the entry column
+    and not the exit one, closes the stay, bills it, and the row it echoes has
+    no `exit_descriptor`. A 200 and a silent loss, at the end where the money
+    is written."""
+
+    def close_session(self, **kwargs) -> dict:
+        result = super().close_session(**kwargs)
+        session = {k: v for k, v in (result["session"] or {}).items() if k != "exit_descriptor"}
+        return {**result, "session": session}
+
+
+def test_a_close_carries_the_exit_reads_descriptor_and_the_platform_echoes_it():
+    """THE CLOSE, and no other channel. The exit read produced a descriptor;
+    the close carries it; the platform hands it back on the row."""
+    platform = FakePlatform()
+    entry, _, _ = build(platform, direction="entry")
+    entry.run_once()
+
+    exit_lane, vend, transport = build(
+        platform,
+        direction="exit",
+        identities=[VehicleIdentity(plate="OFF-1", confidence=0.97, descriptor=DESCRIPTOR)],
+    )
+    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    exit_lane.run_once()
+
+    assert vend.vend_count == 1
+    assert transport.rejected == 0
+    assert platform.closed[0]["descriptor"] == DESCRIPTOR
+    assert platform.closed[0]["plate"] == "OFF-1", "beside the identity, not instead of it"
+    assert transport.last_close["session"]["exit_descriptor"] == DESCRIPTOR
+    # And nothing about the exit read reached the ENTRY end of the row.
+    assert transport.last_close["session"]["entry_descriptor"] is None
+
+
+def test_a_platform_that_does_not_record_the_exit_descriptor_is_refused_loudly(caplog):
+    caplog.set_level(logging.ERROR)
+    platform = PlatformWithoutTheExitDescriptorColumn()
+    entry, _, _ = build(platform, direction="entry")
+    entry.run_once()
+
+    exit_lane, vend, transport = build(
+        platform,
+        direction="exit",
+        identities=[VehicleIdentity(plate="OFF-1", confidence=0.97, descriptor=DESCRIPTOR)],
+    )
+    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    exit_lane.run_once()
+
+    assert vend.vend_count == 1, "the barrier still opened; the car is not the one being refused"
+    assert transport.rejected == 1, (
+        "a close the platform silently dropped the descriptor from was counted as delivered"
+    )
+    assert transport.last_close is None, "a response that does not say must not become the record"
+    assert exit_lane.events.pending == 0, "poison must not block everything behind it"
+    assert any(
+        "exit_descriptor" in record.getMessage() for record in caplog.records
+    ), "the drop must name which end the platform did not record"
+    assert not any(DESCRIPTOR in record.getMessage() for record in caplog.records)
+
+
+def test_a_close_with_no_descriptor_is_unchanged_against_that_platform():
+    """THE CONTROL, and the compatibility rule at the exit end."""
+    platform = PlatformWithoutTheExitDescriptorColumn()
+    entry, _, _ = build(platform, direction="entry")
+    entry.run_once()
+
+    exit_lane, _, transport = build(platform, direction="exit")
+    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    exit_lane.run_once()
+
+    assert transport.rejected == 0
+    assert platform.closed[0]["descriptor"] is None
+    assert transport.last_close is not None
+
+
 def test_a_platform_that_does_not_record_the_exit_confirmation_is_refused_loudly(caplog):
     """C4, at the other end of the stay. The exit is where the money is written,
     and against a platform that predates the column the close is accepted, the
