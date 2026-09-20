@@ -298,7 +298,9 @@ class LaneController:
         #:
         #: WHAT HAPPENS TO A CROSSING THE POLL IS HOLDING WHEN A VEND BEGAN
         #: DURING ITS READ: it is that vend's, and it is taken by that vend's
-        #: read and by no other. The poll claimed first, so the vend's own
+        #: read and by no read carrying a different `at` (what makes two
+        #: differ, and the one way they might not, is stated at `_handed`).
+        #: The poll claimed first, so the vend's own
         #: read waits behind it; when the poll's driver returns, the poll
         #: checks under `_board` whether a transit was published while it was
         #: out, and if one was it hands the crossing over (`_handed`) WITH THE
@@ -310,7 +312,7 @@ class LaneController:
         #: door -- a second assisted vend, or the loop thread's own next ALLOW
         #: arrival -- took it, and that car was `confirmed` with a session
         #: before it had crossed, its own crossing recorded `entry_unadmitted`
-        #: at the next idle read (measured 2026-09-19: 19 to 38 of 200, no
+        #: at the next idle read (measured 2026-09-19: 18 to 38 of 200, no
         #: pause planted). Neither discarded -- that loses the promotion --
         #: nor labelled `entry_unadmitted` -- that mislabels an admitted car,
         #: the one thing this event exists not to do. WHAT A HANDED CROSSING
@@ -346,16 +348,41 @@ class LaneController:
         #: not a spin.
         self._poll_reading = False
         #: A crossing the poll read while a vend began, held for that vend's
-        #: read with that vend's `at`, so no other read can take it. One slot
-        #: is enough: at most one transit can be published during one poll
-        #: read (the loop thread is inside the read, so only the route can
-        #: publish, and it refuses a second vend while the first is in
-        #: progress), and the poll does not read again while a transit is
-        #: pending or a read is outstanding. Not "a second vend cannot begin
-        #: while the first is pending": the first stops being pending at the
-        #: settle's deadline, and a second transit can then begin through
+        #: read with that vend's `at`, so no read carrying a different `at`
+        #: can take it. One slot is enough: at most one transit can be
+        #: published during one poll read. The loop thread is inside the
+        #: read, so only the route can publish; the route's first vend
+        #: consumed the decision, so a second POST -- even after the settle's
+        #: deadline has cleared `_in_progress` -- is refused
+        #: `already_completed` (`vend.py`, one decision one vend), and a new
+        #: decision needs `handle_arrival`, which is the loop thread, which is
+        #: inside the read. And the poll does not read again while a transit
+        #: is pending or a read is outstanding. Not "a second vend cannot
+        #: begin while the first is pending": the first stops being pending at
+        #: the settle's deadline, and a second transit can then begin through
         #: either door with the slot still full -- which is why the `at`
         #: travels with the crossing.
+        #:
+        #: WHAT MAKES TWO `at`s DIFFER, since the binding is an equality test
+        #: on them: nothing in this file. The key is `to_iso(self._clock())`,
+        #: a wall-clock timestamp at ONE MICROSECOND of resolution (that is
+        #: `to_iso`'s, whatever the clock's), and two transits' samples are
+        #: separated by at least the first's `begin_transit` and a whole
+        #: door's work -- an arrival served, or an HTTP request -- so on a
+        #: clock that only moves forward they never share a microsecond. The
+        #: clock is `time.time`, which is NOT guaranteed to move forward: a
+        #: wall-clock step backwards that lands a later transit's sample on
+        #: the exact microsecond of a slot still full would let that read take
+        #: the earlier transit's crossing -- one pair's attribution, the
+        #: outcome this binding exists to prevent, in a window that needs the
+        #: clock to step onto a single microsecond while an abandoned worker
+        #: is between its notify and its take. Not guarded here; STATED, a
+        #: residual smaller than the ones above it. An injected clock that
+        #: does not advance would collide every time, and `demo.py` injects
+        #: frozen ones -- it runs one arrival per lane and never an idle turn,
+        #: so nothing is ever handed over there. Measured 2026-09-19 on the
+        #: re-gate's box: 2000 of 2000 transits through the loop door carried
+        #: distinct `at`s.
         self._handed: tuple[ClosingSequence, str] | None = None
         self._crossings_handed = 0
         #: How many transit states have ever been published. The poll notes
@@ -853,9 +880,11 @@ class LaneController:
 
         Then: if the poll handed over a crossing that completed while THIS
         transit was beginning -- the slot carries the transit's `at`, and only
-        a read carrying the same `at` takes it; a later transit's read leaves
-        it and asks the driver -- that crossing is this read's answer and the
-        driver is not asked. Otherwise the count goes up, the driver is asked, and the
+        a read carrying the same `at` takes it; a read carrying a different
+        `at` leaves it and asks the driver. What makes a later transit's `at`
+        differ is stated at `_handed`, with the one way it might not -- that
+        crossing is this read's answer and the driver is not asked. Otherwise
+        the count goes up, the driver is asked, and the
         count comes down when -- and only when -- the driver returns. A driver
         that never returns leaves the count up for ever, which is one idle poll
         standing down at this lane for ever, and that is the whole of its
