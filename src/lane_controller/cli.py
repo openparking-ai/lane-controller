@@ -34,6 +34,8 @@ from pathlib import Path
 
 from .config import LaneConfig
 from .controller import LaneController
+from .decision import DecisionCache
+from .durable import CacheDirectoryUnsafe, DurableStore
 from .events import EventQueue
 from .platform_client import PlatformClient
 from .runner import LaneRunner
@@ -170,6 +172,21 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
     else:
         identifier = StubVehicleIdentifier()
         seams["identifier"] = "SIMULATED stub (no [lane] vehicle_id_url): every read is a fallback"
+    if config.cache_path:
+        # Refused, not warned, if the path is not this process's own: a
+        # forged row here opens the barrier. `CacheDirectoryUnsafe` reaches
+        # `cmd_serve`, which prints it and exits 2 before the port opens.
+        cache = DecisionCache(
+            max_age_seconds=config.rules_max_age_seconds, store=DurableStore(config.cache_path)
+        )
+        held = "restored" if cache.default_action is not None or cache.stays_cursor else "empty"
+        seams["cache"] = (
+            f"DURABLE {config.cache_path} ({held}; bound {config.rules_max_age_seconds:g}s, "
+            "the same age at which the lane stops trusting it)"
+        )
+    else:
+        cache = DecisionCache(max_age_seconds=config.rules_max_age_seconds)
+        seams["cache"] = "MEMORY ONLY (no [lane] cache_path): a restart holds nothing"
     seams["loops"] = "SIMULATED (this package ships no loop driver)"
     seams["camera"] = "SIMULATED (this package ships no camera driver)"
     seams["barrier"] = (
@@ -184,6 +201,7 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
         arming_loop_b=OccupancyLoopInput() if config.loops.arming_loops == 2 else None,
         closing_loops=ScriptedClosingLoops() if config.loops.confirms_entry else None,
         deactivate_loop=OccupancyLoopInput() if config.loops.has_deactivate_loop else None,
+        cache=cache,
         events=events,
         session_lookup=lookup,
     )
@@ -249,7 +267,11 @@ def cmd_serve(args) -> int:
         return 2
 
     platform = platform_client_for(config, args.platform_token_file)
-    wired = wire_lane(config, platform=platform)
+    try:
+        wired = wire_lane(config, platform=platform)
+    except CacheDirectoryUnsafe as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
     service = LaneService(wired.controller)
     server = make_server(
         service, host=args.host, port=args.port, token=token, act_token=act_token

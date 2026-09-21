@@ -77,6 +77,27 @@ afterwards; the barrier never waits on a network call. If the rules go stale
 past their configured age, the lane falls back rather than acting on pricing it
 no longer trusts.
 
+**And it works after a restart with the internet down**, when `[lane]
+cache_path` is set: the cache is written whole to a SQLite file on every
+refresh that changes it (`durable.py`) and read back at start, **as old as its
+last refresh, not as old as the restart**. A lane that comes back after a power
+cut with the platform still unreachable decides from what it last held, and a
+lane that comes back after two days holds a cache it does not trust and says
+so. Without a path the cache is memory only, as it always was.
+
+**What the cache holds at rest is personal data, and its bound is one number.**
+Every pass holder's and monthly vehicle's identity at the garage, and every
+open stay's plate or ticket, are on the box. The platform's retention purge
+does not reach that file; the lane's own rule does, and it is
+`rules_max_age_seconds` — the age past which the lane stops trusting the cache
+is the age past which it stops holding it, wiped from memory and disk on start
+and on every refresh tick, and the file is replaced whole on every refresh so a
+plate that left the register is gone at the next read. **The directory must be
+the process's own** — a row in that file is `plate → allow`, and a line
+written by hand opens the barrier — so a path in a directory anyone else can
+write refuses to start, before the port opens, by the same rule Vehicle ID
+applies to its queue. `scripts/durable_fail_control.py` breaks each property in turn.
+
 When identification is not confident enough, the
 lane takes an explicit fallback path — the `Fallback` members in
 `decision.py` — each of which is a named outcome with an

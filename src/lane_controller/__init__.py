@@ -26,6 +26,7 @@ from .contract import (
 )
 from .controller import LaneController
 from .decision import Decision, DecisionCache, Fallback, Outcome, Rule, decide
+from .durable import CacheDirectoryUnsafe, DurableStore
 from .events import EventQueue, LaneEvent
 from .interfaces import (
     CameraFeed,
@@ -57,6 +58,8 @@ __all__ = [
     "ClosingSequence",
     "Decision",
     "DecisionCache",
+    "DurableStore",
+    "CacheDirectoryUnsafe",
     "EventPage",
     "EventQueue",
     "Fallback",

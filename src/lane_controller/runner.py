@@ -90,6 +90,9 @@ class RunnerState:
     #: traceback; this is the count a surface can show.
     lane_turn_errors: int = 0
     lane_turns: int = 0
+    #: Times the cache passed its retention bound without a refresh and was
+    #: wiped -- a lane that has not reached the platform for `max_age`.
+    cache_expiries: int = 0
 
 
 class LaneRunner:
@@ -110,6 +113,7 @@ class LaneRunner:
         stays_refresh_s: float,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] | None = None,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         if stays_refresh_s > rules_refresh_s:
             raise ValueError("stays_refresh_s must not exceed rules_refresh_s")
@@ -119,6 +123,10 @@ class LaneRunner:
         self.stays_refresh_s = stays_refresh_s
         self.state = RunnerState()
         self._clock = clock
+        # The schedule runs on a monotonic clock; the cache's timestamps are
+        # wall time (they travel to disk and survive a restart), so the bound
+        # is judged on the wall clock. Both injectable.
+        self._wall_clock = wall_clock
         self._stop = threading.Event()
         # Injectable so a test can run the refresh cadence against a fake
         # clock without waiting; the default waits on the stop event so a
@@ -190,7 +198,20 @@ class LaneRunner:
         """One turn of the refresh thread at `now`: the slow read if it is due
         (and the fast one is then re-based on it, since the full set just
         landed), else the fast read if it is due, else nothing. Returns which
-        ran, for a caller that wants to know."""
+        ran, for a caller that wants to know.
+
+        THE RETENTION BOUND IS ENFORCED FIRST, on every tick: a cache older
+        than its `max_age_seconds` -- a lane that has not reached the platform
+        for that long -- is wiped from memory and disk before anything else
+        happens. A refresh that then succeeds refills it; one that fails
+        leaves the lane holding nothing, which past the bound is what it was
+        deciding from anyway (`stale_rules`)."""
+        if self.controller.cache.expire_if_past_bound(now=self._wall_clock()):
+            self.state.cache_expiries += 1
+            log.warning(
+                "the decision cache passed its %gs bound without a refresh and was wiped",
+                self.controller.cache._max_age,
+            )
         if now >= self._next_rules:
             self.refresh_rules()
             self._next_rules = now + self.rules_refresh_s
