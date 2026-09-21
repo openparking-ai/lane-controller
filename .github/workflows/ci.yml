@@ -61,6 +61,14 @@ jobs:
         # An offline guarantee nobody has seen fail is not known to be one.
         run: python scripts/offline_fail_control.py
 
+      - name: Production-loop fail-control
+        # Breaks the loop that keeps the cache fresh -- an outage served as an
+        # empty register, a closed stay never dropped, the fast cadence never
+        # run, a failed refresh unsaid, a raising turn killing the lane thread,
+        # a platform accepted without its token -- and requires the
+        # production-loop suite to fail each time.
+        run: python scripts/refresh_fail_control.py
+
       - name: Confirmation fail-control
         # Breaks the entry confirmation on purpose -- the window, the crossing
         # direction, the promotion of an unconfirmed entry, and the

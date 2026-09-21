@@ -1440,3 +1440,93 @@ def _break_the_deactivate_loop(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_DEACTIVATE mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the production-loop fail-control.
+#
+# scripts/refresh_fail_control.py sets BREAK_REFRESH and requires
+# tests/test_production_loop.py to FAIL. A loop nobody has seen fail to keep
+# the cache fresh is not known to keep it fresh.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_refresh(monkeypatch):
+    mode = os.environ.get("BREAK_REFRESH")
+    if not mode:
+        return
+
+    from lane_controller import cli as cli_module
+    from lane_controller import decision as decision_module
+    from lane_controller import runner as runner_module
+
+    if mode == "outage_empties":
+        # A module the platform could not read is replaced with nothing: the
+        # outage becomes an empty register, and every pass holder pays.
+        original = decision_module.DecisionCache.load_payload
+
+        def emptying(self, payload, *, now=None):
+            original(self, payload, now=now)
+            for module, fact in (payload.get("entitlements") or {}).items():
+                if isinstance(fact, dict) and fact.get("consulted") and "register" not in fact:
+                    self.entitlements[module] = {**fact, "register": {"registrations": []}}
+
+        monkeypatch.setattr(decision_module.DecisionCache, "load_payload", emptying)
+
+    elif mode == "closed_kept":
+        # The delta never drops a car that left: the exit lane holds every
+        # stay the garage ever had.
+        def keeping(self, changes, cursor, *, now=None):
+            for stay in changes:
+                self.stays[stay["session_id"]] = stay
+            self.stays_cursor = str(cursor)
+
+        monkeypatch.setattr(decision_module.DecisionCache, "apply_stay_changes", keeping)
+
+    elif mode == "no_fast_cadence":
+        # The refresh thread only ever reads the rules: the stays arrive
+        # every five minutes, never every five seconds.
+        original_tick = runner_module.LaneRunner.refresh_tick
+
+        def rules_only(self, now):
+            if now >= self._next_rules:
+                return original_tick(self, now)
+            return None
+
+        monkeypatch.setattr(runner_module.LaneRunner, "refresh_tick", rules_only)
+
+    elif mode == "silent_failure":
+        # A refresh that could not run is not counted and not said.
+        def quiet(self, cadence, name, read):
+            try:
+                read()
+            except Exception:
+                pass
+            return True
+
+        monkeypatch.setattr(runner_module.LaneRunner, "_refresh", quiet)
+
+    elif mode == "thread_dies":
+        # A turn that raises kills the lane thread: the health route keeps
+        # answering over a lane that serves nobody.
+        def unguarded(self):
+            self.state.lane_turns += 1
+            self.controller.run_once(timeout=runner_module.LANE_POLL_S)
+
+        monkeypatch.setattr(runner_module.LaneRunner, "lane_turn", unguarded)
+
+    elif mode == "half_configured":
+        # `serve` accepts a server_url with no token: a lane that reports to a
+        # platform it cannot authenticate to, every send refused, for ever.
+        original_for = cli_module.platform_client_for
+
+        def lenient(config, token_file):
+            if config.server_url and token_file is None:
+                return None
+            return original_for(config, token_file)
+
+        monkeypatch.setattr(cli_module, "platform_client_for", lenient)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_REFRESH mode: {mode}")

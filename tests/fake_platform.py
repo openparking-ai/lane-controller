@@ -40,6 +40,17 @@ class FakePlatform:
         #: another repository, and a copy of it here would be exactly the second
         #: copy the kind-set check exists to catch.
         self.reject_event_kinds: set[str] = set()
+        #: What `get_rules` and `get_stays` serve (platform 0016), and what a
+        #: test moves to make a delta.
+        self.rate_plans: list[dict] = [{"plan_version": "flat-250-USD", "currency": "USD"}]
+        self.entitlements: dict = {"complete": True,
+                                   "garage_pass": {"consulted": False, "reason": "not linked"},
+                                   "monthly_billing": {"consulted": False, "reason": "not linked"}}
+        self.stays: list[dict] = []
+        self.cursor = 0
+        self.stay_page = 500
+        self.rules_reads = 0
+        self.stays_reads: list[str | None] = []
 
     # -- the PlatformClient surface ---------------------------------------
 
@@ -48,14 +59,58 @@ class FakePlatform:
             raise PlatformUnreachable("simulated outage")
 
     def get_rules(self) -> dict:
+        """The payload as platform 0016 serves it: the plans whole, the space
+        class, each module's register (or its unavailability), the open stays
+        with their cursor. `hourly_minor` is gone from the real one and is
+        gone from here."""
         self._check()
+        self.rules_reads += 1
         return {
             "garage_id": "garage-1",
             "currency": "USD",
-            "hourly_minor": 250,
+            "space_class": "standard",
             "default_action": self.default_action,
-            "plate_rules": [],
+            "active": True,
+            "rate_plans": list(self.rate_plans),
+            "entitlements": {"read_at": "2026-09-21T00:00:00Z", **self.entitlements},
+            "stays": {"cursor": str(self.cursor), "open": [s for s in self.stays if s["open"]]},
+            "synced_at": "2026-09-21T00:00:00Z",
         }
+
+    def get_stays(self, since: str | None = None) -> dict:
+        """`GET /lane/stays`: the full open set, or every change past `since`
+        in cursor order, closed rows included, paged by `stay_page`."""
+        self._check()
+        self.stays_reads.append(since)
+        if since is None:
+            return {"cursor": str(self.cursor), "open": [s for s in self.stays if s["open"]]}
+        if not since.isdigit():
+            raise PlatformRejected(400, "since must be a cursor this route handed out")
+        changed = [s for s in self.stays if int(s["change_seq"]) > int(since)]
+        page = changed[: self.stay_page]
+        more = len(changed) > self.stay_page
+        cursor = page[-1]["change_seq"] if page else since
+        return {"since": since, "cursor": cursor, "changes": page, "more": more}
+
+    # -- the stays the fake holds, and how a test moves them ------------------
+
+    def stay_opened(self, session_id: str, plate: str | None = None, ticket_ref: str | None = None):
+        self.cursor += 1
+        stay = {
+            "session_id": session_id, "open": True, "plate": plate, "plate_region": None,
+            "ticket_ref": ticket_ref, "entry_at": "2026-09-21T10:00:00Z", "entry_lane": "E",
+            "change_seq": str(self.cursor),
+        }
+        self.stays = [s for s in self.stays if s["session_id"] != session_id] + [stay]
+        return stay
+
+    def stay_closed(self, session_id: str):
+        self.cursor += 1
+        for i, s in enumerate(self.stays):
+            if s["session_id"] == session_id:
+                self.stays[i] = {**s, "open": False, "change_seq": str(self.cursor)}
+                return self.stays[i]
+        raise KeyError(session_id)
 
     def post_events(self, events: list[dict]) -> dict:
         self._check()

@@ -292,6 +292,37 @@ DEFAULT_SETTLE_GRACE_S = 5.0
 DEFAULT_ARMING_LOOP_MAX_OCCUPIED_S = 600.0
 
 
+#: The published default for `LaneConfig.rules_refresh_seconds`: how often the
+#: production loop re-reads `GET /lane/rules` -- the garage's plans, its space
+#: class, each entitlement module's register and the full set of open stays --
+#: the SLOW cadence.
+#:
+#: A PER-SITE SETTING AND AN ASSUMPTION. Nothing in this package measures how
+#: often a pass is cancelled or a plan changes, and five minutes is not a
+#: measurement of either. What it IS drawn against is the trade the brief
+#: states: a pass cancelled after the last refresh gets one free exit before the
+#: cache catches up, against every legitimate holder waiting on the network at
+#: every exit. It must be shorter than `rules_max_age_seconds`, or the cache is
+#: stale by construction between two refreshes.
+DEFAULT_RULES_REFRESH_S = 300.0
+
+#: The published default for `LaneConfig.stays_refresh_seconds`: how often the
+#: production loop reads `GET /lane/stays?since=<cursor>` -- every stay opened
+#: or closed at the garage since the last read -- the FAST cadence.
+#:
+#: A PER-SITE SETTING AND AN ASSUMPTION, and this number is worth reading
+#: twice: A CAR THAT ENTERED INSIDE ONE OF THESE INTERVALS CANNOT BE PRICED AT
+#: THE BARRIER, because its entry time has not reached the exit lane's cache.
+#: It leaves the way it always has -- the barrier opens, the platform prices
+#: the stay afterwards, nothing is collected at the reader -- and the record
+#: says so. This interval IS the size of that class in ordinary operation, so
+#: it is short, and a site that measures its own entry-to-exit minimum sets it
+#: from that. Nothing here has measured one. It cannot be longer than
+#: `rules_refresh_seconds`: the slow cadence carries the full set, and a delta
+#: read less often than its own resync is no delta.
+DEFAULT_STAYS_REFRESH_S = 5.0
+
+
 def positive_finite(value, name: str) -> None:
     """Refuse anything that is not a real, positive number of seconds.
 
@@ -340,6 +371,17 @@ class LaneConfig:
     confidence_threshold: float = 0.85
     rules_max_age_seconds: float = 86_400.0
     server_url: str | None = None
+    # The two refresh cadences of the production loop. Per-site settings: see
+    # DEFAULT_RULES_REFRESH_S and DEFAULT_STAYS_REFRESH_S above for what each is
+    # and is not -- the second one is the size of the class of cars that cannot
+    # be priced at the barrier.
+    rules_refresh_seconds: float = DEFAULT_RULES_REFRESH_S
+    stays_refresh_seconds: float = DEFAULT_STAYS_REFRESH_S
+    # Where the identification service answers. None: this lane identifies
+    # nothing -- `serve` wires the stub identifier and says so. Set: the lane
+    # is an ordinary client of Vehicle ID at that address, and the address is
+    # loopback in any real installation (`vehicle_id_client`).
+    vehicle_id_url: str | None = None
     # How many undelivered events the outbox may hold before the health surface
     # reports `outbox_depth_growing` as `active`. A per-site setting: see
     # DEFAULT_OUTBOX_DEPTH_THRESHOLD above for what it is and is not.
@@ -380,8 +422,26 @@ class LaneConfig:
             "completion_max_age_s",
             "settle_grace_s",
             "arming_loop_max_occupied_s",
+            "rules_refresh_seconds",
+            "stays_refresh_seconds",
         ):
             positive_finite(getattr(self, name), name)
+        # The two cadences are ordered, and both sit inside the staleness
+        # bound. A delta read less often than the full set it is a delta OF is
+        # no delta; a full refresh slower than the age at which the cache stops
+        # being trusted makes every lane stale between two refreshes.
+        if self.stays_refresh_seconds > self.rules_refresh_seconds:
+            raise ValueError(
+                f"stays_refresh_seconds ({self.stays_refresh_seconds!r}) must not exceed "
+                f"rules_refresh_seconds ({self.rules_refresh_seconds!r}): the fast cadence "
+                "carries the delta of what the slow one carries whole"
+            )
+        if self.rules_refresh_seconds >= self.rules_max_age_seconds:
+            raise ValueError(
+                f"rules_refresh_seconds ({self.rules_refresh_seconds!r}) must be less than "
+                f"rules_max_age_seconds ({self.rules_max_age_seconds!r}): a cache refreshed "
+                "slower than it goes stale is stale between every two refreshes"
+            )
 
     @classmethod
     def from_file(cls, path: str | Path) -> LaneConfig:
@@ -402,6 +462,13 @@ class LaneConfig:
             confidence_threshold=float(lane.get("confidence_threshold", 0.85)),
             rules_max_age_seconds=float(lane.get("rules_max_age_seconds", 86_400.0)),
             server_url=lane.get("server_url"),
+            rules_refresh_seconds=float(
+                lane.get("rules_refresh_seconds", DEFAULT_RULES_REFRESH_S)
+            ),
+            stays_refresh_seconds=float(
+                lane.get("stays_refresh_seconds", DEFAULT_STAYS_REFRESH_S)
+            ),
+            vehicle_id_url=lane.get("vehicle_id_url"),
             outbox_depth_threshold=int(
                 lane.get("outbox_depth_threshold", DEFAULT_OUTBOX_DEPTH_THRESHOLD)
             ),

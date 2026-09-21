@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -98,7 +99,21 @@ class PlatformClient:
     # -- the lane surface --------------------------------------------------
 
     def get_rules(self) -> dict:
+        """The slow cadence: the garage's plans, its space class, each entitlement
+        module's register and the full set of open stays with a cursor. What the
+        lane decides from, refreshed OFF the barrier's path -- see `runner`."""
         return self._request("GET", "/api/v1/lane/rules")
+
+    def get_stays(self, since: str | None = None) -> dict:
+        """The fast cadence: every stay opened or closed since the cursor, closed
+        rows included so the reader drops them; without a cursor, the full open
+        set. The cursor is the platform's, handed back as it was handed out.
+        Read by the production loop's refresh thread and by NOTHING on the
+        barrier's path: a lane decides from what it already holds."""
+        path = "/api/v1/lane/stays"
+        if since is not None:
+            path = f"{path}?since={urllib.parse.quote(str(since), safe='')}"
+        return self._request("GET", path)
 
     def post_events(self, events: list[dict]) -> dict:
         return self._request("POST", "/api/v1/lane/events", {"events": events})

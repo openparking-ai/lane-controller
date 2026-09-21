@@ -94,9 +94,18 @@ both.
 
 ```sh
 lane-controller serve --config lane.toml
+lane-controller serve --config lane.toml --platform-token-file /etc/lane/device.token
 ```
 
 Loopback by default; off loopback it refuses to start without **both** tokens.
+The second form is a lane with a platform behind it: `[lane] server_url` names
+it and the device token it issued is in the file. `serve` refuses the two
+half-configured states by name — a `server_url` with no token, a token with no
+`server_url`. **The production loop runs beside the contract** (`runner.py`):
+one thread serves cars (`run_once`, for ever), one keeps the cache fresh on two
+cadences, and the seam table printed at start says, per seam, what is REAL and
+what is SIMULATED — this package ships no loop, camera or relay driver, and the
+line saying so is per seam rather than one word for all of them.
 
 **Four reads and one act.** Contract version 2 adds `POST /v1/lane/vend` — the
 assisted vend, and the only route here that changes anything. It completes a
@@ -129,7 +138,9 @@ neither on the path between a car arriving and a barrier opening.
 
 | | |
 |---|---|
-| `sync_rules()` | pulls the garage's rules into the local cache. On failure it keeps the cache it had — a failed request is not a reason to forget good rules. |
+| `sync_rules()` | the SLOW cadence: `GET /lane/rules` — the garage's rate plans whole, its space class, each entitlement module's register (verbatim; a module the platform could not read is NOT replaced with nothing) and the full set of open stays with a cursor. On failure it keeps the cache it had — a failed request is not a reason to forget good rules. |
+| `sync_stays()` | the FAST cadence: `GET /lane/stays?since=<cursor>` — every stay opened or closed since, closed rows included so the exit lane drops a car that left, paged and followed at once. A refusal drops the cursor so the next read takes the full set. |
+| `LaneRunner` | the production loop. The lane thread calls `run_once` for ever; the refresh thread runs the two cadences (`[lane] rules_refresh_seconds`, `stays_refresh_seconds`), the slow one first at start. A refresh that could not run is counted and said on `RunnerState`, never hidden; a turn that raises is logged and the loop goes round again. **The fast interval is the size of the class of cars that entered too recently to be priced at the barrier** — `config/lane.example.toml` says so where the number is set. |
 | `EventQueue` | one outbox holding both the activity log and the session actions, so a lane that was offline replays what happened in the order it happened. **Session actions are never dropped**; only log events are, and a drop is counted. |
 | `PlatformTransport` | delivers the outbox. All-or-nothing, because every platform endpoint it calls is idempotent. |
 

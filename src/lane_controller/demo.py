@@ -126,9 +126,13 @@ def main(argv=None) -> int:
     entry, rules, _ = build_lane(
         credentials, "entry", args.plate, args.confidence, lambda: entered_at
     )
+    # 0016: the payload carries the garage's plans whole, not an hourly figure.
+    plans = rules.get("rate_plans") or []
     print(
         f"\n  rules synced: default={rules['default_action']}, "
-        f"{money(rules['hourly_minor'], rules['currency'])}/hour"
+        f"{len(plans)} rate plan(s) in {rules['currency']}"
+        + (f", in force: {plans[-1].get('plan_version')}" if plans else "")
+        + f", {len((rules.get('stays') or {}).get('open') or [])} open stay(s)"
     )
     print("\n  [entry lane] a car arms the loop")
     decision = entry.run_once()
@@ -159,12 +163,22 @@ def main(argv=None) -> int:
     transport = exit_lane.events._transport
     closed = transport.last_close["session"] if transport.last_close else None
     if closed:
-        rate = closed["hourly_minor_applied"]
-        hours = closed["fee_minor"] // rate if rate else 0
+        # 0013: the close is priced by the engine from the plan in force at
+        # entry, and the row says which plan and how -- not by an hourly rate.
         print("\n  [platform]   session CLOSED")
-        billed = f"{money(rate, currency)}/h × {hours} h"
-        print(f"    stay         {args.stay_hours:g} h  →  billed {billed}")
-        print(f"    FEE          {money(closed['fee_minor'], currency)}")
+        print(f"    outcome      {closed.get('exit_outcome') or '—'}")
+        if closed.get("fee_minor") is None:
+            refusal = closed.get("pricing_refusal") or "no plan covered it"
+            print(f"    stay         {args.stay_hours:g} h  →  UNPRICED: {refusal}")
+        else:
+            # The breakdown is the engine's ledger: a list of lines whose
+            # running total is the fee, stored on the row as it came.
+            lines = closed.get("breakdown") or []
+            print(
+                f"    stay         {args.stay_hours:g} h  →  plan {closed.get('plan_version')}, "
+                f"{len(lines)} line(s)"
+            )
+            print(f"    FEE          {money(closed['fee_minor'], currency)}")
     else:
         print("\n  the exit did not produce a closed session — check the platform log")
         return 1
