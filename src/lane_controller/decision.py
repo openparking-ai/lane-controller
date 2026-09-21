@@ -93,6 +93,29 @@ class DecisionCache:
         # platform has said otherwise. A transient garage syncs "allow"; a
         # permit-only garage will sync nothing and keep falling back.
         self.default_action: str | None = None
+        # WHAT THE EXIT WILL DECIDE FROM, held as the platform hands it and
+        # consumed by nothing in this file yet: the decision that reads these
+        # is its own round. This round only keeps them fresh.
+        #
+        # The garage's rate plans, whole, and its space class -- what
+        # `rate_engine.quote` takes.
+        self.plans: list = []
+        self.space_class: str | None = None
+        # Each entitlement module's register, verbatim, keyed by module. A
+        # module is REPLACED only when the payload carries its `register`: a
+        # module the platform could not read (`unavailable`, no `register`)
+        # keeps what this cache already held, because an outage is not an
+        # empty register and a cache that emptied itself on one would send
+        # every pass holder to pay at the next exit.
+        self.entitlements: dict[str, dict] = {}
+        self.entitlements_complete: bool | None = None
+        # The garage's open stays, by session id, and the cursor the next
+        # delta continues from. The full set arrives with the rules (the slow
+        # cadence); the deltas arrive on their own (the fast cadence), closed
+        # rows included so a stay that left is dropped here.
+        self.stays: dict[str, dict] = {}
+        self.stays_cursor: str | None = None
+        self.stays_refreshed_at: float | None = None
 
     def load(
         self,
@@ -104,6 +127,57 @@ class DecisionCache:
         self._rules = {r.plate.upper(): r for r in rules}
         self.default_action = default_action
         self._refreshed_at = time.time() if now is None else now
+
+    def load_payload(self, payload: dict, *, now: float | None = None) -> None:
+        """Everything `GET /lane/rules` carries, in one replacement.
+
+        The plate rules and the default action as `load` takes them; the plans
+        and the space class whole; the entitlements per module by the rule
+        above (`register` present -> replaced, absent -> kept); and the open
+        stays as a full set with their cursor, replacing whatever the deltas
+        had built -- the slow cadence is the resync that bounds what a delta
+        can miss (platform 0016 says why one can).
+        """
+        rules = [
+            Rule(plate=r["plate"], allow=bool(r.get("allow", False)), rate_plan=r.get("rate_plan"))
+            for r in payload.get("plate_rules", [])
+        ]
+        self.load(rules, default_action=payload.get("default_action"), now=now)
+        self.plans = list(payload.get("rate_plans") or [])
+        self.space_class = payload.get("space_class")
+        facts = payload.get("entitlements") or {}
+        for module, fact in facts.items():
+            if isinstance(fact, dict) and "register" in fact:
+                self.entitlements[module] = fact
+        self.entitlements_complete = facts.get("complete")
+        stays = payload.get("stays") or {}
+        if "cursor" in stays:
+            self.replace_stays(stays.get("open") or [], stays["cursor"], now=now)
+
+    def replace_stays(
+        self, open_stays: list[dict], cursor: str, *, now: float | None = None
+    ) -> None:
+        """The full open set, and the cursor to continue from."""
+        self.stays = {s["session_id"]: s for s in open_stays}
+        self.stays_cursor = str(cursor)
+        self.stays_refreshed_at = time.time() if now is None else now
+
+    def apply_stay_changes(
+        self, changes: list[dict], cursor: str, *, now: float | None = None
+    ) -> None:
+        """One delta: an open row is added or updated, a closed row is dropped.
+
+        Applied in the order the platform sent them, which is cursor order;
+        the cursor moves only after every row landed, so a delta that raised
+        halfway would be re-read from where it started.
+        """
+        for stay in changes:
+            if stay.get("open"):
+                self.stays[stay["session_id"]] = stay
+            else:
+                self.stays.pop(stay["session_id"], None)
+        self.stays_cursor = str(cursor)
+        self.stays_refreshed_at = time.time() if now is None else now
 
     def is_stale(self, *, now: float | None = None) -> bool:
         if self._refreshed_at is None:

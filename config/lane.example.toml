@@ -20,8 +20,42 @@ confidence_threshold = 0.85
 # forever with the internet down.
 rules_max_age_seconds = 86400
 
-# Where events are reported when connectivity allows. Never on the hot path.
+# Where events are reported and the cache is refreshed from, when connectivity
+# allows. Never on the hot path. With this set, `serve` REQUIRES the device
+# token the platform issued for this lane, in the file `--platform-token-file`
+# names -- a file, never a value here, for the reason the act token gives
+# below. Unset, the lane is standalone: nothing is reported and nothing is
+# refreshed, and `serve` says so.
 server_url = "https://platform.example/api/lane-events"
+
+# THE TWO REFRESH CADENCES of the production loop. Both are PER-SITE SETTINGS
+# AND ASSUMPTIONS -- nothing in this package has measured a site.
+#
+# The SLOW one re-reads GET /lane/rules: the garage's rate plans, its space
+# class, each entitlement module's register and the full set of open stays.
+# Those change rarely. The trade it sets: a pass cancelled after the last
+# refresh gets one free exit before the cache catches up, against every
+# legitimate holder waiting on the network at every exit. It must be shorter
+# than rules_max_age_seconds above.
+rules_refresh_seconds = 300
+
+# The FAST one reads GET /lane/stays?since=<cursor>: every stay opened or
+# closed at the garage since the last read. READ THIS ONE TWICE: a car that
+# entered inside one of these intervals CANNOT BE PRICED AT THE BARRIER,
+# because its entry time has not reached the exit lane's cache yet. It leaves
+# the way it always has -- the barrier opens, the platform prices the stay
+# afterwards, nothing is collected at the reader -- and the record says so.
+# This number IS the size of that class in ordinary operation. A site that has
+# measured its own shortest entry-to-exit sets it from that; nothing here has.
+# It cannot exceed rules_refresh_seconds.
+stays_refresh_seconds = 5
+
+# Where the identification service answers. Unset, this lane identifies
+# nothing -- `serve` wires the stub identifier and every read is a fallback,
+# and says so. Set, the lane is an ordinary client of Vehicle ID at that
+# address, which is LOOPBACK on any real installation: identification runs on
+# the same box, and the lane has to work with the internet down.
+# vehicle_id_url = "http://127.0.0.1:8088"
 
 # How many UNDELIVERED events the outbox may hold before the health surface
 # reports `outbox_depth_growing` as `active`. A lane that cannot reach the

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from .decision import DecisionCache, Rule
+from .decision import DecisionCache
 from .events import EventTransport, LaneEvent
 from .platform_client import (
     CLOCK_SKEW_CODE,
@@ -139,13 +139,56 @@ def sync_rules(client: PlatformClient, cache: DecisionCache) -> dict | None:
         log.warning("rule sync failed, keeping the cache we have: %s", err)
         return None
 
-    plate_rules = [
-        Rule(plate=r["plate"], allow=bool(r.get("allow", False)), rate_plan=r.get("rate_plan"))
-        for r in payload.get("plate_rules", [])
-    ]
-    cache.load(plate_rules, default_action=payload.get("default_action"))
-    log.info("rules synced: %d plate rule(s), default=%s", len(plate_rules), cache.default_action)
+    cache.load_payload(payload)
+    log.info(
+        "rules synced: default=%s, %d plan(s), %d module register(s), %d open stay(s), cursor=%s",
+        cache.default_action, len(cache.plans), len(cache.entitlements), len(cache.stays),
+        cache.stays_cursor,
+    )
     return payload
+
+
+def sync_stays(client: PlatformClient, cache: DecisionCache) -> dict | None:
+    """The fast cadence: every stay changed since the cache's cursor, applied.
+
+    Returns the last answer, or None if offline -- and, like `sync_rules`, an
+    offline read changes nothing. A cache with no cursor yet takes the full
+    set. A page that says `more` is followed at once, every page landing
+    before the next is asked for. A REFUSAL -- a cursor the platform will not
+    take, a garage it no longer knows -- drops the cursor so the next read
+    takes the full set again, and is logged as what it is rather than being
+    retried under the same cursor for ever.
+    """
+    answer: dict | None = None
+    try:
+        for _page in range(MAX_STAY_PAGES):
+            if cache.stays_cursor is None:
+                answer = client.get_stays()
+                cache.replace_stays(answer.get("open") or [], answer["cursor"])
+                log.info("stays resynced: %d open, cursor=%s", len(cache.stays), cache.stays_cursor)
+                return answer
+            answer = client.get_stays(since=cache.stays_cursor)
+            cache.apply_stay_changes(answer.get("changes") or [], answer["cursor"])
+            if not answer.get("more"):
+                return answer
+        log.warning(
+            "stays delta still says more after %d pages; the next read continues from %s",
+            MAX_STAY_PAGES, cache.stays_cursor,
+        )
+        return answer
+    except PlatformUnreachable as err:
+        log.warning("stays sync failed, keeping the cache we have: %s", err)
+        return None
+    except PlatformRejected as err:
+        log.error("stays sync refused (%s); the next read takes the full set: %s", err.status, err)
+        cache.stays_cursor = None
+        return None
+
+
+#: How many delta pages one `sync_stays` follows before handing the cadence
+#: back. A bound on one call, not on the feed: the cursor is wherever the last
+#: page left it, and the next tick continues from there.
+MAX_STAY_PAGES = 50
 
 
 def require_descriptor_echo(

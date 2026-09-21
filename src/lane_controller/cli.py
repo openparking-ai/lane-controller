@@ -11,12 +11,18 @@ not a degraded one, and this is how somebody runs it:
 is the only credential that authorises `POST /v1/lane/vend`, and without it
 anything that can reach the port opens the barrier.
 
-The lane it serves is built from the configuration file and the SIMULATED
-seams, because this package ships no drivers -- a real installation constructs
-its own `LaneController` with its own hardware and passes it to `LaneService`.
-That is stated rather than implied: `serve` is how the contract is exercised
-and evaluated, and a lane serving simulated hardware says so on the line it
-prints when it starts.
+The lane it serves is built from the configuration file. The HARDWARE seams
+-- the loops, the camera, the vend relay -- are the SIMULATED ones, because
+this package ships no drivers; a real installation constructs its own
+`LaneController` with its own hardware. The two SOFTWARE seams are real when
+the configuration names them: the platform (`[lane] server_url`, with the
+device token in the file `--platform-token-file` names) and the
+identification service (`[lane] vehicle_id_url`). A configured platform gets
+a real `PlatformClient`, the outbox drains to it, and the PRODUCTION LOOP runs
+(`runner`): the lane serves cars on one thread and the cache is refreshed on
+two cadences on another. Which seams are real and which are simulated is
+printed on the lines the service starts with, per seam, so a lane serving
+simulated hardware says so and a lane serving a real platform says that too.
 """
 
 from __future__ import annotations
@@ -28,6 +34,9 @@ from pathlib import Path
 
 from .config import LaneConfig
 from .controller import LaneController
+from .events import EventQueue
+from .platform_client import PlatformClient
+from .runner import LaneRunner
 from .service import InsecureBind, LaneService, assert_bind_allowed, make_server
 from .simulated import (
     CannedCameraFeed,
@@ -37,6 +46,8 @@ from .simulated import (
     SimulatedLoopInput,
     StubVehicleIdentifier,
 )
+from .sync import PlatformTransport
+from .vehicle_id_client import VehicleIdClient
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +79,14 @@ def build_parser() -> argparse.ArgumentParser:
              "larger reason than the first: without it, anything that can reach the port "
              "opens the barrier. A read token on the vend route is 403, and so is the act "
              "token on a read route",
+    )
+    serve.add_argument(
+        "--platform-token-file",
+        type=Path,
+        help="a file holding this lane's DEVICE token for the platform named by [lane] "
+             "server_url. Required when server_url is set; refused when it is not, because a "
+             "credential with nothing to present it to is a credential lying around. A FILE, "
+             "for the same reason as the other two",
     )
     return parser
 
@@ -104,16 +123,102 @@ def _simulated_lane(config: LaneConfig) -> LaneController:
     `LaneController` refuses a lane whose declared geometry and wired hardware
     disagree, so building it any other way would fail here rather than lie.
     """
-    return LaneController(
+    return wire_lane(config, platform=None).controller
+
+
+class WiredLane:
+    """What `serve` built, and which of its seams are real."""
+
+    def __init__(self, controller: LaneController, client: PlatformClient | None, seams: dict):
+        self.controller = controller
+        self.client = client
+        #: seam name -> "REAL <what>" or "SIMULATED <why>", printed at start.
+        self.seams = seams
+
+
+def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLane:
+    """The lane `serve` runs: real software seams where configured, simulated
+    hardware seams always, and a table saying which is which.
+
+    The platform is REAL when a client is handed in: the outbox drains to it
+    through `PlatformTransport`, and at an exit lane the close names its
+    session through `find_open_session`, which is best effort by its own
+    contract (offline, the close goes out without an id). The identifier is
+    REAL when `[lane] vehicle_id_url` is set: this lane is then an ordinary
+    client of Vehicle ID at that address, and `LaneService` reads the wiring
+    to publish `has_identity_service`. Everything the package ships no driver
+    for is simulated, and named as such.
+    """
+    seams: dict[str, str] = {}
+    if platform is not None:
+        events = EventQueue(PlatformTransport(platform))
+        seams["platform"] = (
+            f"REAL {platform.base_url} (outbox drains to it; refresh on two cadences)"
+        )
+        lookup = (
+            (lambda plate: platform.find_open_session(plate=plate))
+            if config.direction == "exit"
+            else None
+        )
+    else:
+        events = EventQueue()
+        seams["platform"] = "NONE (standalone: nothing is reported, nothing is refreshed)"
+        lookup = None
+    if config.vehicle_id_url:
+        identifier = VehicleIdClient(config.vehicle_id_url)
+        seams["identifier"] = f"REAL Vehicle ID at {config.vehicle_id_url}"
+    else:
+        identifier = StubVehicleIdentifier()
+        seams["identifier"] = "SIMULATED stub (no [lane] vehicle_id_url): every read is a fallback"
+    seams["loops"] = "SIMULATED (this package ships no loop driver)"
+    seams["camera"] = "SIMULATED (this package ships no camera driver)"
+    seams["barrier"] = (
+        "SIMULATED (this package ships no relay driver: nothing here vends a barrier)"
+    )
+    controller = LaneController(
         config,
         loop=SimulatedLoopInput(arrivals=0),
         camera=CannedCameraFeed(camera_id=config.camera.camera_id),
         vend=RecordingVendOutput(),
-        identifier=StubVehicleIdentifier(),
+        identifier=identifier,
         arming_loop_b=OccupancyLoopInput() if config.loops.arming_loops == 2 else None,
         closing_loops=ScriptedClosingLoops() if config.loops.confirms_entry else None,
         deactivate_loop=OccupancyLoopInput() if config.loops.has_deactivate_loop else None,
+        events=events,
+        session_lookup=lookup,
     )
+    return WiredLane(controller, platform, seams)
+
+
+def platform_client_for(config: LaneConfig, token_file: Path | None) -> PlatformClient | None:
+    """The platform, or None for a standalone lane -- and a refusal for the two
+    half-configured states, before anything is built.
+
+    `server_url` with no token file is a lane that would report to a platform
+    it cannot authenticate to, every send refused 401 and every refresh
+    failing, for as long as it runs. A token file with no `server_url` is a
+    credential read into memory with nowhere to present it. Neither is a
+    configuration somebody meant, and both are said here.
+    """
+    token = _token(token_file)
+    if config.server_url and token is None:
+        print(
+            f"\n[lane] server_url is set ({config.server_url}) but no --platform-token-file was "
+            "given. A lane that reports to a platform needs the device token that platform "
+            "issued for it; a lane that reports to nothing leaves server_url unset.\n",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if token is not None and not config.server_url:
+        print(
+            "\n--platform-token-file was given but [lane] server_url is not set: a credential "
+            "with nothing to present it to. Set server_url, or drop the token.\n",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if token is None:
+        return None
+    return PlatformClient(config.server_url, token)
 
 
 def cmd_serve(args) -> int:
@@ -143,9 +248,17 @@ def cmd_serve(args) -> int:
         print(f"\n{exc}\n", file=sys.stderr)
         return 2
 
-    service = LaneService(_simulated_lane(config))
+    platform = platform_client_for(config, args.platform_token_file)
+    wired = wire_lane(config, platform=platform)
+    service = LaneService(wired.controller)
     server = make_server(
         service, host=args.host, port=args.port, token=token, act_token=act_token
+    )
+    runner = LaneRunner(
+        wired.controller,
+        client=wired.client,
+        rules_refresh_s=config.rules_refresh_seconds,
+        stays_refresh_s=config.stays_refresh_seconds,
     )
 
     reach = "local only by design" if args.host in ("127.0.0.1", "::1", "localhost") else "EXPOSED"
@@ -155,19 +268,32 @@ def cmd_serve(args) -> int:
         print("  POST /v1/lane/vend WILL PULSE THE VEND RELAY on this lane")
     else:
         print("  no act route on this lane: capabilities.can_vend is false")
-    # Said out loud at the moment somebody starts it, because a lane answering
-    # the contract with no hardware behind it is the one thing an evaluator
-    # could otherwise mistake for a working installation.
-    print("  seams are SIMULATED: this serves the contract, it does not drive a barrier")
+    # Said out loud at the moment somebody starts it, PER SEAM, because a lane
+    # answering the contract with no hardware behind it is the one thing an
+    # evaluator could otherwise mistake for a working installation -- and a
+    # lane with a real platform behind it is now a thing that exists, and the
+    # line has to say which this is.
+    for seam, what in wired.seams.items():
+        print(f"  {seam:10} {what}")
+    if wired.client is not None:
+        print(
+            f"  refresh    rules every {config.rules_refresh_seconds:g}s, "
+            f"stays every {config.stays_refresh_seconds:g}s (the second is the size of the "
+            "class of cars that cannot be priced at the barrier)"
+        )
     if args.auth_token_file:
         print("  every read route requires the read bearer token")
     if args.act_token_file:
         print("  the vend route requires the ACT bearer token, which is a different one")
+    # The production loop, beside the contract: the lane thread serves cars,
+    # the refresh thread keeps the cache fresh, and this thread serves HTTP.
+    runner.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print()
     finally:
+        runner.stop()
         server.server_close()
     return 0
 

@@ -39,8 +39,9 @@ from .interfaces import (
     VendOutput,
 )
 from .platform_client import PlatformClient, PlatformRejected, PlatformUnreachable
+from .runner import LaneRunner, RunnerState
 from .service import InsecureBind, LaneService, make_server
-from .sync import PlatformTransport, sync_rules
+from .sync import PlatformTransport, sync_rules, sync_stays
 from .vehicle_id_client import VehicleIdClient
 from .vend import AssistedVend, BadVendRequest, VendRequest
 
@@ -79,6 +80,8 @@ __all__ = [
     "PlatformClient",
     "PlatformRejected",
     "PlatformTransport",
+    "LaneRunner",
+    "RunnerState",
     "PlatformUnreachable",
     "Rule",
     "Source",
@@ -97,6 +100,7 @@ __all__ = [
     "decide",
     "make_server",
     "sync_rules",
+    "sync_stays",
 ]
 
 __version__ = "0.1.0"
