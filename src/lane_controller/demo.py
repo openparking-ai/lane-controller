@@ -169,14 +169,21 @@ def main(argv=None) -> int:
         elif local.status == "covered":
             print(f"    at the box   COVERED by {', '.join(local.covered_by)}: no fee")
         else:
-            print(f"    at the box   {local.status.upper()}: priced by the platform at the close")
+            print(
+                f"    at the box   {local.status.upper()}: settled by the platform at the close"
+                " — covered if a module it asks there covers it, else priced by the engine"
+            )
     print(f"    gate         {'VENDED' if exit_decision.should_vend else 'not opened'}")
 
     transport = exit_lane.events._transport
     closed = transport.last_close["session"] if transport.last_close else None
     if closed:
-        # 0013: the close is priced by the engine from the plan in force at
-        # entry, and the row says which plan and how -- not by an hourly rate.
+        # The row as the platform closed it. A decision the platform consumed
+        # (0017) is written as the lane decided it -- covered, or the lane's
+        # own fee and plan -- and no engine runs on the platform. Any other
+        # close is settled there: covered if a module covers it, otherwise
+        # priced by the engine from the plan in force at entry (0013). A
+        # priced row says which plan and how -- not an hourly rate.
         print("\n  [platform]   session CLOSED")
         print(f"    outcome      {closed.get('exit_outcome') or '—'}")
         if closed.get("fee_minor") is None:
