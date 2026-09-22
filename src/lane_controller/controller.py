@@ -48,6 +48,7 @@ from .config import LaneConfig
 from .contract import TransitState
 from .decision import Decision, DecisionCache, Outcome, decide
 from .events import EventQueue
+from .exit_pricing import price_exit
 from .interfaces import (
     CameraFeed,
     ClosingLoops,
@@ -468,6 +469,16 @@ class LaneController:
             self.cache,
             confidence_threshold=self.config.confidence_threshold,
         )
+        if self.config.direction == "exit" and decision.should_vend and identity.plate:
+            # THE EXIT'S LOCAL DECISION, BEFORE THE BARRIER MOVES: covered from
+            # the cache, priced on the box, or said to be unpriceable here --
+            # from memory and the in-process engine, and from nothing on the
+            # network (`exit_pricing`). The vend below does not wait on it in
+            # the sense that matters: it takes microseconds, and it is what
+            # the fee on the screens will be read from.
+            decision = replace(
+                decision, exit_pricing=price_exit(identity.plate, self.cache, now=self.now())
+            )
         self.events.record(
             "decision",
             lane,
@@ -475,6 +486,11 @@ class LaneController:
             reason=decision.reason,
             fallback=decision.fallback.value if decision.fallback else None,
             rate_plan=decision.rate_plan,
+            **(
+                {"exit_pricing": decision.exit_pricing.to_detail()}
+                if decision.exit_pricing is not None
+                else {}
+            ),
         )
         # Held so the read contract can publish it. Taken here rather than
         # reconstructed from the event queue, which `flush()` empties: a

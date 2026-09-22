@@ -60,6 +60,11 @@ class Decision:
     identity: VehicleIdentity
     fallback: Fallback | None = None
     rate_plan: str | None = None
+    #: At an EXIT that will vend: what the lane decided about money, from the
+    #: cache alone (`exit_pricing.ExitPricing`). None at an entry, on a
+    #: fallback, or on a lane built before this existed. Not part of the read
+    #: contract yet: the display round is what publishes it.
+    exit_pricing: object | None = None
 
     @property
     def should_vend(self) -> bool:
@@ -73,6 +78,32 @@ class Rule:
     plate: str
     allow: bool
     rate_plan: str | None = None
+
+
+def normalise_identity(text: str) -> str:
+    """The one folding under which a plate the camera read and an identity a
+    registrar typed are compared: upper-case, letters and digits only.
+    `AB-123`, `ab 123` and `AB123` are one identity here.
+
+    AN ASSUMPTION, STATED: garage-pass stores an identity as the registrar
+    typed it and monthly-billing folds it under the garage's own rule
+    (`identity_normalised`), and the lane knows neither rule. This folding is
+    the widest reading both admit, so a holder is not sent to pay over a
+    hyphen. The record it can be wrong against is the platform's: the close
+    still consults both modules through their own doors (0015), so a car the
+    lane let out covered and the modules did not cover is a divergence the
+    record shows, not a fee that was never charged in silence.
+    """
+    return "".join(ch for ch in text.upper() if ch.isalnum())
+
+
+def _register_heads(module: str, register: dict) -> dict[str, dict]:
+    """The pass or agreement entries of a register, by id, as the modules'
+    `show-garage-register` verbs list them (garage-pass G27: `passes[]` keyed
+    `pass`; monthly-billing G48: `agreements[]` keyed `agreement`)."""
+    if module == "garage_pass":
+        return {p.get("pass"): p for p in register.get("passes") or [] if p.get("pass")}
+    return {a.get("agreement"): a for a in register.get("agreements") or [] if a.get("agreement")}
 
 
 class DecisionCache:
@@ -129,6 +160,18 @@ class DecisionCache:
         self.stays: dict[str, dict] = {}
         self.stays_cursor: str | None = None
         self.stays_refreshed_at: float | None = None
+        # The garage's clock and money, as the payload names them: the exit
+        # compares the registers' days with the garage's local day, and prices
+        # in the garage's currency.
+        self.timezone: str | None = None
+        self.currency: str | None = None
+        # THE TWO INDEXES THE EXIT READS ON THE BARRIER'S PATH, rebuilt whole
+        # on every change so the read is one dict lookup and never a scan:
+        # identity -> the register rows that name it, per module; identity ->
+        # the open stays under it. Keys are `normalise_identity`'d, so the
+        # plate the camera read and the identity a registrar typed meet.
+        self._coverage_index: dict[str, list[tuple[str, dict, dict]]] = {}
+        self._stay_index: dict[str, list[dict]] = {}
         if self._store is not None:
             self._restore()
 
@@ -162,6 +205,8 @@ class DecisionCache:
             "stays": self.stays,
             "stays_cursor": self.stays_cursor,
             "stays_refreshed_at": self.stays_refreshed_at,
+            "timezone": self.timezone,
+            "currency": self.currency,
         }
 
     def _persist(self) -> None:
@@ -195,6 +240,10 @@ class DecisionCache:
         self.stays = dict(state.get("stays") or {})
         self.stays_cursor = state.get("stays_cursor")
         self.stays_refreshed_at = state.get("stays_refreshed_at")
+        self.timezone = state.get("timezone")
+        self.currency = state.get("currency")
+        self._reindex_coverage()
+        self._reindex_stays()
         return True
 
     def clear(self) -> None:
@@ -210,6 +259,10 @@ class DecisionCache:
         self.stays = {}
         self.stays_cursor = None
         self.stays_refreshed_at = None
+        self.timezone = None
+        self.currency = None
+        self._coverage_index = {}
+        self._stay_index = {}
         if self._store is not None:
             self._store.wipe()
 
@@ -247,11 +300,14 @@ class DecisionCache:
         self.load(rules, default_action=payload.get("default_action"), now=now)
         self.plans = list(payload.get("rate_plans") or [])
         self.space_class = payload.get("space_class")
+        self.timezone = payload.get("timezone")
+        self.currency = payload.get("currency")
         facts = payload.get("entitlements") or {}
         for module, fact in facts.items():
             if isinstance(fact, dict) and "register" in fact:
                 self.entitlements[module] = fact
         self.entitlements_complete = facts.get("complete")
+        self._reindex_coverage()
         stays = payload.get("stays") or {}
         if "cursor" in stays:
             self.replace_stays(stays.get("open") or [], stays["cursor"], now=now)
@@ -264,6 +320,7 @@ class DecisionCache:
         self.stays = {s["session_id"]: s for s in open_stays}
         self.stays_cursor = str(cursor)
         self.stays_refreshed_at = time.time() if now is None else now
+        self._reindex_stays()
         self._persist()
 
     def apply_stay_changes(
@@ -282,7 +339,40 @@ class DecisionCache:
                 self.stays.pop(stay["session_id"], None)
         self.stays_cursor = str(cursor)
         self.stays_refreshed_at = time.time() if now is None else now
+        self._reindex_stays()
         self._persist()
+
+    # -- the indexes the exit reads ---------------------------------------------
+
+    def _reindex_coverage(self) -> None:
+        index: dict[str, list[tuple[str, dict, dict]]] = {}
+        for module, fact in self.entitlements.items():
+            register = fact.get("register") or {}
+            heads = _register_heads(module, register)
+            for row in register.get("registrations") or []:
+                identity = row.get("vehicle_identity") or row.get("identity_normalised")
+                if not identity:
+                    continue
+                head = heads.get(row.get("pass") or row.get("agreement"), {})
+                index.setdefault(normalise_identity(identity), []).append((module, row, head))
+        self._coverage_index = index
+
+    def _reindex_stays(self) -> None:
+        index: dict[str, list[dict]] = {}
+        for stay in self.stays.values():
+            for identity in (stay.get("plate"), stay.get("ticket_ref")):
+                if identity:
+                    index.setdefault(normalise_identity(identity), []).append(stay)
+        self._stay_index = index
+
+    def register_rows_for(self, identity: str) -> list[tuple[str, dict, dict]]:
+        """Every register row naming this identity: (module, the row, the pass
+        or agreement it names as the register lists it). One lookup."""
+        return self._coverage_index.get(normalise_identity(identity), [])
+
+    def open_stays_for(self, identity: str) -> list[dict]:
+        """Every open stay under this plate or ticket. One lookup."""
+        return self._stay_index.get(normalise_identity(identity), [])
 
     def is_stale(self, *, now: float | None = None) -> bool:
         if self._refreshed_at is None:

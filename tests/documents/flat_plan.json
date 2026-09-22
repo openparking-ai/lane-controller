@@ -1,0 +1,35 @@
+{
+  "plan_version": "flat-lot-2026-01",
+  "effective_from": "2026-01-01T00:00:00-05:00",
+  "timezone": "America/New_York",
+  "currency": "USD",
+  "space_classes": [
+    "standard"
+  ],
+  "resolution": {
+    "QUALIFY": {
+      "mode": "cheapest_wins"
+    },
+    "ACCUMULATE": {
+      "mode": "cheapest_wins"
+    }
+  },
+  "adjust_order": null,
+  "rules": [
+    {
+      "id": "hourly-unbounded",
+      "type": "increment",
+      "stage": "ACCUMULATE",
+      "space_classes": [
+        "standard"
+      ],
+      "first_period_minutes": 60,
+      "first_period_minor": 300,
+      "repeat_period_minutes": 60,
+      "repeat_period_minor": 300,
+      "rounding": "ceil",
+      "max_duration_minutes": null
+    }
+  ],
+  "decisions": []
+}
