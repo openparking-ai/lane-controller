@@ -158,6 +158,18 @@ def main(argv=None) -> int:
     print(f"\n  [exit lane]  {args.stay_hours:g} hours later, the same car arrives")
     exit_decision = exit_lane.run_once()
     print(f"    decision     {exit_decision.outcome.value.upper()}")
+    local = exit_decision.exit_pricing
+    if local is not None:
+        # THE LANE'S OWN ANSWER, before the barrier moved and from the cache
+        # alone: covered, priced on the box, or -- for a car whose entry the
+        # exit lane's cache does not hold yet -- left to the platform's close.
+        if local.status == "priced":
+            print(f"    at the box   PRICED {money(local.fee_minor, local.currency)} "
+                  f"(plan {local.plan_version}, from the cached entry)")
+        elif local.status == "covered":
+            print(f"    at the box   COVERED by {', '.join(local.covered_by)}: no fee")
+        else:
+            print(f"    at the box   {local.status.upper()}: priced by the platform at the close")
     print(f"    gate         {'VENDED' if exit_decision.should_vend else 'not opened'}")
 
     transport = exit_lane.events._transport

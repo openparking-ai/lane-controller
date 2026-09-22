@@ -77,6 +77,22 @@ afterwards; the barrier never waits on a network call. If the rules go stale
 past their configured age, the lane falls back rather than acting on pricing it
 no longer trusts.
 
+**And the exit decides at the barrier, from the cache, before the barrier
+moves.** At an exit lane a car the registers cover (a garage pass or a monthly
+agreement that stands on the garage's local day) leaves **covered**, no fee; a
+transient whose entry the cache holds is **priced on the box** by the rate
+engine in-process — `rate_engine.contract.run_quote`, the one function behind
+the platform's `/v1/quote`, so the lane's number and the platform's are one
+computation; and a transient whose entry the cache does not hold yet — it
+entered inside one stays interval, or during an outage — is said to be
+**`no_cached_entry`**: the barrier opens as it always has, the platform prices
+the stay at the close, nothing is collected at the reader, and the record says
+so (`exit_pricing.py`, on the `decision` event). Nothing on that path opens a
+socket to the platform: `tests/test_exit_decision.py` runs the real Vehicle ID
+service on loopback, counts every connection the turn makes up to the vend, and
+times it — a Mac number, a floor for a Jetson. The close still consults the
+modules and prices on the platform; the lane's answer travels beside it.
+
 **And it works after a restart with the internet down**, when `[lane]
 cache_path` is set: the cache is written whole to a SQLite file on every
 refresh that changes it (`durable.py`) and read back at start, **as old as its
@@ -161,6 +177,7 @@ neither on the path between a car arriving and a barrier opening.
 |---|---|
 | `sync_rules()` | the SLOW cadence: `GET /lane/rules` — the garage's rate plans whole, its space class, each entitlement module's register (verbatim; a module the platform could not read is NOT replaced with nothing) and the full set of open stays with a cursor. On failure it keeps the cache it had — a failed request is not a reason to forget good rules. |
 | `sync_stays()` | the FAST cadence: `GET /lane/stays?since=<cursor>` — every stay opened or closed since, closed rows included so the exit lane drops a car that left, paged and followed at once. A refusal drops the cursor so the next read takes the full set. |
+| `price_exit()` | the exit's local decision, from the cache alone: `covered`, `priced` (the engine in-process), `no_cached_entry`, or the engine's own refusal verbatim. Reads the registers with the garage's local day; folds the plate and the registrar's identity to letters and digits (an assumption, stated in `normalise_identity`). |
 | `LaneRunner` | the production loop. The lane thread calls `run_once` for ever; the refresh thread runs the two cadences (`[lane] rules_refresh_seconds`, `stays_refresh_seconds`), the slow one first at start. A refresh that could not run is counted and said on `RunnerState`, never hidden; a turn that raises is logged and the loop goes round again. **The fast interval is the size of the class of cars that entered too recently to be priced at the barrier** — `config/lane.example.toml` says so where the number is set. |
 | `EventQueue` | one outbox holding both the activity log and the session actions, so a lane that was offline replays what happened in the order it happened. **Session actions are never dropped**; only log events are, and a drop is counted. |
 | `PlatformTransport` | delivers the outbox. All-or-nothing, because every platform endpoint it calls is idempotent. |

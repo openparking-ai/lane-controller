@@ -27,6 +27,12 @@ jobs:
         # pyproject.toml saying so was not a check; this is.
         run: bash .github/scripts/check-vehicle-id-pin.sh
 
+      - name: The rate-engine pin names a commit on rate-engine main
+        # The same rule for the second pinned contract: the exit's local
+        # pricing runs the engine in-process, from a commit that must exist
+        # on the engine's main.
+        run: bash .github/scripts/check-rate-engine-pin.sh
+
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
       - name: No real personal data in the repository
@@ -76,6 +82,14 @@ jobs:
         # half the cache persisted -- and requires the durable-cache suite to
         # fail each time.
         run: python scripts/durable_fail_control.py
+
+      - name: Exit-decision fail-control
+        # Breaks the exit's local decision -- the day read on UTC's clock, a
+        # revoked pass covering, an uncached car priced from a guessed entry,
+        # the platform asked on the barrier's path, the plate named in the
+        # record, the identity folding removed -- and requires the
+        # exit-decision suite to fail each time.
+        run: python scripts/exit_decision_fail_control.py
 
       - name: Confirmation fail-control
         # Breaks the entry confirmation on purpose -- the window, the crossing

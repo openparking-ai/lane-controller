@@ -1596,3 +1596,89 @@ def _break_the_store(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_DURABLE mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the exit-decision fail-control.
+#
+# scripts/exit_decision_fail_control.py sets BREAK_EXIT_DECISION and requires
+# tests/test_exit_decision.py to FAIL. An exit that has never been seen to
+# decide wrongly is not known to decide rightly.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_exit_decision(monkeypatch):
+    mode = os.environ.get("BREAK_EXIT_DECISION")
+    if not mode:
+        return
+
+    from lane_controller import controller as controller_module
+    from lane_controller import decision as decision_module
+    from lane_controller import exit_pricing as pricing_module
+
+    if mode == "day_is_utc":
+        # The registers are read against UTC's day, not the garage's.
+        original = pricing_module.local_day
+
+        def utc_day(now, timezone):
+            return original(now, "UTC")[0], "UTC"
+
+        monkeypatch.setattr(pricing_module, "local_day", utc_day)
+
+    elif mode == "revoked_covers":
+        # A pass's state is not read: revoked and suspended cover.
+        original = pricing_module.row_covers
+
+        def state_blind(module, row, head, day):
+            if module == "garage_pass" and head:
+                head = {**head, "state": "active"}
+            return original(module, row, head, day)
+
+        monkeypatch.setattr(pricing_module, "row_covers", state_blind)
+
+    elif mode == "uncached_guessed":
+        # A transient with no cached entry is priced as if it entered now.
+        original = pricing_module.price_exit
+
+        def guessing(identity_text, cache, *, now):
+            answer = original(identity_text, cache, now=now)
+            if answer.status == pricing_module.NO_CACHED_ENTRY:
+                return pricing_module.ExitPricing(
+                    status=pricing_module.PRICED, fee_minor=0, currency=cache.currency,
+                    plan_version="guessed", computed_from=answer.computed_from,
+                )
+            return answer
+
+        monkeypatch.setattr(controller_module, "price_exit", guessing)
+
+    elif mode == "platform_on_the_path":
+        # The exit asks the platform for its rules before it decides.
+        original = pricing_module.price_exit
+
+        def asking(identity_text, cache, *, now):
+            import urllib.request
+
+            try:
+                urllib.request.urlopen("http://127.0.0.1:9/api/v1/lane/rules", timeout=0.2)
+            except Exception:
+                pass
+            return original(identity_text, cache, now=now)
+
+        monkeypatch.setattr(controller_module, "price_exit", asking)
+
+    elif mode == "plate_in_the_record":
+        # The decision event names the plate it decided about.
+        original = pricing_module.ExitPricing.to_detail
+
+        def naming(self):
+            return {**original(self), "identity": "PASS-1"}
+
+        monkeypatch.setattr(pricing_module.ExitPricing, "to_detail", naming)
+
+    elif mode == "no_folding":
+        # The camera's spelling and the registrar's must match byte for byte.
+        monkeypatch.setattr(decision_module, "normalise_identity", lambda text: text)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_EXIT_DECISION mode: {mode}")
