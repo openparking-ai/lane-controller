@@ -1682,3 +1682,106 @@ def _break_the_exit_decision(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_DECISION mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# scripts/close_decision_fail_control.py sets BREAK_CLOSE_DECISION and requires
+# tests/test_close_decision.py to FAIL. A close that has never been seen to
+# carry the wrong decision is not known to carry the right one.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_close_decision(monkeypatch):
+    mode = os.environ.get("BREAK_CLOSE_DECISION")
+    if not mode:
+        return
+
+    from dataclasses import replace as _replace
+
+    from lane_controller import controller as controller_module
+    from lane_controller import platform_client as client_module
+    from lane_controller import sync as sync_module
+
+    def _rewritten(edit):
+        """`PlatformTransport._close_session` handed a COPY of the event whose
+        `local_decision` was edited on the way out; the event itself, which the
+        lane recorded, is untouched -- so the break is in transit, not in the
+        record."""
+        original = sync_module.PlatformTransport._close_session
+
+        def in_transit(self, event):
+            detail = dict(event.detail)
+            if detail.get("local_decision") is not None:
+                detail = edit(detail)
+            return original(self, _replace(event, detail=detail))
+
+        monkeypatch.setattr(sync_module.PlatformTransport, "_close_session", in_transit)
+
+    if mode == "close_carries_nothing":
+        # The close records no decision at all.
+        original = controller_module.LaneController._record_session
+
+        def bare(self, identity, at, *, confirmation, exit_pricing=None):
+            return original(self, identity, at, confirmation=confirmation)
+
+        monkeypatch.setattr(controller_module.LaneController, "_record_session", bare)
+
+    elif mode == "last_decision_read":
+        # The settle reads whatever the lane last decided, not what it was handed.
+        original = controller_module.LaneController._record_session
+
+        def from_last(self, identity, at, *, confirmation, exit_pricing=None):
+            last = self.last_decision.exit_pricing if self.last_decision else None
+            return original(self, identity, at, confirmation=confirmation, exit_pricing=last)
+
+        monkeypatch.setattr(controller_module.LaneController, "_record_session", from_last)
+
+    elif mode == "transport_drops_it":
+        # The event carries it; the transport does not hand it to the route.
+        _rewritten(lambda detail: {k: v for k, v in detail.items() if k != "local_decision"})
+
+    elif mode == "fee_edited_in_transit":
+        # The lane sends a fee other than the one it showed.
+        def plus_one(detail):
+            decision = dict(detail["local_decision"])
+            if decision.get("fee_minor") is not None:
+                decision["fee_minor"] = decision["fee_minor"] + 1
+            return {**detail, "local_decision": decision}
+
+        _rewritten(plus_one)
+
+    elif mode == "client_drops_it":
+        # The client never puts it on the wire.
+        original = client_module.PlatformClient.close_session
+
+        def without(self, *, local_decision=None, **kwargs):
+            return original(self, **kwargs)
+
+        monkeypatch.setattr(client_module.PlatformClient, "close_session", without)
+
+    elif mode == "null_not_absent":
+        # A close with no decision says `null` instead of nothing.
+        original = client_module.PlatformClient.close_session
+
+        def nulled(self, *, local_decision=None, **kwargs):
+            if local_decision is None:
+                bodies = []
+                real = self._request
+
+                def capture(method, path, body=None):
+                    body = {**(body or {}), "local_decision": None}
+                    bodies.append(body)
+                    return real(method, path, body)
+
+                self._request = capture
+                try:
+                    return original(self, local_decision=None, **kwargs)
+                finally:
+                    self._request = real
+            return original(self, local_decision=local_decision, **kwargs)
+
+        monkeypatch.setattr(client_module.PlatformClient, "close_session", nulled)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_CLOSE_DECISION mode: {mode}")

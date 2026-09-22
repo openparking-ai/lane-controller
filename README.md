@@ -90,8 +90,16 @@ the stay at the close, nothing is collected at the reader, and the record says
 so (`exit_pricing.py`, on the `decision` event). Nothing on that path opens a
 socket to the platform: `tests/test_exit_decision.py` runs the real Vehicle ID
 service on loopback, counts every connection the turn makes up to the vend, and
-times it — a Mac number, a floor for a Jetson. The close still consults the
-modules and prices on the platform; the lane's answer travels beside it.
+times it — a Mac number, a floor for a Jetson. **And the close carries that
+decision** (`local_decision` on the session close, the whole of the `decision`
+event's `exit_pricing`, unedited, handed down from the car's own decision and
+never read back from "the last one"): a platform at migration 0017 or later
+**consumes it** — writes the lane's fee, runs no engine — so the screen, the
+card and the row are one computation, and its reconciler re-derives the number
+out of band from what the decision says it was computed from. A platform that
+does not consume it says why on the row; an older platform ignores the field
+and prices as before. `tests/test_close_decision.py` holds the seam, and
+`scripts/close_decision_fail_control.py` breaks it six ways.
 
 **And it works after a restart with the internet down**, when `[lane]
 cache_path` is set: the cache is written whole to a SQLite file on every

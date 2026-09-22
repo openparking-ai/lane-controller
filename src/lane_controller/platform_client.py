@@ -198,6 +198,7 @@ class PlatformClient:
         ticket_ref: str | None = None,
         session_id: str | None = None,
         descriptor: str | None = None,
+        local_decision: dict | None = None,
     ) -> dict:
         body = {
             "event_id": event_id,
@@ -213,6 +214,12 @@ class PlatformClient:
         # compares has to be in this call.
         if descriptor is not None:
             body["descriptor"] = descriptor
+        # The exit's local decision, ONLY when there is one, whole and
+        # unedited: the platform's close writes its numbers (0017), and its
+        # reconciler re-derives them from `computed_from`. Nothing here decides
+        # what the platform should make of it.
+        if local_decision is not None:
+            body["local_decision"] = local_decision
         return self._request("POST", "/api/v1/lane/sessions/close", body)
 
 

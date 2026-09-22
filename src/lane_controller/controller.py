@@ -519,7 +519,7 @@ class LaneController:
             # arrived, whatever time the server eventually hears about it, and
             # pricing a stay by when the network came back would be wrong.
             at = to_iso(self._clock())
-            self._settle_transit(identity, at)
+            self._settle_transit(identity, at, exit_pricing=decision.exit_pricing)
 
         elif decision.outcome is Outcome.NO_VEHICLE:
             # D3. Nothing was there, so nothing happens: no ticket, no session,
@@ -726,7 +726,7 @@ class LaneController:
         """
         return "ticket" if identity.ticket_ref else "plate"
 
-    def _settle_transit(self, identity, at: str) -> None:
+    def _settle_transit(self, identity, at: str, *, exit_pricing=None) -> None:
         """Record the pending entry, then let the closing loops decide its fate.
 
         Two halves, called as one here and separately by the assisted vend --
@@ -734,9 +734,14 @@ class LaneController:
         on waiting for the crossing, because the confirmation window is ten
         seconds and an HTTP route that held one open for it would be reporting
         a settled transit as though it were an immediate one.
+
+        `exit_pricing` is THIS car's local decision, handed down explicitly so
+        the close carries the decision the barrier moved on -- not whatever
+        `last_decision` holds by the time a settle records the session, which
+        on a thread of its own could be the next car's.
         """
         self.begin_transit(identity, at)
-        self.resolve_transit(identity, at)
+        self.resolve_transit(identity, at, exit_pricing=exit_pricing)
 
     def begin_transit(self, identity, at: str) -> None:
         """The vend created a PENDING entry. Nothing has decided its fate yet."""
@@ -760,7 +765,7 @@ class LaneController:
         )
         self._transit(TransitState.PENDING, at)
 
-    def resolve_transit(self, identity, at: str, *, claim=None) -> None:
+    def resolve_transit(self, identity, at: str, *, claim=None, exit_pricing=None) -> None:
         """What the loops after the barrier made of the pending entry.
 
         `claim` is how the assisted vend bounds a loop driver that does not
@@ -797,7 +802,9 @@ class LaneController:
                 geometry_assumed=geometry,
             )
             self._transit(TransitState.UNCONFIRMABLE, at)
-            self._record_session(identity, at, confirmation=UNCONFIRMABLE)
+            self._record_session(
+                identity, at, confirmation=UNCONFIRMABLE, exit_pricing=exit_pricing
+            )
             return
 
         window = self._confirmation_window()
@@ -828,7 +835,7 @@ class LaneController:
                 names.confirmed, lane, reason=REASON_FORWARD, at=at, geometry_assumed=geometry
             )
             self._transit(TransitState.CONFIRMED, at)
-            self._record_session(identity, at, confirmation=CONFIRMED)
+            self._record_session(identity, at, confirmation=CONFIRMED, exit_pricing=exit_pricing)
             return
 
         if self._refutes(crossing):
@@ -870,7 +877,7 @@ class LaneController:
             # are for. It closes, it bills, and it says `held` with the
             # `exit_held` event above beside it: a flag for a human, not a hole
             # in the ledger.
-            self._record_session(identity, at, confirmation=HELD)
+            self._record_session(identity, at, confirmation=HELD, exit_pricing=exit_pricing)
 
     def transit_timed_out(self, identity, at: str, deadline: float) -> None:
         """The loop driver did not return inside this lane's own deadline.
@@ -1278,8 +1285,11 @@ class LaneController:
             return {}
         return {"descriptor": identity.descriptor}
 
-    def _record_session(self, identity, at: str, *, confirmation: str) -> None:
-        """Put the session action on the queue, saying what confirmed it."""
+    def _record_session(
+        self, identity, at: str, *, confirmation: str, exit_pricing=None
+    ) -> None:
+        """Put the session action on the queue, saying what confirmed it -- and,
+        at an exit, what the barrier decided (`local_decision`)."""
         lane = self.config.lane_id
         if self.config.direction == "entry":
             self.events.record(
@@ -1306,11 +1316,22 @@ class LaneController:
             found = self.session_lookup(identity.plate)
             if found:
                 session_id = found.get("session", {}).get("id")
+        # THE DECISION THE BARRIER MOVED ON rides the close, and no other
+        # channel: the platform's close CONSUMES it (0017) -- writes its fee,
+        # runs no engine -- so what the screen showed and what the row says are
+        # one computation. It is the whole of `exit_pricing.to_detail()`, the
+        # same words the `decision` event carries: the status, what it was
+        # computed from (the cache's `synced_at`), and for a priced stay the
+        # fee, the plan version and the instants it priced between -- what the
+        # platform's reconciler re-derives the number from. A close with no
+        # decision (an exit that read no plate) carries none, and the platform
+        # prices it as it always has.
         self.events.record(
             SESSION_CLOSE,
             lane,
             **self._identity_detail(identity, with_region=False),
             **self._session_descriptor(identity),
+            **({"local_decision": exit_pricing.to_detail()} if exit_pricing is not None else {}),
             at=at,
             session_id=session_id,
             exit_confirmation=confirmation,

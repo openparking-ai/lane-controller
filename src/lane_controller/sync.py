@@ -390,6 +390,9 @@ class PlatformTransport(EventTransport):
             session_id=event.detail.get("session_id"),
             exit_confirmation=declared,
             descriptor=descriptor,
+            # The barrier's decision, as recorded at the exit. The platform
+            # consumes it or says why not; either way the row answers.
+            local_decision=event.detail.get("local_decision"),
         )
         require_confirmation_echo(result, declared, end="exit", action="close")
         require_descriptor_echo(result, descriptor, end="exit", action="close")
