@@ -313,9 +313,10 @@ DEFAULT_RULES_REFRESH_S = 300.0
 #: A PER-SITE SETTING AND AN ASSUMPTION, and this number is worth reading
 #: twice: A CAR THAT ENTERED INSIDE ONE OF THESE INTERVALS CANNOT BE PRICED AT
 #: THE BARRIER, because its entry time has not reached the exit lane's cache.
-#: It leaves the way it always has -- the barrier opens, the platform prices
-#: the stay afterwards, nothing is collected at the reader -- and the record
-#: says so. This interval IS the size of that class in ordinary operation, so
+#: It leaves the way it always has -- the barrier opens, the platform settles
+#: the stay at the close (covered if a module it asks there covers it, priced
+#: through the engine if none does), nothing is collected at the reader -- and
+#: the record says so. This interval IS the size of that class in ordinary operation, so
 #: it is short, and a site that measures its own entry-to-exit minimum sets it
 #: from that. Nothing here has measured one. It cannot be longer than
 #: `rules_refresh_seconds`: the slow cadence carries the full set, and a delta

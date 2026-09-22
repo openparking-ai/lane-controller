@@ -43,8 +43,10 @@ rules_refresh_seconds = 300
 # closed at the garage since the last read. READ THIS ONE TWICE: a car that
 # entered inside one of these intervals CANNOT BE PRICED AT THE BARRIER,
 # because its entry time has not reached the exit lane's cache yet. It leaves
-# the way it always has -- the barrier opens, the platform prices the stay
-# afterwards, nothing is collected at the reader -- and the record says so.
+# the way it always has -- the barrier opens, the platform settles the stay at
+# the close (covered if a module it asks there covers it, priced through the
+# engine if none does), nothing is collected at the reader -- and the record
+# says so.
 # This number IS the size of that class in ordinary operation. A site that has
 # measured its own shortest entry-to-exit sets it from that; nothing here has.
 # It cannot exceed rules_refresh_seconds.

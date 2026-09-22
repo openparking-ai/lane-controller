@@ -171,7 +171,8 @@ def main(argv=None) -> int:
         else:
             print(
                 f"    at the box   {local.status.upper()}: settled by the platform at the close"
-                " — covered if a module it asks there covers it, else priced by the engine"
+                " — covered if a module it asks there covers it; else the engine is asked,"
+                " and the stay is priced or, if the engine refuses, closed unpriced"
             )
     print(f"    gate         {'VENDED' if exit_decision.should_vend else 'not opened'}")
 
