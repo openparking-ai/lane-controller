@@ -66,6 +66,11 @@ log = logging.getLogger(__name__)
 #: turn's loop observations are frequent; not a site setting, because nothing
 #: about a site changes what one turn of the loop is for.
 LANE_POLL_S = 1.0
+#: How often the drain thread retries an outbox that did not empty -- a
+#: platform that was unreachable comes back without anybody arriving. Against
+#: a platform that black-holes, each attempt costs the client's timeout on the
+#: drain thread; this is the pause between them, not the cost of one.
+DRAIN_RETRY_S = 1.0
 
 
 @dataclass
@@ -93,6 +98,9 @@ class RunnerState:
     #: Times the cache passed its retention bound without a refresh and was
     #: wiped -- a lane that has not reached the platform for `max_age`.
     cache_expiries: int = 0
+    #: Turns of the outbox drain thread, and how many raised.
+    drain_turns: int = 0
+    drain_turn_errors: int = 0
 
 
 class LaneRunner:
@@ -135,6 +143,15 @@ class LaneRunner:
         self._threads: list[threading.Thread] = []
         self._next_rules = 0.0
         self._next_stays = 0.0
+        # THE OUTBOX DRAINS ON ITS OWN THREAD. The controller signals here
+        # whenever it records something that should leave the box; the drain
+        # thread flushes on the signal, and again every `drain_retry_s`
+        # while anything is still queued (a platform that was unreachable
+        # comes back without anybody arriving). The lane thread never waits
+        # on the network -- not before the vend, which the exit decision
+        # already guaranteed, and now not after it either.
+        self._drain_signal = threading.Event()
+        self.drain_retry_s = DRAIN_RETRY_S
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -147,14 +164,22 @@ class LaneRunner:
         if self.client is not None:
             refresh = threading.Thread(target=self._refresh_loop, name="refresh", daemon=True)
             self._threads.append(refresh)
+        if self.controller.events.transport is not None:
+            # A lane with no platform has nothing to drain to, and says so by
+            # its wiring (`EventQueue.transport`), not by a flag.
+            self.controller.set_drain(self.signal_drain)
+            drain = threading.Thread(target=self._drain_loop, name="outbox-drain", daemon=True)
+            self._threads.append(drain)
         for thread in self._threads:
             thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        self._drain_signal.set()
         for thread in self._threads:
             thread.join(timeout)
         self._threads = []
+        self.controller.set_drain(None)
 
     @property
     def running(self) -> bool:
@@ -174,6 +199,31 @@ class LaneRunner:
         except Exception:  # noqa: BLE001 -- the guard IS the point; see the module docstring
             self.state.lane_turn_errors += 1
             log.exception("a turn of the lane loop raised; the loop goes round again")
+
+    # -- the drain thread ---------------------------------------------------------
+
+    def signal_drain(self) -> None:
+        """What the controller's `deliver()` becomes under this runner: a
+        signal, returned from at once. Installed by `start()`."""
+        self._drain_signal.set()
+
+    def _drain_loop(self) -> None:
+        while not self._stop.is_set():
+            self._drain_signal.wait(self.drain_retry_s)
+            self._drain_signal.clear()
+            if self._stop.is_set():
+                break
+            self.drain_turn()
+
+    def drain_turn(self) -> None:
+        """One flush of the outbox, guarded like a lane turn: a transport that
+        raises costs one drain, not the drain thread."""
+        self.state.drain_turns += 1
+        try:
+            self.controller.events.flush()
+        except Exception:  # noqa: BLE001 -- the guard IS the point; see the module docstring
+            self.state.drain_turn_errors += 1
+            log.exception("a turn of the outbox drain raised; the drain goes round again")
 
     # -- the refresh thread -------------------------------------------------------
 

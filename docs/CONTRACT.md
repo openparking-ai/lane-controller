@@ -927,9 +927,10 @@ There is no flag that turns any of that off.
   one is a NEW attempt subject to every refusal — which at a barrier the car has
   already left is `no_vehicle`.
 - **No durability across a kill in the middle of a vend.** The completion path
-  ends by flushing the outbox, exactly as an ordinary arrival does, so a
-  completed vend reaches the platform without waiting for the next car — and the
-  window that is left is stated rather than implied. **A kill between the
+  ends by handing the outbox to the drain, exactly as an ordinary arrival does
+  (inline on a bare controller; a signal to the drain thread under the runner),
+  so a completed vend reaches the platform without waiting for the next car —
+  and the window that is left is stated rather than implied. **A kill between the
   identity being written and the relay being pulsed loses the record and the
   barrier did not move**, which is consistent. **A kill between the relay being
   pulsed and the flush loses the record and the barrier DID move**, and nothing

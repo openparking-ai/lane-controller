@@ -6,6 +6,7 @@ that drains when it can and holds when it cannot.
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from collections import deque
@@ -73,6 +74,15 @@ class EventQueue:
         self._log: deque[LaneEvent] = deque(maxlen=max_events)
         self._sessions: deque[LaneEvent] = deque()
         self._transport = transport
+        # TWO THREADS MEET HERE. The lane thread records; the outbox drains on
+        # a thread of its own (`LaneRunner`), or on the assisted vend's settle
+        # worker. `_state` guards the deques for the microseconds an append
+        # or a removal takes -- never across the send, which is the one thing
+        # here that waits on a network. `_flushing` serialises drains: two at
+        # once would deliver one batch twice (harmless, every endpoint is
+        # idempotent) and, worse, race each other's removal.
+        self._state = threading.Lock()
+        self._flushing = threading.Lock()
         self.dropped = 0
         # The READ side of the contract, and it is NOT the outbox. `flush()`
         # clears the outbox because those items have been delivered; a consumer
@@ -101,24 +111,27 @@ class EventQueue:
     @property
     def _queue(self) -> list[LaneEvent]:
         """Everything pending, in the order it happened."""
-        return sorted([*self._sessions, *self._log], key=lambda e: e.at)
+        with self._state:
+            return sorted([*self._sessions, *self._log], key=lambda e: e.at)
 
     def record(self, kind: str, lane_id: str, **detail: Any) -> LaneEvent:
         event = LaneEvent(kind=kind, lane_id=lane_id, at=time.time(), detail=detail)
-        if kind in SESSION_KINDS:
-            # Outbox only. Not the read window -- see `_history`.
-            self._sessions.append(event)
+        with self._state:
+            if kind in SESSION_KINDS:
+                # Outbox only. Not the read window -- see `_history`.
+                self._sessions.append(event)
+                return event
+            self._cursor += 1
+            self._history.append((self._cursor, event))
+            if self._log.maxlen is not None and len(self._log) == self._log.maxlen:
+                self.dropped += 1
+            self._log.append(event)
             return event
-        self._cursor += 1
-        self._history.append((self._cursor, event))
-        if self._log.maxlen is not None and len(self._log) == self._log.maxlen:
-            self.dropped += 1
-        self._log.append(event)
-        return event
 
     @property
     def pending_sessions(self) -> int:
-        return len(self._sessions)
+        with self._state:
+            return len(self._sessions)
 
     def flush(self) -> int:
         """Try to deliver everything queued. Returns how many were delivered.
@@ -127,19 +140,33 @@ class EventQueue:
         bookkeeping to avoid re-sending; re-sending is free here because every
         platform endpoint the transport calls is idempotent, so the simple
         thing is also the correct thing.
+
+        WHAT IS REMOVED IS THE BATCH, NOT THE QUEUE. The send waits on a
+        network, and the lane thread goes on recording while it does: a
+        `clear()` afterwards would throw away every event recorded during the
+        send -- a car served while the platform was slow, gone from the
+        record. Only the events that were delivered leave the deques.
         """
-        batch = self._queue
-        if self._transport is None or not batch:
-            return 0
-        if not self._transport.send(batch):
-            return 0  # keep everything; try again next time
-        self._log.clear()
-        self._sessions.clear()
-        return len(batch)
+        with self._flushing:
+            batch = self._queue
+            if self._transport is None or not batch:
+                return 0
+            if not self._transport.send(batch):
+                return 0  # keep everything; try again next time
+            delivered = {id(event) for event in batch}
+            with self._state:
+                for kept, queue in (
+                    ([e for e in self._sessions if id(e) not in delivered], self._sessions),
+                    ([e for e in self._log if id(e) not in delivered], self._log),
+                ):
+                    queue.clear()
+                    queue.extend(kept)
+            return len(batch)
 
     @property
     def pending(self) -> int:
-        return len(self._log) + len(self._sessions)
+        with self._state:
+            return len(self._log) + len(self._sessions)
 
     # --- the read side of the contract ------------------------------------
 
