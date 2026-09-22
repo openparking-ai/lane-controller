@@ -78,16 +78,29 @@ class Rule:
 class DecisionCache:
     """Local allow and pricing rules, refreshed from the server when it can be.
 
-    Stubbed in deliberately: the storage is a dict today and will become
-    something durable on the Jetson (SQLite on the controller is the intended
-    shape). The behaviour that matters is already fixed and already tested --
-    what the cache does when it is empty, and what it does when it is stale.
+    The storage is a dict, and with a `store` it is ALSO a file: every
+    refresh that changes the cache is written whole to `durable.DurableStore`
+    and read back at construction, so a lane that restarts with the platform
+    unreachable decides from what it last held rather than from nothing. The
+    dicts stay the source for every decision; the disk is a copy written on
+    the refresh thread and read once. Without a store -- a test, the demo, a
+    standalone lane that chose none -- the behaviour is exactly what it was:
+    replaced on every refresh, gone on restart.
+
+    THE BOUND ON WHAT IS HELD, at rest and in memory, is `max_age_seconds`:
+    the age past which the lane stops trusting the cache is the age past
+    which it stops holding it. `expire_if_past_bound` wipes both, and a store
+    older than the bound is not restored. `durable.py` says why that is one
+    number and not two.
     """
 
-    def __init__(self, *, max_age_seconds: float = 86_400.0) -> None:
+    def __init__(self, *, max_age_seconds: float = 86_400.0, store=None) -> None:
         self._rules: dict[str, Rule] = {}
         self._refreshed_at: float | None = None
         self._max_age = max_age_seconds
+        #: `durable.DurableStore`, or None. Anything with `read() -> dict|None`,
+        #: `write(dict)` and `wipe()`.
+        self._store = store
         # What to do with a confidently-read plate that has no rule. None means
         # fall back -- the safe default, and the one that applies until the
         # platform has said otherwise. A transient garage syncs "allow"; a
@@ -116,6 +129,8 @@ class DecisionCache:
         self.stays: dict[str, dict] = {}
         self.stays_cursor: str | None = None
         self.stays_refreshed_at: float | None = None
+        if self._store is not None:
+            self._restore()
 
     def load(
         self,
@@ -127,6 +142,93 @@ class DecisionCache:
         self._rules = {r.plate.upper(): r for r in rules}
         self.default_action = default_action
         self._refreshed_at = time.time() if now is None else now
+        self._persist()
+
+    # -- the disk -----------------------------------------------------------------
+
+    def state(self) -> dict:
+        """The whole cache as one JSON-able value: what the store holds."""
+        return {
+            "rules": [
+                {"plate": r.plate, "allow": r.allow, "rate_plan": r.rate_plan}
+                for r in self._rules.values()
+            ],
+            "default_action": self.default_action,
+            "refreshed_at": self._refreshed_at,
+            "plans": self.plans,
+            "space_class": self.space_class,
+            "entitlements": self.entitlements,
+            "entitlements_complete": self.entitlements_complete,
+            "stays": self.stays,
+            "stays_cursor": self.stays_cursor,
+            "stays_refreshed_at": self.stays_refreshed_at,
+        }
+
+    def _persist(self) -> None:
+        if self._store is not None:
+            self._store.write(self.state())
+
+    def _restore(self, *, now: float | None = None) -> bool:
+        """What the store holds, into memory -- unless it is past the bound,
+        in which case it is wiped rather than loaded. True if restored."""
+        state = self._store.read()
+        if not state or state.get("refreshed_at") is None:
+            return False
+        current = time.time() if now is None else now
+        if (current - float(state["refreshed_at"])) > self._max_age:
+            # Personal data past its bound is not held, and not even read
+            # back into memory on the way to being discarded.
+            self._store.wipe()
+            return False
+        self._rules = {
+            r["plate"].upper(): Rule(
+                plate=r["plate"], allow=bool(r["allow"]), rate_plan=r.get("rate_plan")
+            )
+            for r in state.get("rules") or []
+        }
+        self.default_action = state.get("default_action")
+        self._refreshed_at = float(state["refreshed_at"])
+        self.plans = list(state.get("plans") or [])
+        self.space_class = state.get("space_class")
+        self.entitlements = dict(state.get("entitlements") or {})
+        self.entitlements_complete = state.get("entitlements_complete")
+        self.stays = dict(state.get("stays") or {})
+        self.stays_cursor = state.get("stays_cursor")
+        self.stays_refreshed_at = state.get("stays_refreshed_at")
+        return True
+
+    def clear(self) -> None:
+        """Hold nothing: memory and disk. The empty cache is the one this
+        object started as -- stale, no rules, falling back on every plate."""
+        self._rules = {}
+        self._refreshed_at = None
+        self.default_action = None
+        self.plans = []
+        self.space_class = None
+        self.entitlements = {}
+        self.entitlements_complete = None
+        self.stays = {}
+        self.stays_cursor = None
+        self.stays_refreshed_at = None
+        if self._store is not None:
+            self._store.wipe()
+
+    def expire_if_past_bound(self, *, now: float | None = None) -> bool:
+        """THE RETENTION BOUND. A cache older than `max_age_seconds` -- the age
+        at which `is_stale` already stops the lane trusting it -- is wiped from
+        memory and from disk. Called on every refresh tick and at start; a
+        cache that is refreshed never reaches it. True if something was wiped.
+
+        Wiping changes no decision: past the bound every plate already falls
+        back `stale_rules`, so what goes is only the personal data the box was
+        holding for no one."""
+        if self._refreshed_at is None:
+            return False
+        current = time.time() if now is None else now
+        if (current - self._refreshed_at) <= self._max_age:
+            return False
+        self.clear()
+        return True
 
     def load_payload(self, payload: dict, *, now: float | None = None) -> None:
         """Everything `GET /lane/rules` carries, in one replacement.
@@ -153,6 +255,7 @@ class DecisionCache:
         stays = payload.get("stays") or {}
         if "cursor" in stays:
             self.replace_stays(stays.get("open") or [], stays["cursor"], now=now)
+        self._persist()
 
     def replace_stays(
         self, open_stays: list[dict], cursor: str, *, now: float | None = None
@@ -161,6 +264,7 @@ class DecisionCache:
         self.stays = {s["session_id"]: s for s in open_stays}
         self.stays_cursor = str(cursor)
         self.stays_refreshed_at = time.time() if now is None else now
+        self._persist()
 
     def apply_stay_changes(
         self, changes: list[dict], cursor: str, *, now: float | None = None
@@ -178,6 +282,7 @@ class DecisionCache:
                 self.stays.pop(stay["session_id"], None)
         self.stays_cursor = str(cursor)
         self.stays_refreshed_at = time.time() if now is None else now
+        self._persist()
 
     def is_stale(self, *, now: float | None = None) -> bool:
         if self._refreshed_at is None:

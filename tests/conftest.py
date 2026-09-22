@@ -1530,3 +1530,69 @@ def _break_the_refresh(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_REFRESH mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the durable-cache fail-control.
+#
+# scripts/durable_fail_control.py sets BREAK_DURABLE and requires
+# tests/test_durable_cache.py to FAIL. A cache nobody has seen fail to survive
+# a restart is not known to survive one.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_store(monkeypatch):
+    mode = os.environ.get("BREAK_DURABLE")
+    if not mode:
+        return
+
+    from lane_controller import decision as decision_module
+    from lane_controller import durable as durable_module
+
+    if mode == "not_persisted":
+        # Writes go nowhere: a restart finds an empty store.
+        monkeypatch.setattr(decision_module.DecisionCache, "_persist", lambda self: None)
+
+    elif mode == "restart_resets_age":
+        # A restored cache reads as refreshed NOW: two days old looks fresh.
+        original = decision_module.DecisionCache._restore
+
+        def young(self, *, now=None):
+            restored = original(self, now=now)
+            if restored:
+                import time as _time
+
+                self._refreshed_at = _time.time()
+            return restored
+
+        monkeypatch.setattr(decision_module.DecisionCache, "_restore", young)
+
+    elif mode == "bound_not_enforced":
+        # Personal data past its bound is held for ever.
+        monkeypatch.setattr(
+            decision_module.DecisionCache, "expire_if_past_bound", lambda self, *, now=None: False
+        )
+
+    elif mode == "world_readable":
+        # The file is left at the umask: anyone on the box reads the plates.
+        monkeypatch.setattr(durable_module, "CACHE_FILE_MODE", 0o644)
+
+    elif mode == "any_directory":
+        # Any directory will do: a forged row opens the barrier.
+        monkeypatch.setattr(
+            durable_module, "cache_directory_fault", lambda mode, owner, process, *, leaf=True: None
+        )
+
+    elif mode == "half_persisted":
+        # Only the rules are written; the stays and the registers do not survive.
+        original_state = decision_module.DecisionCache.state
+
+        def rules_only(self):
+            state = original_state(self)
+            return {**state, "stays": {}, "entitlements": {}, "plans": []}
+
+        monkeypatch.setattr(decision_module.DecisionCache, "state", rules_only)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_DURABLE mode: {mode}")

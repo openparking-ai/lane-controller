@@ -57,6 +57,26 @@ stays_refresh_seconds = 5
 # the same box, and the lane has to work with the internet down.
 # vehicle_id_url = "http://127.0.0.1:8088"
 
+# Where the decision cache lives ON DISK, so a lane that restarts while the
+# platform is unreachable decides from what it last held -- a power cut, a
+# watchdog, an update, with a car at the barrier. Unset, the cache is memory
+# only and a restart comes back holding nothing.
+#
+# THE FILE HOLDS PERSONAL DATA: every pass holder's and monthly vehicle's
+# identity at this garage, and every open stay's plate or ticket. Its bound is
+# rules_max_age_seconds above, and it is ONE number on purpose: the age past
+# which the lane stops trusting the cache is the age past which it stops
+# holding it -- wiped from memory and disk, on start and on every refresh
+# tick -- and the file is replaced whole on every refresh, so a plate that
+# left the register is gone from the box at the next read. The platform's
+# retention purge does not reach this file; this rule is what does.
+#
+# AN ABSOLUTE PATH, in a directory this process owns and nobody else can
+# write: a row in this file is `plate -> allow`, and a line somebody wrote by
+# hand opens the barrier for that plate. A path that fails that test refuses
+# to start, before the port opens. The file is 0600, the directory 0700.
+# cache_path = "/var/lib/lane-controller/decision-cache.sqlite"
+
 # How many UNDELIVERED events the outbox may hold before the health surface
 # reports `outbox_depth_growing` as `active`. A lane that cannot reach the
 # platform keeps working and keeps queueing; this is the depth at which that

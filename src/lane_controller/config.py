@@ -382,6 +382,13 @@ class LaneConfig:
     # is an ordinary client of Vehicle ID at that address, and the address is
     # loopback in any real installation (`vehicle_id_client`).
     vehicle_id_url: str | None = None
+    # Where the decision cache lives on disk, so a lane that restarts with the
+    # platform unreachable decides from what it last held. None: memory only,
+    # gone on restart -- the standalone product and every test. Set: an
+    # ABSOLUTE path in a directory this process owns and nobody else can write
+    # (`durable.py` says why that is refused, not warned). What the file holds
+    # is personal data, bounded by `rules_max_age_seconds`.
+    cache_path: str | None = None
     # How many undelivered events the outbox may hold before the health surface
     # reports `outbox_depth_growing` as `active`. A per-site setting: see
     # DEFAULT_OUTBOX_DEPTH_THRESHOLD above for what it is and is not.
@@ -469,6 +476,7 @@ class LaneConfig:
                 lane.get("stays_refresh_seconds", DEFAULT_STAYS_REFRESH_S)
             ),
             vehicle_id_url=lane.get("vehicle_id_url"),
+            cache_path=lane.get("cache_path"),
             outbox_depth_threshold=int(
                 lane.get("outbox_depth_threshold", DEFAULT_OUTBOX_DEPTH_THRESHOLD)
             ),
