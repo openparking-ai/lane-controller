@@ -26,10 +26,12 @@ THREE ANSWERS, AND THE THIRD IS PRODUCT-VISIBLE (brief 4.5, 4.6):
                      it: it entered inside one refresh interval, or during an
                      outage, or at a lane whose events have not propagated.
                      IT CANNOT BE PRICED AT THE BARRIER. The barrier opens as
-                     it always has, the platform prices the stay at the close,
-                     and nothing is collected at the reader -- on the record,
-                     never silent. The stays interval in `config.py` is the
-                     size of this class in ordinary operation.
+                     it always has, the platform settles the stay at the
+                     close -- covered if a module it asks there covers it,
+                     priced through the engine if none does -- and nothing is
+                     collected at the reader -- on the record, never silent.
+                     The stays interval in `config.py` is the size of this
+                     class in ordinary operation.
 
 ...and two refusals of the engine's own, kept verbatim: `engine_refused`
 (422: the plans cannot price this stay -- the close's unpriced backstop, 0013,
@@ -45,24 +47,31 @@ day for six hours out of every twenty-four.
 THIS DECIDES WHAT THE BARRIER SHOWS AND WHETHER IT ASKS FOR MONEY, AND SINCE
 PLATFORM 0017 IT DECIDES THE RECORD TOO. The answer travels on the close as
 `local_decision`, and a close the platform can CONSUME -- `covered`, or
-`priced` for this stay, in this stay's currency and space class, on a plan
-version the garage holds -- is written as the fee with NEITHER MODULE'S DOOR
-ASKED AND NO ENGINE CALL.
+`priced` for this stay, in this stay's currency, in the GARAGE'S space class
+(the stay has none of its own until it is closed), on a plan version the
+garage holds -- is written as the lane decided it, covered or at the lane's
+fee, with NEITHER MODULE'S DOOR ASKED AND NO ENGINE CALL.
 
-THE DOORS AND THE ENGINE ARE FOR THE PATHS THAT ARE NOT CONSUMED, and they
-are every other one: a close carrying no decision at all; a `priced` decision
-that names another session, another currency, another space class or a plan
-version the garage does not hold; and the four this file can answer when it
-cannot price -- `no_cached_entry`, `stale_facts`, `engine_refused`,
-`engine_invalid`. Each of those consults both linked modules through their own
-doors (0015) and prices through the engine (0013), and the decision it did not
-take is kept on the row with the reason.
+THE DOORS ARE FOR THE PATHS THAT ARE NOT CONSUMED, and they are every other
+one: a close carrying no decision at all; a `priced` decision that names
+another session, another currency, another space class or a plan version the
+garage does not hold; and the four this file can answer when it cannot price
+-- `no_cached_entry`, `stale_facts`, `engine_refused`, `engine_invalid`. Each
+of those asks every module the garage LINKS, each through its own door (0015):
+two doors when both are linked, one when one is, none when neither is. THE
+ENGINE IS ASKED ONLY WHEN NO MODULE COVERS THE STAY. A module that covers it
+closes it `covered`, with no engine call, whatever the lane decided; a stay no
+module covers is priced through the engine (0013), and one the engine refuses
+closes unpriced with the refusal on the row. A decision the close carried and
+did not take is kept on the row with the reason.
 
-WHAT LOOKS AT A CONSUMED DECISION AFTERWARDS IS 0018's RECONCILER, out of
-band, correcting nothing: a `priced` row is re-derived through the engine FROM
-THE INPUTS THE LANE ITSELF STORED, and a `covered` row is recorded `covered`
-and listed -- never re-consulted against the modules. Nothing anywhere
-compares a covered close with what the modules would have said.
+WHAT LOOKS AT A CONSUMED DECISION AFTERWARDS IS THE RECONCILER, out of band,
+correcting nothing. A `priced` row is re-derived through the engine FROM THE
+INPUTS THE LANE ITSELF STORED -- by the reconciliation route (0017) for the
+period an operator asks about, and by the sweep (0018) unprompted. A `covered`
+row is listed by the route (0017) and recorded `covered` by the sweep (0018),
+and neither re-consults the modules. Nothing anywhere compares a covered close
+with what the modules would have said.
 """
 
 from __future__ import annotations

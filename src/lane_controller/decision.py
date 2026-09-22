@@ -91,14 +91,14 @@ def normalise_identity(text: str) -> str:
     the widest reading both admit, so a holder is not sent to pay over a
     hyphen. AND NOTHING CATCHES IT WHEN IT IS TOO WIDE. A `covered` decision
     is consumed by the platform's close without either door being asked
-    (0017), and 0018's reconciler records that row `covered` and lists it
-    without re-consulting the modules -- so a car this folding let out covered
-    that the modules would not have covered is a fee that was never charged,
-    and nothing in the record contradicts it. What the record does carry is
-    the CLAIM: `decided_by = 'lane'`, the pass or agreement the lane says it
-    matched, and an `exit_covered` event whose actor is `lane:decision`. A
-    reader can take those to the modules; nothing on either side does it for
-    them.
+    (0017); the reconciliation route (0017) lists that row and the sweep
+    (0018) records it `covered`, and neither re-consults the modules -- so a
+    car this folding let out covered that the modules would not have covered
+    is a fee that was never charged, and nothing in the record contradicts
+    it. What the record does carry is the CLAIM: `decided_by = 'lane'`, the
+    pass or agreement the lane says it matched, and an `exit_covered` event
+    whose actor is `lane:decision`. A reader can take those to the modules;
+    nothing on either side does it for them.
     """
     return "".join(ch for ch in text.upper() if ch.isalnum())
 
