@@ -516,7 +516,7 @@ class AssistedVend:
                 # not exist until here, and without this it sat in the outbox
                 # until some later ordinary arrival -- which at a lane using the
                 # intercom may never come.
-                controller.events.flush()
+                controller.deliver()
         finally:
             with self._state:
                 self._in_progress = False

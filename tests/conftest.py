@@ -1785,3 +1785,61 @@ def _break_the_close_decision(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_CLOSE_DECISION mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# scripts/drain_fail_control.py sets BREAK_OUTBOX_DRAIN and requires
+# tests/test_outbox_drain.py to FAIL. A drain that has never been seen to hold
+# the lane thread is not known to leave it alone.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_outbox_drain(monkeypatch):
+    mode = os.environ.get("BREAK_OUTBOX_DRAIN")
+    if not mode:
+        return
+
+    from lane_controller import runner as runner_module
+    from lane_controller.events import EventQueue
+
+    if mode == "drain_on_the_lane_thread":
+        # The runner installs no drain: `deliver()` is the flush, on whatever
+        # thread recorded -- the lane thread, after the vend. Measured after
+        # PR #28; this is that lane put back.
+        monkeypatch.setattr(LaneController, "set_drain", lambda self, drain: None)
+
+    elif mode == "signal_never_flushes":
+        # The signal is taken and nothing is sent.
+        monkeypatch.setattr(runner_module.LaneRunner, "drain_turn", lambda self: None)
+
+    elif mode == "no_retry":
+        # The drain waits for a signal and only a signal: an outbox the
+        # platform refused sits until the next car arrives.
+        original = runner_module.LaneRunner.start
+
+        def without_retry(self):
+            self.drain_retry_s = None
+            return original(self)
+
+        monkeypatch.setattr(runner_module.LaneRunner, "start", without_retry)
+
+    elif mode == "clear_after_send":
+        # The old flush: the deques are CLEARED after the send returns, so
+        # every event recorded during the send is thrown away with the batch.
+        def clearing(self):
+            with self._flushing:
+                batch = self._queue
+                if self._transport is None or not batch:
+                    return 0
+                if not self._transport.send(batch):
+                    return 0
+                with self._state:
+                    self._log.clear()
+                    self._sessions.clear()
+                return len(batch)
+
+        monkeypatch.setattr(EventQueue, "flush", clearing)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_OUTBOX_DRAIN mode: {mode}")

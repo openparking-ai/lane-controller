@@ -99,6 +99,13 @@ jobs:
         # requires the close-decision suite to fail each time.
         run: python scripts/close_decision_fail_control.py
 
+      - name: Outbox-drain fail-control
+        # Breaks the outbox drain -- the flush put back on the lane thread
+        # after the vend, a signal that sends nothing, no retry of a refused
+        # outbox, the deques cleared after the send -- and requires the
+        # outbox-drain suite to fail each time.
+        run: python scripts/drain_fail_control.py
+
       - name: Confirmation fail-control
         # Breaks the entry confirmation on purpose -- the window, the crossing
         # direction, the promotion of an unconfirmed entry, and the

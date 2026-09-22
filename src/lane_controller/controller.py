@@ -222,6 +222,12 @@ class LaneController:
         #: `GET /v1/lane/state` publishes as `decision.completed`, and it is
         #: cleared by the next arrival because a new decision is a new case.
         self.last_decision_completed_at: str | None = None
+        # WHO DRAINS THE OUTBOX. None means "this thread, now" -- the bare
+        # controller of the tests and the demo, where `run_once` returns with
+        # the record delivered. `LaneRunner` installs a drain of its own so
+        # that no thread the barrier runs on ever waits on the network; see
+        # `deliver()`.
+        self._drain: Callable[[], None] | None = None
         self.last_read_ref: str | None = None
         self.last_cause: str | None = None
         self.transit_state: str = TransitState.NONE.value
@@ -568,7 +574,7 @@ class LaneController:
 
         # Best effort, and after the barrier has already been told what to do.
         # Nothing above this line waits on the network.
-        self.events.flush()
+        self.deliver()
         return decision
 
     # ------------------------------------------------------------------
@@ -636,7 +642,7 @@ class LaneController:
         # for the same reason as `handle_arrival`: nothing above this line waits
         # on the network. WHAT A KILL AT EACH POINT LEAVES is asserted in
         # `tests/test_vend.py` and stated in `docs/CONTRACT.md`.
-        self.events.flush()
+        self.deliver()
         return at
 
     # ------------------------------------------------------------------
@@ -917,7 +923,7 @@ class LaneController:
             settle_deadline_s=deadline,
         )
         self._transit(TransitState.UNCONFIRMABLE, at)
-        self.events.flush()
+        self.deliver()
 
     @property
     def loop_driver_timed_out(self) -> bool:
@@ -1145,7 +1151,7 @@ class LaneController:
         ordinary arrival may be hours away, and at a lane where the barrier is
         up that arrival never vends. Same reason as `complete_vend`.
         """
-        self.events.flush()
+        self.deliver()
 
     def observe_arming_loop(self) -> float | None:
         """Sample the arming loop, and return how long it has read occupied.
@@ -1211,7 +1217,7 @@ class LaneController:
             reason=REASON_VEHICLE_TOO_CLOSE,
             geometry_assumed=geometry,
         )
-        self.events.flush()
+        self.deliver()
 
     def _release_arming(self, ended_by: str, geometry: dict) -> None:
         """Close the held interval, saying which of its two ends this was.
@@ -1232,7 +1238,7 @@ class LaneController:
             held_for_s=round(held_for, 3),
             geometry_assumed=geometry,
         )
-        self.events.flush()
+        self.deliver()
 
     def _identity_detail(self, identity, *, with_region: bool) -> dict:
         """The identity fields a SESSION ACTION carries, and only those.
@@ -1284,6 +1290,35 @@ class LaneController:
         if identity.descriptor is None:
             return {}
         return {"descriptor": identity.descriptor}
+
+    def set_drain(self, drain: Callable[[], None] | None) -> None:
+        """Install who drains the outbox -- `LaneRunner` hands its own thread's
+        signal here. None restores draining inline."""
+        self._drain = drain
+
+    def deliver(self) -> None:
+        """The record leaves the box -- through whoever drains the outbox.
+
+        Every path that records and used to call `events.flush()` calls this
+        instead, and the difference is WHICH THREAD WAITS. A flush is a
+        network call with the client's timeout behind it (5 s by default)
+        for every queued session action; against a platform that refuses it
+        costs a third of a millisecond, against one that black-holes -- the
+        ordinary shape of a site outage -- it costs the whole timeout, per
+        action, and it used to cost it ON THE LANE THREAD, after the vend:
+        not the car being served, the car behind it, when the queue is
+        longest. Under `LaneRunner` the drain is a thread of its own and this
+        is a signal. With no drain installed it is the flush itself, so a
+        bare controller still returns from `run_once` with the record
+        delivered -- the offline suite's shape.
+
+        Resolved at call time, not captured: the fail-controls that remove a
+        flush do so by patching `EventQueue.flush` on the class.
+        """
+        if self._drain is None:
+            self.events.flush()
+        else:
+            self._drain()
 
     def _record_session(
         self, identity, at: str, *, confirmation: str, exit_pricing=None
@@ -1414,7 +1449,7 @@ class LaneController:
                 reason=REASON_ARMING_INCOMPLETE,
                 geometry_assumed=geometry,
             )
-            self.events.flush()
+            self.deliver()
             return None
 
         self.events.record(ARMED, lane, geometry_assumed=geometry)

@@ -557,8 +557,33 @@ def hang_the_driver(controller):
     return released
 
 
-def leaked_workers() -> int:
-    return sum(1 for t in threading.enumerate() if t.name == "assisted-vend-resolve")
+def resolve_workers() -> set[threading.Thread]:
+    """Every `assisted-vend-resolve` thread alive right now, BY IDENTITY.
+
+    The instrument used to be a COUNT of threads by name, compared against a
+    count taken at the start of the test. A count is a population figure, and
+    the population is not this test's: workers abandoned by EARLIER tests are
+    still alive when this one starts (each test releases its hung driver only
+    at its end, and the thread takes a moment to die), so one of them dying
+    between the baseline and the assertion moves the baseline under the test
+    -- `1 == 1 + 1`, twice on push CI (after PR #28 and after PR #29), green
+    on every rerun. The instrument was the defect, not the code it guards.
+
+    So: a SET of the threads themselves. `leaked_since(before)` is exactly the
+    workers this test started that are still alive, whatever any other test's
+    workers do in the meantime.
+    """
+    return {t for t in threading.enumerate() if t.name == "assisted-vend-resolve"}
+
+
+def leaked_since(before: set[threading.Thread]) -> set[threading.Thread]:
+    return {t for t in resolve_workers() - before if t.is_alive()}
+
+
+def wait_until_none_leaked_since(before: set[threading.Thread], seconds: float = 2.0) -> None:
+    deadline = time.monotonic() + seconds
+    while leaked_since(before) and time.monotonic() < deadline:
+        time.sleep(0.005)
 
 
 def test_after_one_hung_driver_the_next_vends_still_settle_and_bill():
@@ -570,13 +595,13 @@ def test_after_one_hung_driver_the_next_vends_still_settle_and_bill():
     of them still answered 202. `main` bills them. This lane must too."""
     controller = a_lane_that_completes()
     service = LaneService(controller)
-    leaked_before = leaked_workers()
+    before = resolve_workers()
     released = hang_the_driver(controller)
 
     complete(service, controller, "KEY-001")
     assert controller.transit_state == TransitState.UNCONFIRMABLE.value
     assert service.assisted._in_progress is False
-    assert leaked_workers() == leaked_before + 1, "the hung worker is the one leaked thread"
+    assert len(leaked_since(before)) == 1, "the hung worker is the one leaked thread"
 
     # The driver recovers: a NEW call answers at once. The hung one is still
     # hung. Two more cars, two more completions.
@@ -590,7 +615,7 @@ def test_after_one_hung_driver_the_next_vends_still_settle_and_bill():
         )
         assert controller.events.pending_sessions == n - 1, f"vend {n} billed nobody"
 
-    assert leaked_workers() == leaked_before + 1, "a later vend leaked a thread of its own"
+    assert len(leaked_since(before)) == 1, "a later vend leaked a thread of its own"
     released.set()
 
 
@@ -820,6 +845,39 @@ def test_the_vend_route_never_waits_on_a_hung_settle_driver_either():
     released.set()
 
 
+def test_the_leak_instrument_is_immune_to_another_tests_worker_dying_mid_measurement():
+    """THE FLAKE, PLANTED, AND THE REPAIR MEASURED AGAINST IT. A worker with the
+    real name, left over from "an earlier test", is alive at the baseline and
+    dies between the completion and the assertion -- exactly the interleaving
+    push CI produced twice. The old instrument (a count by name) reads
+    `1 == 1 + 1` on it; the set-by-identity instrument reads one leaked worker,
+    which is the truth. Both readings are taken here so the repair is not a
+    claim: the old one is required to be WRONG on this run."""
+    stray_release = threading.Event()
+    stray = threading.Thread(
+        target=stray_release.wait, kwargs={"timeout": 10},
+        name="assisted-vend-resolve", daemon=True,
+    )
+    stray.start()
+    controller = a_lane_that_completes()
+    service = LaneService(controller)
+    old_count_before = len(resolve_workers())
+    before = resolve_workers()
+    released = hang_the_driver(controller)
+    try:
+        complete(service, controller, "KEY-001")
+        stray_release.set()  # the earlier test's worker dies now, mid-measurement
+        stray.join(timeout=5)
+        assert not stray.is_alive()
+        old_count_after = len(resolve_workers())
+        assert old_count_after != old_count_before + 1, (
+            "the planted race did not move the baseline; the control measured nothing"
+        )
+        assert len(leaked_since(before)) == 1, "the repaired instrument mis-read the leak"
+    finally:
+        released.set()
+
+
 def test_a_hung_poll_driver_costs_the_held_case_its_confirmation_and_nothing_on_the_route():
     """What `docs/CONTRACT.md` says a hung idle read costs, measured: the
     case the lane was holding is answered 202, its settle waits behind the
@@ -831,14 +889,14 @@ def test_a_hung_poll_driver_costs_the_held_case_its_confirmation_and_nothing_on_
     loops.answer = ClosingSequence.FORWARD  # and when it comes back, it comes back with a car
     controller = a_lane_that_completes(loops_impl=loops)
     service = LaneService(controller)
-    leaked_before = leaked_workers()
+    before = resolve_workers()
     idle = a_hung_poll(controller)
     try:
         complete(service, controller, "KEY-001")  # 202, and the settle joined at its deadline
         assert controller.transit_state == TransitState.UNCONFIRMABLE.value
         assert controller.loop_driver_timed_out
         assert service.assisted._in_progress is False, "the route is not free after the deadline"
-        assert leaked_workers() == leaked_before + 1, (
+        assert len(leaked_since(before)) == 1, (
             "the settle behind the hung read is the one leaked worker"
         )
         assert idle.is_alive(), "the loop thread is still inside the driver; that is the cost"
@@ -846,9 +904,7 @@ def test_a_hung_poll_driver_costs_the_held_case_its_confirmation_and_nothing_on_
     finally:
         loops.release.set()
     idle.join(timeout=5)
-    deadline = time.monotonic() + 2
-    while leaked_workers() > leaked_before and time.monotonic() < deadline:
-        time.sleep(0.005)
+    wait_until_none_leaked_since(before)
     # The driver came back with FORWARD. A vend began during that read, so
     # the crossing is that vend's and not a new `entry_unadmitted` -- the car
     # the lane admitted and then gave up on may be exactly what crossed. The
@@ -959,7 +1015,7 @@ def test_a_timed_out_vends_handed_crossing_is_not_the_next_cars():
     loops.answer = ClosingSequence.FORWARD
     controller = a_lane_that_completes(loops_impl=loops)
     service = LaneService(controller)
-    leaked_before = leaked_workers()
+    before = resolve_workers()
     # V1's worker is parked on its way to the board -- inside the window
     # read `resolve_transit` makes just before `_read_closing_loops` -- so the
     # race the gate measured (19 to 38 of 200) is decided the same way every
@@ -995,10 +1051,8 @@ def test_a_timed_out_vends_handed_crossing_is_not_the_next_cars():
     assert controller._handed == (ClosingSequence.FORWARD, at_v1), "car 2's read took V1's slot"
 
     parked.set()  # V1's abandoned worker reaches the board now
-    deadline = time.monotonic() + 2
-    while leaked_workers() > leaked_before and time.monotonic() < deadline:
-        time.sleep(0.005)
-    assert leaked_workers() == leaked_before, "V1's abandoned worker never took its slot"
+    wait_until_none_leaked_since(before)
+    assert not leaked_since(before), "V1's abandoned worker never took its slot"
     assert controller._handed is None, "V1's handed crossing was not consumed"
     assert controller.transit_since != at_v1  # car 2's transit, not V1's, is what is published
     recorded = kinds(controller)
