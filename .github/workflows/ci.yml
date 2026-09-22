@@ -91,6 +91,14 @@ jobs:
         # exit-decision suite to fail each time.
         run: python scripts/exit_decision_fail_control.py
 
+      - name: Close-decision fail-control
+        # Breaks the decision on the close -- the close carrying nothing, the
+        # settle recording the last decision instead of the one it was
+        # handed, the transport dropping it, the fee edited in transit, the
+        # client leaving it off the wire, null where nothing belongs -- and
+        # requires the close-decision suite to fail each time.
+        run: python scripts/close_decision_fail_control.py
+
       - name: Confirmation fail-control
         # Breaks the entry confirmation on purpose -- the window, the crossing
         # direction, the promotion of an unconfirmed entry, and the
