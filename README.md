@@ -85,12 +85,13 @@ engine in-process — `rate_engine.contract.run_quote`, the one function behind
 the platform's `/v1/quote`, so the lane's number and the platform's are one
 computation; and a transient whose entry the cache does not hold yet — it
 entered inside one stays interval, or during an outage — is said to be
-**`no_cached_entry`**: the barrier opens as it always has, the platform prices
-the stay at the close, nothing is collected at the reader, and the record says
-so (`exit_pricing.py`, on the `decision` event). Nothing on that path opens a
-socket to the platform: `tests/test_exit_decision.py` runs the real Vehicle ID
-service on loopback, counts every connection the turn makes up to the vend, and
-times it — a Mac number, a floor for a Jetson. **And the close carries that
+**`no_cached_entry`**: the barrier opens as it always has, the platform settles
+the stay at the close — covered if a module it asks there covers it, priced
+through the engine if none does — nothing is collected at the reader, and the
+record says so (`exit_pricing.py`, on the `decision` event). Nothing on that
+path opens a socket to the platform: `tests/test_exit_decision.py` runs the
+real Vehicle ID service on loopback, counts every connection the turn makes up
+to the vend, and times it — a Mac number, a floor for a Jetson. **And the close carries that
 decision** (`local_decision` on the session close, the whole of the `decision`
 event's `exit_pricing`, unedited, handed down from the car's own decision and
 never read back from "the last one"): a platform at migration 0017 or later
