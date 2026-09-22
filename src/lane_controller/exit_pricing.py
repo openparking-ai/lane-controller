@@ -42,12 +42,27 @@ compares the days with its own"), and the lane's day is the garage's local
 day from the timezone the payload names -- never UTC's, which is a different
 day for six hours out of every twenty-four.
 
-THIS DECIDES WHAT THE BARRIER SHOWS AND WHETHER IT ASKS FOR MONEY. IT DOES
-NOT DECIDE THE RECORD. The close still consults both modules through their
-own doors and prices through the engine on the platform (0015, 0013); the
-lane's answer travels beside it on the `decision` event, and a divergence
-between the two is what 4.9b's reconciler will report. Neither is this
-round's.
+THIS DECIDES WHAT THE BARRIER SHOWS AND WHETHER IT ASKS FOR MONEY, AND SINCE
+PLATFORM 0017 IT DECIDES THE RECORD TOO. The answer travels on the close as
+`local_decision`, and a close the platform can CONSUME -- `covered`, or
+`priced` for this stay, in this stay's currency and space class, on a plan
+version the garage holds -- is written as the fee with NEITHER MODULE'S DOOR
+ASKED AND NO ENGINE CALL.
+
+THE DOORS AND THE ENGINE ARE FOR THE PATHS THAT ARE NOT CONSUMED, and they
+are every other one: a close carrying no decision at all; a `priced` decision
+that names another session, another currency, another space class or a plan
+version the garage does not hold; and the four this file can answer when it
+cannot price -- `no_cached_entry`, `stale_facts`, `engine_refused`,
+`engine_invalid`. Each of those consults both linked modules through their own
+doors (0015) and prices through the engine (0013), and the decision it did not
+take is kept on the row with the reason.
+
+WHAT LOOKS AT A CONSUMED DECISION AFTERWARDS IS 0018's RECONCILER, out of
+band, correcting nothing: a `priced` row is re-derived through the engine FROM
+THE INPUTS THE LANE ITSELF STORED, and a `covered` row is recorded `covered`
+and listed -- never re-consulted against the modules. Nothing anywhere
+compares a covered close with what the modules would have said.
 """
 
 from __future__ import annotations
