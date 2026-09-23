@@ -185,11 +185,23 @@ def main(argv=None) -> int:
         # close is settled there: covered if a module covers it, otherwise
         # priced by the engine from the plan in force at entry (0013). A
         # priced row says which plan and how -- not an hourly rate.
+        #
+        # THE OUTCOME DECIDES WHAT IS PRINTED, NOT THE FEE. A covered close has
+        # no fee and no refusal, and it is not unpriced: it is covered, by the
+        # module(s) the row names. A null fee on any other close prints the
+        # refusal the row stores, or says the row stores none -- never a cause
+        # the row does not carry.
         print("\n  [platform]   session CLOSED")
-        print(f"    outcome      {closed.get('exit_outcome') or '—'}")
-        if closed.get("fee_minor") is None:
-            refusal = closed.get("pricing_refusal") or "no plan covered it"
-            print(f"    stay         {args.stay_hours:g} h  →  UNPRICED: {refusal}")
+        outcome = closed.get("exit_outcome")
+        print(f"    outcome      {outcome or '—'}")
+        if outcome == "covered":
+            covered_by = (closed.get("entitlement") or {}).get("covered_by") or []
+            who = f"by {', '.join(covered_by)}" if covered_by else "(the row names no module)"
+            print(f"    stay         {args.stay_hours:g} h  →  COVERED {who}: no fee")
+        elif closed.get("fee_minor") is None:
+            refusal = closed.get("pricing_refusal")
+            reason = refusal if refusal else "the row carries no reason"
+            print(f"    stay         {args.stay_hours:g} h  →  UNPRICED: {reason}")
         else:
             # The breakdown is the engine's ledger: a list of lines whose
             # running total is the fee, stored on the row as it came.
