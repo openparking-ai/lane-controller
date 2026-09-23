@@ -115,6 +115,14 @@ jobs:
         # reader-fee suite to fail each time.
         run: python scripts/reader_fail_control.py
 
+      - name: Validation-prompt fail-control
+        # The phone prompt and the validation claimed when the phone is
+        # entered: one amount shown and it is the discounted one, the fee read
+        # from the platform, Skip asking nothing, the words naming both uses,
+        # and the number in no log line and no URL. Each property is broken in
+        # turn and the suite must go red.
+        run: python scripts/validation_prompt_fail_control.py
+
       - name: Confirmation fail-control
         # Breaks the entry confirmation on purpose -- the window, the crossing
         # direction, the promotion of an unconfirmed entry, and the

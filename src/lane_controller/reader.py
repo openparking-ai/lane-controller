@@ -147,10 +147,164 @@ class StripeCartScreen:
             self._post(f"{base}/set_reader_display", cart_form(cart))
 
 
+# -- the phone prompt, and the validation claimed when the phone is entered -----------------
+#
+# GOKHAN'S SETTLED DESIGN, 2026-09-23 (brief §4, amendment A1). ONE SCREEN: the
+# fee, and an optional phone number, together -- no second screen, no back
+# button. The words name BOTH uses, because a driver who skips a screen that
+# only offered a receipt has thrown away a validation. Skip goes straight on.
+#
+# THE CLAIM IS MADE WHEN THE PHONE IS ENTERED, before anything is shown as the
+# amount to pay: the lane hands the number and the decision on screen to the
+# platform (`PlatformClient.claim_validation`), which claims a live validation
+# for this stay ON THAT FEE and holds it; what comes back -- the line, and the
+# fee after it -- is what the driver is shown next. ONE NUMBER, NO CORRECTION
+# AFTER: the amount the driver is shown is already the discounted one, and the
+# close records the claim the platform holds. The lane computes nothing: the
+# line and the fee are the platform's, appended and read as they came.
+#
+# THE PHONE IS NEVER KEPT HERE. It goes from the prompt to the claim call and
+# nowhere else: not onto the record, not onto an event, not into the outbox,
+# not into a log line -- a failure is logged without it.
+#
+# WHAT IS NOT HERE: the reader's own input action. Collecting a typed number is
+# a reader action like the cart, and whoever holds the key that can drive a
+# reader holds the key that can charge on it; so `PhonePrompt` is handed in,
+# as `post` is to the cart, and this package supplies no transport.
+
+#: The words, as settled. Not "receipt?": the validation is named too.
+PROMPT_TEXT = "Enter your phone number for a text receipt, or to use a restaurant validation."
+SKIP_TEXT = "Skip"
+
+#: Minor units per major, for the TITLE ONLY -- display, never arithmetic. A
+#: currency not listed here is shown by its code and minor units, not guessed.
+_EXPONENT = {"USD": 2, "EUR": 2, "GBP": 2, "CAD": 2, "AUD": 2, "JPY": 0}
+
+
+def _shown(fee_minor: int, currency: str) -> str:
+    exponent = _EXPONENT.get(currency.upper())
+    if exponent is None:
+        return f"{fee_minor} {currency.upper()} minor units"
+    if exponent == 0:
+        return f"{fee_minor} {currency.upper()}"
+    whole, part = divmod(fee_minor, 10**exponent)
+    return f"{whole}.{part:0{exponent}d} {currency.upper()}"
+
+
+def prompt_for(record: dict | None) -> dict | None:
+    """The one screen for this record -- the fee and the optional phone -- or
+    `None` when there is nothing to pay here, or no stay to claim a validation
+    for: exactly the records `cart_for` shows no cart for, and a priced record
+    that names no session."""
+    if cart_for(record) is None or not record.get("session_id"):
+        return None
+    return {
+        "title": f"Parking fee {_shown(record['fee_minor'], record['currency'])}",
+        "text": PROMPT_TEXT,
+        "skip": SKIP_TEXT,
+        "fee_minor": record["fee_minor"],
+        "currency": record["currency"],
+    }
+
+
+class PhonePrompt(Protocol):
+    """The reader's input screen: shows `prompt` and returns the number the
+    driver entered, or `None` when they pressed Skip (or did not answer)."""
+
+    def ask(self, prompt: dict) -> str | None: ...
+
+
+def with_validation(record: dict, answer: dict | None) -> dict | None:
+    """The record as the driver is shown it once a validation is HELD for the
+    stay: the platform's line appended to the ledger AS IT CAME and the fee the
+    PLATFORM'S fee after it, read. `None` when the answer is anything else, or
+    was made on a fee other than this record's -- a number this screen did not
+    show is not put up in its place."""
+    if not isinstance(answer, dict) or answer.get("outcome") != "held":
+        return None
+    line, fee = answer.get("line"), answer.get("fee_minor")
+    if answer.get("fee_before_minor") != record.get("fee_minor"):
+        return None
+    if answer.get("currency") != record.get("currency"):
+        return None
+    if not isinstance(line, dict) or isinstance(fee, bool) or not isinstance(fee, int) or fee < 0:
+        return None
+    return {
+        **record,
+        "fee_minor": fee,
+        "breakdown": [*record["breakdown"], line],
+        "validation": {
+            "held": True,
+            "fee_before_minor": record["fee_minor"],
+            "discount_minor": answer.get("discount_minor"),
+        },
+    }
+
+
+class ValidatingScreen:
+    """The reader at an exit with the phone prompt in front of what it shows.
+
+    For a record with a fee to pay: the prompt (`prompt_for`), then -- when a
+    number was entered -- the claim (`claim(record, phone)`, the platform's
+    answer), then the record the driver pays from handed to `inner`: the
+    discounted one when a validation is held, the record as priced otherwise
+    (skipped, nothing live, the platform unreachable). Any other record goes to
+    `inner` untouched, as it did before this existed.
+    """
+
+    def __init__(
+        self,
+        inner: ReaderScreen,
+        prompt: PhonePrompt,
+        claim: Callable[[dict, str], dict | None],
+    ) -> None:
+        self._inner = inner
+        self._prompt = prompt
+        self._claim = claim
+
+    def present_exit(self, record: dict | None) -> None:
+        prompt = prompt_for(record)
+        if prompt is None:
+            self._inner.present_exit(record)
+            return
+        shown = record
+        phone = self._prompt.ask(prompt)
+        if phone:
+            try:
+                answer = self._claim(record, phone)
+            except Exception as err:  # noqa: BLE001 -- the fee as priced is still shown
+                # Named by its class, never with the number: the phone does not
+                # reach a log line even on the failure path.
+                log.warning(
+                    "the validation could not be claimed (%s); the fee is shown as priced",
+                    type(err).__name__,
+                )
+                answer = None
+            shown = with_validation(record, answer) or record
+        self._inner.present_exit(shown)
+
+
+def claim_through(client) -> Callable[[dict, str], dict | None]:
+    """The claim `ValidatingScreen` takes, through a `PlatformClient`: the
+    record's own session and the record itself, as the reader showed it."""
+
+    def claim(record: dict, phone: str) -> dict | None:
+        return client.claim_validation(record["session_id"], phone, record)
+
+    return claim
+
+
 __all__ = [
     "PRICED",
+    "PROMPT_TEXT",
+    "SKIP_TEXT",
+    "PhonePrompt",
     "ReaderScreen",
     "StripeCartScreen",
+    "ValidatingScreen",
     "cart_for",
     "cart_form",
+    "claim_through",
+    "prompt_for",
+    "with_validation",
 ]

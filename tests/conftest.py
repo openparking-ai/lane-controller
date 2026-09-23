@@ -1965,3 +1965,108 @@ def _break_the_reader_fee(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_READER_FEE mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# scripts/validation_prompt_fail_control.py sets BREAK_VALIDATION_PROMPT and
+# requires tests/test_reader_validation.py to FAIL. A prompt that has never
+# been seen to show the undiscounted amount first, or to log a number, is not
+# known not to.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_validation_prompt(monkeypatch):
+    mode = os.environ.get("BREAK_VALIDATION_PROMPT")
+    if not mode:
+        return
+
+    from lane_controller import reader as reader_module
+    from lane_controller.platform_client import PlatformClient
+
+    original_with = reader_module.with_validation
+
+    if mode == "shown_before_the_claim":
+        # The fee as priced goes up first and the discount corrects it after:
+        # two numbers, the second after the first.
+        def present(self, record):
+            self._inner.present_exit(record)
+            prompt = reader_module.prompt_for(record)
+            if prompt is None:
+                return
+            phone = self._prompt.ask(prompt)
+            if phone:
+                shown = reader_module.with_validation(record, self._claim(record, phone))
+                if shown is not None:
+                    self._inner.present_exit(shown)
+
+        monkeypatch.setattr(reader_module.ValidatingScreen, "present_exit", present)
+
+    elif mode == "fee_worked_out_by_the_lane":
+        # The discounted fee added up here from the line, not read.
+        def worked_out(record, answer):
+            shown = original_with(record, answer)
+            if shown is not None:
+                shown = {**shown, "fee_minor": record["fee_minor"] + answer["line"]["delta_minor"]}
+            return shown
+
+        monkeypatch.setattr(reader_module, "with_validation", worked_out)
+
+    elif mode == "skip_still_claims":
+        original_present = reader_module.ValidatingScreen.present_exit
+
+        def present(self, record):
+            if reader_module.prompt_for(record) is not None and not self._prompt.typed:
+                self._claim(record, "")
+            original_present(self, record)
+
+        monkeypatch.setattr(reader_module.ValidatingScreen, "present_exit", present)
+
+    elif mode == "failure_logged_with_its_message":
+        # The failure logged with the exception's own words -- which can carry
+        # what was sent.
+        def present(self, record):
+            prompt = reader_module.prompt_for(record)
+            shown = record
+            if prompt is not None:
+                phone = self._prompt.ask(prompt)
+                if phone:
+                    try:
+                        answer = self._claim(record, phone)
+                        shown = reader_module.with_validation(record, answer) or record
+                    except Exception as err:  # noqa: BLE001
+                        reader_module.log.warning("the validation could not be claimed: %s", err)
+            self._inner.present_exit(shown)
+
+        monkeypatch.setattr(reader_module.ValidatingScreen, "present_exit", present)
+
+    elif mode == "another_fees_answer_shown":
+        def any_fee(record, answer):
+            if not isinstance(answer, dict) or answer.get("outcome") != "held":
+                return None
+            return {**record, "fee_minor": answer["fee_minor"],
+                    "breakdown": [*record["breakdown"], answer["line"]]}
+
+        monkeypatch.setattr(reader_module, "with_validation", any_fee)
+
+    elif mode == "no_prompt":
+        monkeypatch.setattr(reader_module, "prompt_for", lambda record: None)
+
+    elif mode == "receipt_only_wording":
+        monkeypatch.setattr(reader_module, "PROMPT_TEXT", "Text receipt?")
+
+    elif mode == "number_in_the_url":
+        from urllib.parse import quote
+
+        def in_url(self, session_id, phone, local_decision):
+            answer = self._request(
+                "POST",
+                f"/api/v1/lane/sessions/{session_id}/validation?phone={quote(phone)}",
+                {"phone": phone, "local_decision": local_decision},
+            )
+            return answer.get("validation") if isinstance(answer, dict) else None
+
+        monkeypatch.setattr(PlatformClient, "claim_validation", in_url)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_VALIDATION_PROMPT mode: {mode}")

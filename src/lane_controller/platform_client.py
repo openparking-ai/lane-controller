@@ -223,6 +223,24 @@ class PlatformClient:
         return self._request("POST", "/api/v1/lane/sessions/close", body)
 
 
+    def claim_validation(self, session_id: str, phone: str, local_decision: dict) -> dict | None:
+        """The phone the driver entered, claimed for this stay on the fee the
+        reader is showing (platform 0019, amendment A1). Returns the platform's
+        `validation` answer: `held` with the line and the fee after it, or
+        `not_validated` / `refused` / `not_linked`. The number goes in this
+        request body and nowhere else; nothing here keeps or logs it.
+
+        Raises as every call does: `PlatformUnreachable` (the reader shows the
+        fee as priced), `PlatformRejected` (a stay that has closed, a decision
+        the platform would not write)."""
+        answer = self._request(
+            "POST",
+            f"/api/v1/lane/sessions/{urllib.parse.quote(session_id, safe='')}/validation",
+            {"phone": phone, "local_decision": local_decision},
+        )
+        return answer.get("validation") if isinstance(answer, dict) else None
+
+
 def _refusal_code(body: str) -> str | None:
     """The platform's own name for a refusal, out of its error body.
 
