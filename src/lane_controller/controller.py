@@ -57,6 +57,7 @@ from .interfaces import (
     VehicleIdentifier,
     VendOutput,
 )
+from .reader import ReaderScreen
 from .sync import (
     ARMED,
     ARMING_INCOMPLETE,
@@ -151,6 +152,7 @@ class LaneController:
         events: EventQueue | None = None,
         clock: Callable[[], float] = time.time,
         session_lookup: Callable[[str], dict | None] | None = None,
+        reader: ReaderScreen | None = None,
     ) -> None:
         self.config = config
         self.loop = loop
@@ -228,6 +230,14 @@ class LaneController:
         # that no thread the barrier runs on ever waits on the network; see
         # `deliver()`.
         self._drain: Callable[[], None] | None = None
+        # THE CARD READER'S SCREEN at an exit, or None where there is no
+        # reader. It is handed the exit decision's own record and nothing
+        # else (`reader.py`), and -- like the outbox -- WHICH THREAD waits on
+        # it is the runner's to say: None here means "this thread, now", and
+        # `LaneRunner` installs a hand-off to a thread of its own, so the
+        # barrier never waits on a reader. See `show_reader()`.
+        self.reader = reader
+        self._reader_hand: Callable[[dict | None], None] | None = None
         self.last_read_ref: str | None = None
         self.last_cause: str | None = None
         self.transit_state: str = TransitState.NONE.value
@@ -511,6 +521,17 @@ class LaneController:
         self.last_decision_completed_at = None
         self.last_read_ref = identity.read_ref
         self.last_cause = identity.unavailable.value if identity.unavailable else None
+
+        if self.config.direction == "exit" and decision.outcome is not Outcome.NO_VEHICLE:
+            # THE FEE ON THE READER, BEFORE THE BARRIER MOVES -- handed over,
+            # not waited on. The record is the exit decision's own, the same
+            # words the `decision` event above carries and the close will
+            # carry as `local_decision`; a car this lane made no money
+            # decision about hands `None`, which takes down whatever the
+            # reader was showing for the car before it.
+            self.show_reader(
+                decision.exit_pricing.to_detail() if decision.exit_pricing is not None else None
+            )
 
         if decision.should_vend:
             self.vend.vend(decision.reason)
@@ -1371,6 +1392,35 @@ class LaneController:
             session_id=session_id,
             exit_confirmation=confirmation,
         )
+        # The car this fee belonged to has gone through: the reader shows
+        # nothing until the next exit decision, so the next driver never
+        # reads this one's fee.
+        self.show_reader(None)
+
+    def set_reader_hand(self, hand: Callable[[dict | None], None] | None) -> None:
+        """Install who presents to the reader -- `LaneRunner` hands its own
+        thread's slot here. None restores presenting inline."""
+        self._reader_hand = hand
+
+    def show_reader(self, record: dict | None) -> None:
+        """The exit decision's record -- or `None`, nothing to show -- to the reader.
+
+        Under `LaneRunner` this is a hand-off to the reader's own thread,
+        returned from at once: a reader is a device on the network, and the
+        barrier does not wait on one. With no hand installed -- the bare
+        controller of the tests and the demo -- the reader is called here, and
+        a reader that raises costs its own screen and nothing else: the vend
+        and the record go on without it.
+        """
+        if self.reader is None:
+            return
+        if self._reader_hand is not None:
+            self._reader_hand(record)
+            return
+        try:
+            self.reader.present_exit(record)
+        except Exception:  # noqa: BLE001 -- a screen may not stop a barrier
+            log.exception("the reader could not be shown the exit decision; the lane goes on")
 
     def run_once(self, timeout: float | None = None) -> Decision | None:
         """Wait for one vehicle and serve it. None if none arrived in time.

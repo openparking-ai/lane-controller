@@ -1843,3 +1843,125 @@ def _break_the_outbox_drain(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_OUTBOX_DRAIN mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# scripts/reader_fail_control.py sets BREAK_READER_FEE and requires
+# tests/test_reader_fee.py to FAIL. A reader that has never been seen to show
+# a recomputed or a stale fee is not known to show the stored one.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_reader_fee(monkeypatch):
+    mode = os.environ.get("BREAK_READER_FEE")
+    if not mode:
+        return
+
+    from lane_controller import reader as reader_module
+    from lane_controller import runner as runner_module
+
+    original_cart_for = reader_module.cart_for
+    original_show = LaneController.show_reader
+
+    if mode == "total_resummed":
+        # The total added up from the lines instead of read from the record:
+        # agrees with the engine every day it writes a fee that is its sum.
+        def resummed(record):
+            cart = original_cart_for(record)
+            if cart is not None:
+                cart = {**cart, "total": sum(item["amount"] for item in cart["line_items"])}
+            return cart
+
+        monkeypatch.setattr(reader_module, "cart_for", resummed)
+
+    elif mode == "lines_reworded":
+        # Each line described by its code rather than the engine's own words.
+        def reworded(record):
+            cart = original_cart_for(record)
+            if cart is not None:
+                codes = [line.get("code") or "" for line in record["breakdown"]]
+                cart = {**cart, "line_items": [
+                    {**item, "description": code or item["description"]}
+                    for item, code in zip(cart["line_items"], codes, strict=True)
+                ]}
+            return cart
+
+        monkeypatch.setattr(reader_module, "cart_for", reworded)
+
+    elif mode == "zero_fee_shows_a_cart":
+        # A priced stay of zero is put up as a cart of nothing to pay.
+        def zero_cart(record):
+            if isinstance(record, dict) and record.get("status") == "priced" \
+                    and record.get("fee_minor") == 0:
+                return original_cart_for({**record, "fee_minor": 1}) | {"total": 0}
+            return original_cart_for(record)
+
+        monkeypatch.setattr(reader_module, "cart_for", zero_cart)
+
+    elif mode == "cart_forced_first":
+        # The lane builds the cart and hands THAT over: every reader is a cart
+        # reader, and a screen that asks for an input first cannot be plugged in.
+        def as_cart(self, record):
+            return original_show(self, original_cart_for(record) if record else None)
+
+        monkeypatch.setattr(LaneController, "show_reader", as_cart)
+
+    elif mode == "fee_shown_after_the_vend":
+        # The fee reaches the reader only once the barrier has been told to move.
+        held: list = []
+        original_vend = RecordingVendOutput.vend
+
+        def deferred(self, record):
+            if record is not None:
+                held.append((self, record))
+                return None
+            return original_show(self, record)
+
+        def vend_then_show(self, reason):
+            original_vend(self, reason)
+            while held:
+                controller, record = held.pop(0)
+                original_show(controller, record)
+
+        monkeypatch.setattr(LaneController, "show_reader", deferred)
+        monkeypatch.setattr(RecordingVendOutput, "vend", vend_then_show)
+
+    elif mode == "stale_fee_left_up":
+        # Nothing takes the fee down: the next driver reads the last car's.
+        def never_cleared(self, record):
+            if record is None:
+                return None
+            return original_show(self, record)
+
+        monkeypatch.setattr(LaneController, "show_reader", never_cleared)
+
+    elif mode == "reader_on_the_lane_thread":
+        # The runner installs no hand-off: the reader is called on the lane
+        # thread, before the vend, and the barrier waits on a network device.
+        monkeypatch.setattr(LaneController, "set_reader_hand", lambda self, hand: None)
+
+    elif mode == "clear_erases_an_unshown_fee":
+        # The old slot: whatever was handed last replaces what was waiting,
+        # a clear included -- so a close recorded straight after the vend
+        # takes down a fee the reader never showed.
+        def overwriting(self, record):
+            with self._reader_lock:
+                self._reader_pending = [record]
+            self._reader_signal.set()
+
+        monkeypatch.setattr(runner_module.LaneRunner, "hand_to_reader", overwriting)
+
+    elif mode == "a_raising_reader_stops_the_lane":
+        # No guard: a reader off the network raises through the arrival.
+        def unguarded(self, record):
+            if self.reader is None:
+                return None
+            if self._reader_hand is not None:
+                return self._reader_hand(record)
+            return self.reader.present_exit(record)
+
+        monkeypatch.setattr(LaneController, "show_reader", unguarded)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_READER_FEE mode: {mode}")

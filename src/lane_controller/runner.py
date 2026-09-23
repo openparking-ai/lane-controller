@@ -101,6 +101,9 @@ class RunnerState:
     #: Turns of the outbox drain thread, and how many raised.
     drain_turns: int = 0
     drain_turn_errors: int = 0
+    #: Records presented to the card reader on its own thread, and how many raised.
+    reader_turns: int = 0
+    reader_turn_errors: int = 0
 
 
 class LaneRunner:
@@ -152,6 +155,18 @@ class LaneRunner:
         # already guaranteed, and now not after it either.
         self._drain_signal = threading.Event()
         self.drain_retry_s = DRAIN_RETRY_S
+        # THE READER'S SCREEN IS SHOWN ON ITS OWN THREAD, for the same reason:
+        # a reader is a device on the network and the lane thread does not
+        # wait on one. THE NEWEST DECISION WINS: a record handed over while an
+        # older one has not been shown yet replaces it, because a reader that
+        # caught up by showing every fee it missed would show a driver someone
+        # else's. BUT A CLEAR NEVER ERASES A FEE NOBODY HAS SEEN: it queues
+        # behind it. Measured: at an exit with no closing loops the close is
+        # recorded straight after the vend, and a clear that replaced the fee
+        # meant the reader never showed it at all.
+        self._reader_signal = threading.Event()
+        self._reader_lock = threading.Lock()
+        self._reader_pending: list[dict | None] = []
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -170,16 +185,22 @@ class LaneRunner:
             self.controller.set_drain(self.signal_drain)
             drain = threading.Thread(target=self._drain_loop, name="outbox-drain", daemon=True)
             self._threads.append(drain)
+        if self.controller.reader is not None:
+            self.controller.set_reader_hand(self.hand_to_reader)
+            reader = threading.Thread(target=self._reader_loop, name="reader-screen", daemon=True)
+            self._threads.append(reader)
         for thread in self._threads:
             thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
         self._drain_signal.set()
+        self._reader_signal.set()
         for thread in self._threads:
             thread.join(timeout)
         self._threads = []
         self.controller.set_drain(None)
+        self.controller.set_reader_hand(None)
 
     @property
     def running(self) -> bool:
@@ -224,6 +245,41 @@ class LaneRunner:
         except Exception:  # noqa: BLE001 -- the guard IS the point; see the module docstring
             self.state.drain_turn_errors += 1
             log.exception("a turn of the outbox drain raised; the drain goes round again")
+
+    # -- the reader thread --------------------------------------------------------
+
+    def hand_to_reader(self, record: dict | None) -> None:
+        """What the controller's `show_reader()` becomes under this runner: the
+        record into what the reader thread shows next, and a signal, returned
+        from at once. Installed by `start()`."""
+        with self._reader_lock:
+            unshown = [one for one in self._reader_pending if one is not None]
+            if record is not None:
+                self._reader_pending = [record]
+            else:
+                self._reader_pending = [*unshown[-1:], None]
+        self._reader_signal.set()
+
+    def _reader_loop(self) -> None:
+        while not self._stop.is_set():
+            self._reader_signal.wait()
+            self._reader_signal.clear()
+            if self._stop.is_set():
+                break
+            with self._reader_lock:
+                pending, self._reader_pending = self._reader_pending, []
+            for record in pending:
+                self.reader_turn(record)
+
+    def reader_turn(self, record: dict | None) -> None:
+        """One record to the reader, guarded like a lane turn: a reader that
+        raises costs one screen, not the reader thread."""
+        self.state.reader_turns += 1
+        try:
+            self.controller.reader.present_exit(record)
+        except Exception:  # noqa: BLE001 -- the guard IS the point; see the module docstring
+            self.state.reader_turn_errors += 1
+            log.exception("the reader could not be shown the exit decision; it waits for the next")
 
     # -- the refresh thread -------------------------------------------------------
 
