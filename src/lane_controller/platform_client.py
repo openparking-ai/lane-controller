@@ -199,6 +199,7 @@ class PlatformClient:
         session_id: str | None = None,
         descriptor: str | None = None,
         local_decision: dict | None = None,
+        reader_shown: dict | None = None,
     ) -> dict:
         body = {
             "event_id": event_id,
@@ -220,6 +221,11 @@ class PlatformClient:
         # what the platform should make of it.
         if local_decision is not None:
             body["local_decision"] = local_decision
+        # What the reader put up for this stay (platform 0019, amendment A2.2),
+        # ONLY when a screen said: a held validation is recorded only when this
+        # is its discounted fee.
+        if reader_shown is not None:
+            body["reader_shown"] = reader_shown
         return self._request("POST", "/api/v1/lane/sessions/close", body)
 
 

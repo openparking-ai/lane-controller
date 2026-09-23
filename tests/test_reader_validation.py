@@ -13,6 +13,11 @@ platform's answer is planted where a test needs one it could not otherwise get,
 and a planted answer whose fee is not the record's fee minus the line is how a
 READ figure is told from a computed one.
 
+Amendment A2.2: the close carries what the reader showed (`reader_shown`),
+sealed as the close is recorded, and nothing discounted goes up after that --
+so the number on the reader and the number the platform records are the same
+in every order.
+
 `scripts/validation_prompt_fail_control.py` breaks each property and requires
 this file to go red.
 """
@@ -258,6 +263,8 @@ def test_through_the_lane_the_close_carries_the_decision_as_priced_and_the_phone
     assert close and close[-1]["local_decision"] == record
     assert close[-1]["local_decision"]["fee_minor"] == 500
     assert "phone" not in close[-1]
+    # ...and what the reader SHOWED: the discounted fee, so the platform records it.
+    assert close[-1]["reader_shown"] == {"fee_minor": 300, "currency": "USD"}
     everything = json.dumps(fake.closed) + json.dumps(
         [event.as_dict() for _, event in controller.events.since(0)]) + caplog.text
     assert not holds_phone(everything)
@@ -271,3 +278,74 @@ def test_the_seam_is_unchanged_for_a_screen_without_the_prompt():
     decision = controller.run_once()
     assert inner.shown[0] == decision.exit_pricing.to_detail()
     assert reader_module.cart_for(inner.shown[0])["total"] == 500
+
+
+# -- A2.2: what the reader showed rides the close ------------------------------------------
+
+
+def test_the_seal_is_what_went_up_discounted_priced_or_nothing():
+    record = priced_record()
+    screen = ValidatingScreen(RecordingReader(), Prompt(PHONE), Claims(held_answer))
+    screen.present_exit(record)
+    assert screen.seal("s-9") == {"fee_minor": 300, "currency": "USD"}
+    skipped = ValidatingScreen(RecordingReader(), Prompt(None), Claims(held_answer))
+    skipped.present_exit(record)
+    assert skipped.seal("s-9") == {"fee_minor": 500, "currency": "USD"}
+    unshown = ValidatingScreen(RecordingReader(), Prompt(PHONE), Claims(held_answer))
+    assert unshown.seal("s-9") is None
+
+
+def test_a_claim_the_lane_gave_up_on_is_sealed_as_the_fee_as_priced():
+    # A slow platform: the lane's call times out, the fee goes up as priced, and
+    # the close says so -- the platform then gives back the hold it made late.
+    record = priced_record()
+    inner = RecordingReader()
+    gave_up = Claims(raises=PlatformUnreachable("timed out"))
+    screen = ValidatingScreen(inner, Prompt(PHONE), gave_up)
+    screen.present_exit(record)
+    assert cart_for(inner.shown[0])["total"] == 500
+    assert screen.seal("s-9") == {"fee_minor": 500, "currency": "USD"}
+
+
+def test_nothing_discounted_goes_up_after_the_close_was_recorded():
+    # The close is recorded while the claim is still in flight (the barrier did
+    # not wait): the seal finds nothing, and the late answer is NOT put up.
+    record = priced_record()
+    inner = RecordingReader()
+    sealed = []
+
+    def late(r):
+        sealed.append(screen.seal("s-9"))
+        return held_answer(r)
+
+    screen = ValidatingScreen(inner, Prompt(PHONE), Claims(late))
+    screen.present_exit(record)
+    assert sealed == [None], "the close said nothing was shown"
+    assert inner.shown == [record], "and nothing discounted went up after it"
+
+
+def test_the_transport_carries_reader_shown_only_when_there_is_one():
+    platform = a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])
+    fake = FakePlatform()
+    fake.reject_close_without_open = False
+    controller, _ = exit_lane(a_cache(platform), "TRNS-9", reader=RecordingReader(),
+                              transport=PlatformTransport(fake))
+    controller.run_once()
+    close = [body for body in fake.closed if body.get("local_decision")]
+    assert close and "reader_shown" not in close[-1], "a screen that keeps nothing sends nothing"
+
+
+def test_the_client_puts_reader_shown_on_the_close_body():
+    sent = []
+
+    def opener(request, timeout):
+        sent.append(json.loads(request.data))
+        return _Response({"session": {"exit_confirmation": "confirmed"}})
+
+    client = PlatformClient("http://platform.invalid", "lane-token", opener=opener)
+    at = "2026-09-23T17:00:00Z"
+    client.close_session(event_id="e1", exit_at=at, exit_confirmation="confirmed",
+                         plate="TRNS-9", reader_shown={"fee_minor": 300, "currency": "USD"})
+    client.close_session(event_id="e2", exit_at=at, exit_confirmation="confirmed", plate="TRNS-9")
+    assert sent[0]["reader_shown"] == {"fee_minor": 300, "currency": "USD"}
+    assert "reader_shown" not in sent[1]

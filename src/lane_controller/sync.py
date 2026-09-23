@@ -191,6 +191,12 @@ def sync_stays(client: PlatformClient, cache: DecisionCache) -> dict | None:
 MAX_STAY_PAGES = 50
 
 
+def _reader_shown(event) -> dict:
+    """`{"reader_shown": ...}` when the close recorded what the reader showed, else {}."""
+    shown = event.detail.get("reader_shown")
+    return {"reader_shown": shown} if shown is not None else {}
+
+
 def require_descriptor_echo(
     result: dict | None, sent: str | None, *, end: str = "entry", action: str = "open"
 ) -> None:
@@ -393,6 +399,9 @@ class PlatformTransport(EventTransport):
             # The barrier's decision, as recorded at the exit. The platform
             # consumes it or says why not; either way the row answers.
             local_decision=event.detail.get("local_decision"),
+            # What the reader showed, when a screen said (A2.2); absent, the
+            # close is the one this lane sent before it existed.
+            **_reader_shown(event),
         )
         require_confirmation_echo(result, declared, end="exit", action="close")
         require_descriptor_echo(result, descriptor, end="exit", action="close")

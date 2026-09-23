@@ -59,6 +59,8 @@ be. Both occur in the engine's ledger. No live call was made to find out.
 from __future__ import annotations
 
 import logging
+import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Protocol
 
@@ -167,6 +169,17 @@ class StripeCartScreen:
 # nowhere else: not onto the record, not onto an event, not into the outbox,
 # not into a log line -- a failure is logged without it.
 #
+# WHAT THE READER SHOWED RIDES THE CLOSE (amendment A2.2). The screen keeps,
+# per stay, the amount it handed to the reader, and the lane SEALS it when it
+# records that stay's close (`seal`): the close carries what was sealed as
+# `reader_shown`, and the platform records a held validation only when that is
+# the discounted fee. Sealing is one step under one lock with putting a figure
+# up, so either the discount went up first and the close says so, or the close
+# was recorded first and the screen puts up the fee as priced -- the number on
+# the reader and the number on the row are the same in every order. A claim
+# the lane gave up on (a slow platform) shows the fee as priced, the close
+# says so, and the platform gives the hold back.
+#
 # WHAT IS NOT HERE: the reader's own input action. Collecting a typed number is
 # a reader action like the cart, and whoever holds the key that can drive a
 # reader holds the key that can charge on it; so `PhonePrompt` is handed in,
@@ -252,6 +265,10 @@ class ValidatingScreen:
     `inner` untouched, as it did before this existed.
     """
 
+    #: How many stays' shown amounts are remembered: far more than one exit
+    #: has in flight, so a close always finds its own.
+    REMEMBERED = 256
+
     def __init__(
         self,
         inner: ReaderScreen,
@@ -261,6 +278,23 @@ class ValidatingScreen:
         self._inner = inner
         self._prompt = prompt
         self._claim = claim
+        self._lock = threading.Lock()
+        #: session id -> {"fee_minor", "currency"} last put up, or None once sealed.
+        self._shown: OrderedDict[str, dict | None] = OrderedDict()
+        self._sealed: OrderedDict[str, None] = OrderedDict()
+
+    def seal(self, session_id: str | None) -> dict | None:
+        """What this screen put up for `session_id`, `{fee_minor, currency}`, or
+        None when it put up nothing for that stay -- and from now on nothing
+        discounted goes up for it. Called by the lane as it records the close."""
+        if not session_id:
+            return None
+        with self._lock:
+            shown = self._shown.pop(session_id, None)
+            self._sealed[session_id] = None
+            while len(self._sealed) > self.REMEMBERED:
+                self._sealed.popitem(last=False)
+            return shown
 
     def present_exit(self, record: dict | None) -> None:
         prompt = prompt_for(record)
@@ -281,6 +315,20 @@ class ValidatingScreen:
                 )
                 answer = None
             shown = with_validation(record, answer) or record
+        with self._lock:
+            session_id = record["session_id"]
+            if session_id in self._sealed:
+                # The close is already recorded and said what it said: nothing
+                # discounted goes up after it.
+                shown = record
+            else:
+                self._shown[session_id] = {
+                    "fee_minor": shown["fee_minor"], "currency": shown["currency"],
+                }
+                while len(self._shown) > self.REMEMBERED:
+                    self._shown.popitem(last=False)
+        # Outside the lock: what was registered is exactly what goes up, and a
+        # reader on the network never holds the lane's close.
         self._inner.present_exit(shown)
 
 

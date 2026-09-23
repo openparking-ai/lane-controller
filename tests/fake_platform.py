@@ -218,6 +218,7 @@ class FakePlatform:
         session_id: str | None = None,
         descriptor: str | None = None,
         local_decision: dict | None = None,
+        reader_shown: dict | None = None,
     ) -> dict:
         self._check()
         identity = self._identity(plate, ticket_ref)
@@ -234,6 +235,7 @@ class FakePlatform:
                 "exit_confirmation": exit_confirmation,
                 "descriptor": descriptor,
                 "local_decision": local_decision,
+                **({"reader_shown": reader_shown} if reader_shown is not None else {}),
             }
         )
         if event_id in self.sessions_by_close_event:

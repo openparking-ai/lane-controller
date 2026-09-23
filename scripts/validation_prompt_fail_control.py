@@ -13,6 +13,9 @@ undiscounted amount first, or to log a number, is not known not to.
   no_prompt                        the reader never asks for a phone.
   receipt_only_wording             the words offer a receipt and not the validation.
   number_in_the_url                the phone travels in the URL.
+  shown_not_carried                the close forgets what the reader showed (A2.2).
+  discount_after_seal              a late answer goes up after the close was recorded (A2.2).
+  seal_reports_the_record          the seal says the fee as priced, whatever went up (A2.2).
 """
 
 from __future__ import annotations
@@ -31,6 +34,9 @@ BREAKAGES = [
     ("no_prompt", "the reader never asks for a phone"),
     ("receipt_only_wording", "the words offer a receipt and not the validation"),
     ("number_in_the_url", "the phone travels in the URL"),
+    ("shown_not_carried", "the close forgets what the reader showed"),
+    ("discount_after_seal", "a late answer goes up after the close was recorded"),
+    ("seal_reports_the_record", "the seal says the fee as priced, whatever went up"),
 ]
 
 

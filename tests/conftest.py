@@ -2068,5 +2068,31 @@ def _break_the_validation_prompt(monkeypatch):
 
         monkeypatch.setattr(PlatformClient, "claim_validation", in_url)
 
+    elif mode == "shown_not_carried":
+        # The close forgets what the reader showed.
+        from lane_controller.controller import LaneController
+
+        monkeypatch.setattr(LaneController, "_reader_shown", lambda self, exit_pricing: {})
+
+    elif mode == "discount_after_seal":
+        # A late answer is put up after the close was recorded.
+        original_seal = reader_module.ValidatingScreen.seal
+
+        def seal_forgetting(self, session_id):
+            shown = original_seal(self, session_id)
+            self._sealed.pop(session_id, None)
+            return shown
+
+        monkeypatch.setattr(reader_module.ValidatingScreen, "seal", seal_forgetting)
+
+    elif mode == "seal_reports_the_record":
+        # The seal says the fee as priced, whatever went up.
+        def seal_record(self, session_id):
+            shown = self._shown.pop(session_id, None)
+            self._sealed[session_id] = None
+            return None if shown is None else {"fee_minor": 500, "currency": shown["currency"]}
+
+        monkeypatch.setattr(reader_module.ValidatingScreen, "seal", seal_record)
+
     else:
         raise RuntimeError(f"unknown BREAK_VALIDATION_PROMPT mode: {mode}")
