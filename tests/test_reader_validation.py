@@ -105,8 +105,6 @@ def test_the_one_screen_is_the_fee_and_an_optional_phone_and_its_words_name_both
     assert prompt["fee_minor"] == 500 and prompt["currency"] == "USD"
     assert prompt["skip"] == "Skip"
     assert prompt["text"] == PROMPT_TEXT
-    # Both uses are named: a screen that only offered a receipt would be skipped
-    # by a driver holding a validation.
     assert "text receipt" in PROMPT_TEXT and "validation" in PROMPT_TEXT
     assert "receipt?" not in PROMPT_TEXT
 
