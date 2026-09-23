@@ -2096,3 +2096,104 @@ def _break_the_validation_prompt(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_VALIDATION_PROMPT mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# scripts/exit_fee_fail_control.py sets BREAK_EXIT_FEE and requires
+# tests/test_exit_fee_published.py to FAIL. A fee published for a second screen
+# that has never been seen to differ from the reader's is not known to match it.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_exit_fee(monkeypatch):
+    mode = os.environ.get("BREAK_EXIT_FEE")
+    if not mode:
+        return
+
+    from lane_controller import reader as reader_module
+    from lane_controller import service as service_module
+
+    original_fee_for = reader_module.exit_fee_for
+    original_show = LaneController.show_reader
+
+    if mode == "fee_resummed":
+        # The published figure added up from the record's lines.
+        def resummed(decision_at, record, shown=None):
+            fee = original_fee_for(decision_at, record, shown)
+            if fee is not None and fee.get("fee_minor") and isinstance(record, dict):
+                fee = {**fee, "fee_minor": sum(line["delta_minor"] for line in record["breakdown"])}
+            return fee
+
+        monkeypatch.setattr(service_module, "exit_fee_for", resummed)
+        monkeypatch.setattr(reader_module, "exit_fee_for", resummed)
+
+    elif mode == "digits_guessed":
+        # Two decimals for every currency.
+        def two(decision_at, record, shown=None):
+            fee = original_fee_for(decision_at, record, shown)
+            if fee is not None and "minor_unit_digits" in fee:
+                fee = {**fee, "minor_unit_digits": 2}
+            return fee
+
+        monkeypatch.setattr(service_module, "exit_fee_for", two)
+
+    elif mode == "discount_not_followed":
+        # The fee as priced, whatever the reader was given after a validation.
+        monkeypatch.setattr(service_module, "exit_fee_for",
+                            lambda decision_at, record, shown=None:
+                            original_fee_for(decision_at, record, None))
+
+    elif mode == "left_up_after_close":
+        # Nothing takes the published fee down once the car has gone.
+        def show_keeping(self, record):
+            kept = self.exit_screen
+            original_show(self, record)
+            if record is None:
+                self.exit_screen = kept
+
+        monkeypatch.setattr(LaneController, "show_reader", show_keeping)
+
+    elif mode == "figure_without_a_cart":
+        # A figure published for a record the reader shows no cart for.
+        def any_figure(decision_at, record, shown=None):
+            fee = original_fee_for(decision_at, record, shown)
+            if fee is not None and fee.get("status") == "priced" and "fee_minor" not in fee:
+                fee = {**fee, "fee_minor": record.get("fee_minor"),
+                       "currency": record.get("currency"), "minor_unit_digits": 2}
+            return fee
+
+        monkeypatch.setattr(reader_module, "exit_fee_for", any_figure)
+        monkeypatch.setattr(service_module, "exit_fee_for", any_figure)
+
+    elif mode == "no_reader_no_fee":
+        # Published only where a reader is fitted.
+        def show_only_with_reader(self, record):
+            original_show(self, record)
+            if self.reader is None:
+                self.exit_screen = None
+
+        monkeypatch.setattr(LaneController, "show_reader", show_only_with_reader)
+
+    elif mode == "stay_on_the_wire":
+        # The stay's session id rides along with the fee.
+        from lane_controller.contract import ExitFee
+
+        original_exit_fee = service_module.LaneService.exit_fee
+
+        def leaky(self):
+            fee = original_exit_fee(self)
+            if fee is None:
+                return None
+            session = self.controller.exit_screen[1].get("session_id")
+
+            class Leaky(ExitFee):
+                def to_dict(inner):
+                    return {**ExitFee.to_dict(inner), "session_id": session}
+
+            return Leaky(**ExitFee.to_dict(fee))
+
+        monkeypatch.setattr(service_module.LaneService, "exit_fee", leaky)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_EXIT_FEE mode: {mode}")

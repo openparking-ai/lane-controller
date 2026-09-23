@@ -64,6 +64,8 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import Protocol
 
+from rate_engine.currency import is_known, minor_unit_digits
+
 log = logging.getLogger(__name__)
 
 #: The record's status for a stay the lane priced (`exit_pricing.PRICED`).
@@ -113,6 +115,38 @@ def cart_for(record: dict | None) -> dict | None:
             return None
         items.append({"amount": amount, "description": text, "quantity": 1})
     return {"currency": currency.lower(), "line_items": items, "total": fee}
+
+
+def exit_fee_for(decision_at: str, record: dict | None, shown: dict | None = None) -> dict | None:
+    """`GET /v1/lane/state`'s `exit_fee` for what the reader was handed, or None.
+
+    `record` is what `show_reader()` last handed over and `shown` is what a
+    validating screen then put up for that stay (`shown_for`), if anything.
+    The figure is READ -- the record's `fee_minor`, or the amount the screen put
+    up after a held validation, in the same currency -- and never added up.
+    A figure is published only where the reader has one to show (`cart_for`),
+    or where it is a priced zero; anything else carries its status alone.
+    """
+    if not isinstance(record, dict):
+        return None
+    status = record.get("status")
+    if not isinstance(status, str) or not status:
+        return None
+    fee = {"decision_at": decision_at, "status": status}
+    if status != PRICED:
+        return fee
+    amount, currency = record.get("fee_minor"), record.get("currency")
+    zero = isinstance(amount, int) and not isinstance(amount, bool) and amount == 0
+    if not zero and cart_for(record) is None:
+        return fee
+    if not is_known(currency):
+        return fee
+    if isinstance(shown, dict) and shown.get("currency") == currency:
+        held = shown.get("fee_minor")
+        if isinstance(held, int) and not isinstance(held, bool) and held >= 0:
+            amount = held
+    return {**fee, "fee_minor": amount, "currency": currency,
+            "minor_unit_digits": minor_unit_digits(currency)}
 
 
 def cart_form(cart: dict) -> dict[str, str]:
@@ -295,6 +329,17 @@ class ValidatingScreen:
             while len(self._sealed) > self.REMEMBERED:
                 self._sealed.popitem(last=False)
             return shown
+
+    def shown_for(self, session_id: str | None) -> dict | None:
+        """What this screen has put up for `session_id`, `{fee_minor, currency}`,
+        or None -- READ ONLY: unlike `seal`, it changes nothing. The lane's read
+        contract asks it, so a display beside this reader draws the amount the
+        reader was given and not the fee as priced when a validation is held."""
+        if not session_id:
+            return None
+        with self._lock:
+            shown = self._shown.get(session_id)
+            return dict(shown) if shown is not None else None
 
     def present_exit(self, record: dict | None) -> None:
         prompt = prompt_for(record)

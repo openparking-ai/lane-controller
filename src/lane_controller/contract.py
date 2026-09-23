@@ -474,23 +474,98 @@ class LastDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class ExitFee:
+    """What this exit lane is putting in front of the driver about money, NOW.
+
+    It is what the lane handed its card reader for the car at the barrier --
+    and when a validation is held, the fee the reader was given after it -- so
+    a second screen that draws from this draws the reader's number and cannot
+    come to show a different one. `null` on `GET /v1/lane/state` whenever the
+    reader has been told to show nothing: at an entry, before the first exit
+    decision, and from the moment the car's close is recorded.
+
+    **A FIGURE IS PUBLISHED ONLY WHERE THE READER HAS ONE.** `fee_minor` and
+    `currency` are present on a `priced` stay whose record makes a cart, and
+    on a priced stay of zero (which the reader shows nothing for, and a second
+    screen can say is nothing to pay). A priced record the reader shows no cart
+    for carries its status and no figure, so no screen puts up a number the
+    reader does not.
+
+    **`minor_unit_digits` is the rate engine's**, the engine that priced the
+    stay: how many minor units make a major one in `currency`. It is published
+    so a screen writes the figure with the decimal point where the engine's
+    ISO table puts it rather than keeping a list of its own. The engine refuses
+    to price in a currency whose digits it does not hold, so a published figure
+    always carries them.
+
+    Nothing that names the car or the stay is here: no plate, no session, no
+    match. The status is the exit record's own word, verbatim.
+    """
+
+    #: The `at` of the decision this fee belongs to, as `decision.at` published it.
+    decision_at: str
+    status: str
+    fee_minor: int | None = None
+    currency: str | None = None
+    minor_unit_digits: int | None = None
+
+    def __post_init__(self) -> None:
+        _iso_utc(self.decision_at, "exit_fee.decision_at")
+        _text(self.status, "exit_fee.status")
+        figure = (self.fee_minor, self.currency, self.minor_unit_digits)
+        if any(part is None for part in figure) and any(part is not None for part in figure):
+            raise ValueError(
+                "exit_fee carries a fee, its currency and its digits together or none of them"
+            )
+        if self.fee_minor is not None:
+            if isinstance(self.fee_minor, bool) or not isinstance(self.fee_minor, int) \
+                    or self.fee_minor < 0:
+                raise ValueError(f"exit_fee.fee_minor must be a whole number >= 0, got "
+                                 f"{self.fee_minor!r}")
+            _text(self.currency, "exit_fee.currency")
+            if isinstance(self.minor_unit_digits, bool) or not isinstance(
+                self.minor_unit_digits, int
+            ) or self.minor_unit_digits < 0:
+                raise ValueError(f"exit_fee.minor_unit_digits must be a whole number >= 0, "
+                                 f"got {self.minor_unit_digits!r}")
+
+    def to_dict(self) -> dict:
+        return {
+            "decision_at": self.decision_at,
+            "status": self.status,
+            "fee_minor": self.fee_minor,
+            "currency": self.currency,
+            "minor_unit_digits": self.minor_unit_digits,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class LaneState:
-    """`GET /v1/lane/state` -- the last decision, and the current transit."""
+    """`GET /v1/lane/state` -- the last decision, the current transit, and at an
+    exit, the fee in front of the driver.
+
+    `exit_fee` was ADDED within version 2: a consumer ignores a field it does
+    not know, so a reader of this version reads the payload exactly as before.
+    """
 
     decision: LastDecision | None
     transit: Transit
+    exit_fee: ExitFee | None = None
 
     def __post_init__(self) -> None:
         if self.decision is not None and not isinstance(self.decision, LastDecision):
             raise ValueError("decision must be a LastDecision or null")
         if not isinstance(self.transit, Transit):
             raise ValueError("transit must be a Transit")
+        if self.exit_fee is not None and not isinstance(self.exit_fee, ExitFee):
+            raise ValueError("exit_fee must be an ExitFee or null")
 
     def to_dict(self) -> dict:
         return {
             "contract_version": CONTRACT_VERSION,
             "decision": self.decision.to_dict() if self.decision else None,
             "transit": self.transit.to_dict(),
+            "exit_fee": self.exit_fee.to_dict() if self.exit_fee else None,
         }
 
 
