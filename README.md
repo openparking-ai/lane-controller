@@ -212,8 +212,7 @@ is a gap in the money record.
 **At the reader, the phone prompt and the validation** (`reader.py`,
 `ValidatingScreen`). For a priced stay with a fee to pay, the reader's one
 screen is the fee and an optional phone number with **Skip**, and its words
-name both uses: *"Enter your phone number for a text receipt, or to use a
-restaurant validation."* A number entered is **claimed at that moment**,
+(`PROMPT_TEXT`) name both uses. A number entered is **claimed at that moment**,
 before any amount to pay is shown: `PlatformClient.claim_validation` sends it
 with the decision on screen to `POST /lane/sessions/<id>/validation`, and the
 platform claims a live validation for the stay on that fee and holds it. The
