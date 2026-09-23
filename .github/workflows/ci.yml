@@ -106,6 +106,15 @@ jobs:
         # outbox-drain suite to fail each time.
         run: python scripts/drain_fail_control.py
 
+      - name: Reader-fee fail-control
+        # Breaks the fee on the card reader -- a total re-summed from its
+        # lines, lines re-worded, a zero fee put up as a cart, a cart forced on
+        # every reader, the fee shown after the vend, the last car's fee left
+        # up, the reader on the lane thread, a clear that erases an unshown
+        # fee, a reader that raises through the arrival -- and requires the
+        # reader-fee suite to fail each time.
+        run: python scripts/reader_fail_control.py
+
       - name: Confirmation fail-control
         # Breaks the entry confirmation on purpose -- the window, the crossing
         # direction, the promotion of an unconfirmed entry, and the
