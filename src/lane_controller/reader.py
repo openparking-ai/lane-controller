@@ -151,10 +151,10 @@ class StripeCartScreen:
 
 # -- the phone prompt, and the validation claimed when the phone is entered -----------------
 #
-# GOKHAN'S SETTLED DESIGN, 2026-09-23 (brief §4, amendment A1). ONE SCREEN: the
-# fee, and an optional phone number, together -- no second screen, no back
-# button. The words name BOTH uses, because a driver who skips a screen that
-# only offered a receipt has thrown away a validation. Skip goes straight on.
+# THE SETTLED DESIGN (amendment A1). ONE SCREEN: the fee, and an optional
+# phone number, together -- no second screen, no back button. The words
+# (`PROMPT_TEXT`) name BOTH uses, a receipt and a validation, and a test holds
+# that they do. Skip goes straight on.
 #
 # THE CLAIM IS MADE WHEN THE PHONE IS ENTERED, before anything is shown as the
 # amount to pay: the lane hands the number and the decision on screen to the
@@ -185,7 +185,7 @@ class StripeCartScreen:
 # reader holds the key that can charge on it; so `PhonePrompt` is handed in,
 # as `post` is to the cart, and this package supplies no transport.
 
-#: The words, as settled. Not "receipt?": the validation is named too.
+#: The words, as settled. Both uses are named, not the receipt alone.
 PROMPT_TEXT = "Enter your phone number for a text receipt, or to use a restaurant validation."
 SKIP_TEXT = "Skip"
 

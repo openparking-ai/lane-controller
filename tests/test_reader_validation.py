@@ -63,7 +63,7 @@ def held_answer(record: dict, *, discount: int = 200, fee_after: int | None = No
         "discount_minor": discount,
         "fee_minor": record["fee_minor"] - discount if fee_after is None else fee_after,
         "line": {"code": "validation", "rule_id": None, "delta_minor": -discount,
-                 "text": "Validation from Invented Bistro (2.00 USD off): -2.00 USD"},
+                 "text": "Validation from Example Name (2.00 USD off): -2.00 USD"},
         "held_at": "2026-09-23T17:00:00.000Z",
     }
 
@@ -105,8 +105,6 @@ def test_the_one_screen_is_the_fee_and_an_optional_phone_and_its_words_name_both
     assert prompt["fee_minor"] == 500 and prompt["currency"] == "USD"
     assert prompt["skip"] == "Skip"
     assert prompt["text"] == PROMPT_TEXT
-    # Both uses are named: a screen that only offered a receipt would be skipped
-    # by a driver holding a validation.
     assert "text receipt" in PROMPT_TEXT and "validation" in PROMPT_TEXT
     assert "receipt?" not in PROMPT_TEXT
 
