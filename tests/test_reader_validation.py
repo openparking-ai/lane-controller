@@ -63,7 +63,7 @@ def held_answer(record: dict, *, discount: int = 200, fee_after: int | None = No
         "discount_minor": discount,
         "fee_minor": record["fee_minor"] - discount if fee_after is None else fee_after,
         "line": {"code": "validation", "rule_id": None, "delta_minor": -discount,
-                 "text": "Validation from Invented Bistro (2.00 USD off): -2.00 USD"},
+                 "text": "Validation from Example Name (2.00 USD off): -2.00 USD"},
         "held_at": "2026-09-23T17:00:00.000Z",
     }
 
