@@ -237,10 +237,12 @@ def test_get_stays_asks_the_stays_route_with_and_without_a_cursor():
         ("GET", "http://platform.test/api/v1/lane/stays?since=9"),
         ("GET", "http://platform.test/api/v1/lane/stays?since=a%20b"),
     ]
-    # the whole client surface, so a seventh method is a deliberate addition
+    # the whole client surface, so a new method is a deliberate addition. The
+    # seventh, `claim_validation`, is the reader's: the validation claimed when
+    # the phone is entered (platform 0019, amendment A1).
     assert sorted(m for m in vars(PlatformClient) if not m.startswith("_")) == [
-        "close_session", "find_open_session", "get_rules", "get_stays", "open_session",
-        "post_events",
+        "claim_validation", "close_session", "find_open_session", "get_rules", "get_stays",
+        "open_session", "post_events",
     ]
 
 

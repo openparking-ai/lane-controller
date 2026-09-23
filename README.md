@@ -209,6 +209,27 @@ dropped rather than retried forever, because retrying poison blocks everything
 behind it. Dropped items are counted and logged, never silent: a dropped session
 is a gap in the money record.
 
+**At the reader, the phone prompt and the validation** (`reader.py`,
+`ValidatingScreen`). For a priced stay with a fee to pay, the reader's one
+screen is the fee and an optional phone number with **Skip**, and its words
+name both uses: *"Enter your phone number for a text receipt, or to use a
+restaurant validation."* A number entered is **claimed at that moment**,
+before any amount to pay is shown: `PlatformClient.claim_validation` sends it
+with the decision on screen to `POST /lane/sessions/<id>/validation`, and the
+platform claims a live validation for the stay on that fee and holds it. The
+amount the driver is shown next is the platform's discounted fee, with its
+line appended to the engine's, **read, never worked out here**. Skip, a number
+that matches nothing, and a platform that cannot answer all show the fee as
+priced. The close carries the decision as priced **and what the reader showed**
+(`reader_shown`, sealed as the close is recorded, amendment A2): the platform
+records the claim it holds only when the reader showed the discounted fee, and
+nothing discounted goes up for a stay after its close was recorded — so the
+number on the reader and the number on the row agree in every order. **The number goes into that request body and nowhere else**:
+not the record, not an event, not the outbox, not a log line, not a URL. The
+reader's own input action (`PhonePrompt`) is handed in, as the cart's `post`
+is; this package supplies no reader transport. `scripts/validation_prompt_fail_control.py`
+breaks each property in turn.
+
 ## Watch a car drive through
 
 From the [platform](https://github.com/openparking-ai/platform) repository:

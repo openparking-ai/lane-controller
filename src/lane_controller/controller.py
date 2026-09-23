@@ -1388,6 +1388,10 @@ class LaneController:
             **self._identity_detail(identity, with_region=False),
             **self._session_descriptor(identity),
             **({"local_decision": exit_pricing.to_detail()} if exit_pricing is not None else {}),
+            # What the reader put up for this stay, SEALED as the close is
+            # recorded (A2.2): the platform records a held validation only
+            # when this is its discounted fee.
+            **self._reader_shown(exit_pricing),
             at=at,
             session_id=session_id,
             exit_confirmation=confirmation,
@@ -1396,6 +1400,15 @@ class LaneController:
         # nothing until the next exit decision, so the next driver never
         # reads this one's fee.
         self.show_reader(None)
+
+    def _reader_shown(self, exit_pricing) -> dict:
+        """`{"reader_shown": ...}` from a screen that keeps what it showed, or {}."""
+        seal = getattr(self.reader, "seal", None)
+        session_id = getattr(exit_pricing, "session_id", None)
+        if seal is None or not session_id:
+            return {}
+        shown = seal(session_id)
+        return {"reader_shown": shown} if shown is not None else {}
 
     def set_reader_hand(self, hand: Callable[[dict | None], None] | None) -> None:
         """Install who presents to the reader -- `LaneRunner` hands its own
