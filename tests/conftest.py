@@ -2220,5 +2220,18 @@ def _break_the_exit_fee(monkeypatch):
 
         monkeypatch.setattr(reader_module.ValidatingScreen, "shown_for", shown_for_the_stay)
 
+    elif mode == "left_up_for_the_next_car":
+        # An exit that makes no money decision hands the reader nothing -- and
+        # nothing is what takes the car before's fee down. Skipped there (and
+        # only there: the close still clears), the last car's fee stays up.
+        import sys
+
+        def show_unless_nothing_was_decided(self, record):
+            if record is None and sys._getframe(1).f_code.co_name == "handle_arrival":
+                return
+            original_show(self, record)
+
+        monkeypatch.setattr(LaneController, "show_reader", show_unless_nothing_was_decided)
+
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_FEE mode: {mode}")

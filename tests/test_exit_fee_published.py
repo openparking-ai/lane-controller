@@ -6,7 +6,7 @@ driver would be reading a screen -- while the reader is being handed the fee --
 and the records are the real `price_exit` with the rate engine in-process,
 except where a test plants one on purpose to prove a figure is READ.
 
-`scripts/exit_fee_fail_control.py` breaks the publication in nine ways and
+`scripts/exit_fee_fail_control.py` breaks the publication in ten ways and
 requires this file to go red each time.
 """
 
@@ -358,6 +358,33 @@ def test_the_hand_over_up_now_is_never_the_one_the_screen_forgets():
     assert screen.shown_for(others[1]) == {"fee_minor": 500, "currency": "USD"}
 
 
+def test_the_closes_the_screen_forgets_are_the_oldest():
+    """The screen remembers a bounded number of closed stays. Past that bound it
+    forgets the OLDEST close -- never the newest, which is the one a car still at
+    the exit can be presented again for. A newest close forgotten is a discount
+    put up again for a stay whose close already said what it said."""
+    class Keeps:
+        def __init__(self):
+            self.shown = []
+
+        def present_exit(self, record):
+            self.shown.append(record)
+
+    inner = Keeps()
+    screen = ValidatingScreen(inner, Prompt(PHONE), Claims(held_answer))
+    closed = [f"s-closed-{n}" for n in range(ValidatingScreen.REMEMBERED + 1)]
+    for session_id in closed:
+        assert screen.seal(session_id) is None
+    for session_id in (closed[-1], closed[1]):
+        again = {**priced_record(), "session_id": session_id}
+        screen.present_exit(again)
+        assert inner.shown[-1]["fee_minor"] == 500, f"{session_id}'s close was forgotten"
+        assert screen.shown_for(again) == {"fee_minor": 500, "currency": "USD"}
+    oldest = {**priced_record(), "session_id": closed[0]}
+    screen.present_exit(oldest)
+    assert inner.shown[-1]["fee_minor"] == 300, "nothing was forgotten"
+
+
 def test_an_exit_with_no_reader_still_publishes_its_fee():
     vend = VendThatReads()
     run_exit(a_cache(a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])), "TRNS-9",
@@ -377,6 +404,58 @@ def test_the_fee_comes_down_when_the_close_is_recorded():
     assert reader.states[0]["exit_fee"] is not None
     assert reader.shown[-1] is None
     assert after["exit_fee"] is None, "the next driver would read this one's fee"
+
+
+def test_an_exit_that_decides_nothing_about_money_takes_the_last_cars_fee_down():
+    """Car A is shown its fee and backs out, so no close ever takes it down. Car
+    B then arrives and the lane makes no money decision about it -- no plate
+    read, or a read too weak to decide on. The lane hands the reader NOTHING,
+    and that is the only thing that takes A's fee down: until it does, A's fee
+    is on the reader and published in front of B."""
+    from lane_controller import LaneController
+    from lane_controller.events import EventQueue
+    from lane_controller.interfaces import ClosingSequence
+    from lane_controller.simulated import (
+        CannedCameraFeed,
+        ScriptedClosingLoops,
+        StubVehicleIdentifier,
+    )
+    from test_close_decision import a_config
+
+    car_a = VehicleIdentity(plate="TRNS-9", plate_region="FL", make=None, model=None,
+                            color=None, confidence=0.99)
+    for car_b in (VehicleIdentity(plate=None, confidence=0.0, presence=True),
+                  VehicleIdentity(plate="TRNS-9", plate_region="FL", make=None, model=None,
+                                  color=None, confidence=0.42)):
+        reader = ReadsTheState()
+        controller = LaneController(
+            a_config(closing_loops=2),
+            loop=SimulatedLoopInput(arrivals=2),
+            camera=CannedCameraFeed(),
+            vend=RecordingVendOutput(),
+            identifier=StubVehicleIdentifier([car_a, car_b]),
+            closing_loops=ScriptedClosingLoops([(ClosingSequence.REVERSE, 1.0)]),
+            cache=a_cache(a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])),
+            events=EventQueue(),
+            clock=lambda: NOW,
+            reader=reader,
+        )
+        with served(controller) as base:
+            consumer = LaneConsumer(base)
+            reader.consumer = consumer
+            first = controller.run_once()
+            between = consumer.state()
+            second = controller.run_once()
+            after = consumer.state()
+        assert first.exit_pricing.to_detail()["fee_minor"] == 500
+        # A backed out: no close, and A's fee is still up when B arrives.
+        assert not [e for e in controller.events._queue if e.kind == "session_close"]
+        assert between["exit_fee"]["fee_minor"] == 500 == cart_for(reader.shown[0])["total"]
+        # B: no money decision, so nothing is handed over and nothing published.
+        assert second.exit_pricing is None and not second.should_vend, second
+        assert after["exit_fee"] is None, "A's fee is published in front of B"
+        assert len(reader.shown) == 2 and reader.shown[1] is None, "A's fee is on B's reader"
+        assert reader.states[1]["exit_fee"] is None, "A's fee is published in front of B"
 
 
 def test_an_entry_lane_publishes_no_fee():

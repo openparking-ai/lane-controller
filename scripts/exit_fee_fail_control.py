@@ -18,6 +18,9 @@ never been seen to differ from the reader's is not known to match it.
   figure_outlives_its_hand_over
                           what went up for a stay is published for a later
                           hand-over of the same stay.
+  left_up_for_the_next_car
+                          an exit that makes no money decision leaves the
+                          last car's fee up.
 """
 
 from __future__ import annotations
@@ -39,6 +42,8 @@ BREAKAGES = [
      "the fee as priced, between the seal and the reader being cleared"),
     ("figure_outlives_its_hand_over",
      "what went up for a stay is published for a later hand-over of it"),
+    ("left_up_for_the_next_car",
+     "an exit that makes no money decision leaves the last car's fee up"),
 ]
 
 
