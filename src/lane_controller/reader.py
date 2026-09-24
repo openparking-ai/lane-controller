@@ -64,6 +64,8 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import Protocol
 
+from rate_engine.currency import is_known, minor_unit_digits
+
 log = logging.getLogger(__name__)
 
 #: The record's status for a stay the lane priced (`exit_pricing.PRICED`).
@@ -113,6 +115,38 @@ def cart_for(record: dict | None) -> dict | None:
             return None
         items.append({"amount": amount, "description": text, "quantity": 1})
     return {"currency": currency.lower(), "line_items": items, "total": fee}
+
+
+def exit_fee_for(decision_at: str, record: dict | None, shown: dict | None = None) -> dict | None:
+    """`GET /v1/lane/state`'s `exit_fee` for what the reader was handed, or None.
+
+    `record` is what `show_reader()` last handed over and `shown` is what a
+    validating screen then put up for that same record (`shown_for`), if anything.
+    The figure is READ -- the record's `fee_minor`, or the amount the screen put
+    up after a held validation, in the same currency -- and never added up.
+    A figure is published only where the reader has one to show (`cart_for`),
+    or where it is a priced zero; anything else carries its status alone.
+    """
+    if not isinstance(record, dict):
+        return None
+    status = record.get("status")
+    if not isinstance(status, str) or not status:
+        return None
+    fee = {"decision_at": decision_at, "status": status}
+    if status != PRICED:
+        return fee
+    amount, currency = record.get("fee_minor"), record.get("currency")
+    zero = isinstance(amount, int) and not isinstance(amount, bool) and amount == 0
+    if not zero and cart_for(record) is None:
+        return fee
+    if not is_known(currency):
+        return fee
+    if isinstance(shown, dict) and shown.get("currency") == currency:
+        held = shown.get("fee_minor")
+        if isinstance(held, int) and not isinstance(held, bool) and held >= 0:
+            amount = held
+    return {**fee, "fee_minor": amount, "currency": currency,
+            "minor_unit_digits": minor_unit_digits(currency)}
 
 
 def cart_form(cart: dict) -> dict[str, str]:
@@ -279,8 +313,11 @@ class ValidatingScreen:
         self._prompt = prompt
         self._claim = claim
         self._lock = threading.Lock()
-        #: session id -> {"fee_minor", "currency"} last put up, or None once sealed.
-        self._shown: OrderedDict[str, dict | None] = OrderedDict()
+        #: session id -> (the record the lane handed over, the `{"fee_minor",
+        #: "currency"}` put up for it). THE ONLY COPY of a figure this screen
+        #: gave the reader, and it belongs to that one hand-over: see `shown_for`.
+        self._shown: OrderedDict[str, tuple[dict, dict]] = OrderedDict()
+        #: The stays whose close is recorded: nothing discounted goes up for them.
         self._sealed: OrderedDict[str, None] = OrderedDict()
 
     def seal(self, session_id: str | None) -> dict | None:
@@ -290,11 +327,39 @@ class ValidatingScreen:
         if not session_id:
             return None
         with self._lock:
-            shown = self._shown.pop(session_id, None)
+            if session_id in self._sealed:
+                # Sealed once: a later close of the same stay was given nothing new.
+                return None
             self._sealed[session_id] = None
             while len(self._sealed) > self.REMEMBERED:
                 self._sealed.popitem(last=False)
-            return shown
+            # READ, not dropped: what went up stays what `shown_for` answers
+            # for as long as the lane is still showing that hand-over.
+            kept = self._shown.get(session_id)
+            return None if kept is None else dict(kept[1])
+
+    def shown_for(self, record: dict | None) -> dict | None:
+        """What this screen put up for `record` -- the record the lane handed
+        it, as the lane holds it -- `{fee_minor, currency}`, or None. READ ONLY:
+        unlike `seal`, it changes nothing. The lane's read contract asks it, so
+        a display beside this reader draws the amount the reader was given and
+        not the fee as priced when a validation is held.
+
+        THE FIGURE'S LIFETIME IS THE HAND-OVER'S, and this is the one place it
+        is decided. A figure is answered for the very record it went up for,
+        and for no other -- not another hand-over of the same stay, however
+        alike. So it exists from the moment it is registered to go up until the
+        lane stops showing that record: sealing the close takes nothing away
+        from it, and once the lane hands over anything else -- `None` after the
+        close, or the same stay again, priced again -- it is never answered."""
+        session_id = record.get("session_id") if isinstance(record, dict) else None
+        if not session_id:
+            return None
+        with self._lock:
+            kept = self._shown.get(session_id)
+            if kept is None or kept[0] is not record:
+                return None
+            return dict(kept[1])
 
     def present_exit(self, record: dict | None) -> None:
         prompt = prompt_for(record)
@@ -321,12 +386,14 @@ class ValidatingScreen:
                 # The close is already recorded and said what it said: nothing
                 # discounted goes up after it.
                 shown = record
-            else:
-                self._shown[session_id] = {
-                    "fee_minor": shown["fee_minor"], "currency": shown["currency"],
-                }
-                while len(self._shown) > self.REMEMBERED:
-                    self._shown.popitem(last=False)
+            self._shown[session_id] = (
+                record, {"fee_minor": shown["fee_minor"], "currency": shown["currency"]},
+            )
+            # The newest hand-over is the last one forgotten, even for a stay
+            # this screen has put something up for before.
+            self._shown.move_to_end(session_id)
+            while len(self._shown) > self.REMEMBERED:
+                self._shown.popitem(last=False)
         # Outside the lock: what was registered is exactly what goes up, and a
         # reader on the network never holds the lane's close.
         self._inner.present_exit(shown)

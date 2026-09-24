@@ -123,6 +123,15 @@ jobs:
         # turn and the suite must go red.
         run: python scripts/validation_prompt_fail_control.py
 
+      - name: Exit-fee fail-control
+        # The fee published on GET /v1/lane/state as `exit_fee` for a second
+        # screen at the exit: re-summed from the lines, two decimals guessed,
+        # the discount not followed, left up after the close, a figure the
+        # reader has no cart for, nothing without a reader, the stay on the
+        # wire, the fee as priced inside the close, a figure outliving its
+        # hand-over -- and requires the exit-fee suite to fail each time.
+        run: python scripts/exit_fee_fail_control.py
+
       - name: Confirmation fail-control
         # Breaks the entry confirmation on purpose -- the window, the crossing
         # direction, the promotion of an unconfirmed entry, and the

@@ -62,6 +62,7 @@ from .contract import (
     CONTRACT_VERSION,
     Capabilities,
     EventPage,
+    ExitFee,
     HealthEntry,
     HealthState,
     LaneDescription,
@@ -72,6 +73,7 @@ from .contract import (
     Transit,
 )
 from .interfaces import Unavailable
+from .reader import exit_fee_for
 from .sync import to_iso
 from .vehicle_id_client import VehicleIdClient
 from .vend import AssistedVend, BadVendRequest
@@ -375,7 +377,22 @@ class LaneService:
                 state=controller.transit_state,
                 since=controller.transit_since,
             ),
+            exit_fee=self.exit_fee(),
         )
+
+    def exit_fee(self) -> ExitFee | None:
+        """The fee in front of the driver at this exit, from what the reader was
+        handed -- and, behind a validating screen, what it then put up."""
+        screen = self.controller.exit_screen
+        if screen is None:
+            return None
+        decision_at, record = screen
+        shown_for = getattr(self.controller.reader, "shown_for", None)
+        # The record itself, not its stay: what went up is answered only for
+        # the hand-over the lane is still showing (`ValidatingScreen.shown_for`).
+        shown = shown_for(record) if shown_for is not None else None
+        fee = exit_fee_for(decision_at, record, shown)
+        return ExitFee(**fee) if fee is not None else None
 
     # --- GET /v1/lane/health ----------------------------------------------
 

@@ -49,6 +49,7 @@ from lane_controller.contract import (
     SOURCES,
     VEND_BLOCKING,
     VEND_IDENTITY_KINDS,
+    ExitFee,
     HealthEntry,
     HealthState,
     LaneHealth,
@@ -166,6 +167,11 @@ ROUTE_PAYLOADS = {"lane", "state", "health", "events"}
 #: served response.
 ACT_PAYLOADS = {"vend", "vend_refused"}
 
+#: Blocks that are ONE FIELD of a route's payload, shown on their own because the
+#: route's own example carries them as `null` -- `exit_fee` is null at every lane
+#: but an exit that has priced a car. Compared against the payload class.
+FIELD_PAYLOADS = {"exit_fee"}
+
 
 def doc_payloads() -> dict[str, dict]:
     """Every `<!--payload:NAME-->` example in `docs/CONTRACT.md`, parsed."""
@@ -205,7 +211,7 @@ def test_the_document_shows_exactly_the_payloads_the_code_builds():
     against it, so a field added, renamed or dropped in either one goes red.
     """
     doc = doc_payloads()
-    assert set(doc) == ROUTE_PAYLOADS | ACT_PAYLOADS | {"sets"}, (
+    assert set(doc) == ROUTE_PAYLOADS | ACT_PAYLOADS | FIELD_PAYLOADS | {"sets"}, (
         "every route in the contract has a payload example, every example "
         "belongs to a route, and `sets` is the closed-set block that is not a "
         f"route. Found {sorted(doc)}"
@@ -226,8 +232,12 @@ def test_the_document_shows_exactly_the_payloads_the_code_builds():
     # code. Comparing shapes handles that -- a list reduces to its first
     # element -- and completeness is guarantee 3's job, not this one.
     live.update(act_payloads())
+    live["exit_fee"] = ExitFee(
+        decision_at="2026-08-30T14:03:11.482913+00:00", status="priced",
+        fee_minor=1500, currency="USD", minor_unit_digits=2,
+    ).to_dict()
 
-    for name in sorted(ROUTE_PAYLOADS | ACT_PAYLOADS):
+    for name in sorted(ROUTE_PAYLOADS | ACT_PAYLOADS | FIELD_PAYLOADS):
         example = doc[name]
         assert shape(example) == shape(live[name]), (
             f"docs/CONTRACT.md's `{name}` example does not have the shape "

@@ -648,13 +648,18 @@ def _break_the_lane_contract(monkeypatch):
     elif mode == "drop_code":
         # One code left out of the payload. A consumer cannot tell an absent
         # code from a healthy one, which is the whole reason the set is closed.
+        # Left out of what is SERVED, past `LaneHealth`'s own refusal: a short
+        # table built directly is refused at construction, the server drops the
+        # connection, and no test ever reads a payload with a code missing.
+        original_health = service_module.LaneService.health
+
+        class Short(LaneHealth):
+            def to_dict(inner):
+                payload = LaneHealth.to_dict(inner)
+                return {**payload, "codes": payload["codes"][:-1]}
+
         def short(self):
-            return LaneHealth(
-                entries=tuple(
-                    HealthEntry(code=code.value, state=HealthState.UNKNOWN.value)
-                    for code in list(MalfunctionCode)[:-1]
-                )
-            )
+            return Short(entries=original_health(self).entries)
 
         monkeypatch.setattr(service_module.LaneService, "health", short)
 
@@ -766,9 +771,12 @@ def _break_the_lane_contract(monkeypatch):
 
         original_session = LaneController._record_session
 
-        def photographs_the_plate(self, identity, at, *, confirmation):
+        # Whatever else `_record_session` takes is passed through untouched: a
+        # break whose signature is behind the method's raises TypeError on every
+        # call, and a body that never runs breaks nothing.
+        def photographs_the_plate(self, identity, at, **kwargs):
             self.events.record("entry_photo_taken", self.config.lane_id, plate=identity.plate)
-            return original_session(self, identity, at, confirmation=confirmation)
+            return original_session(self, identity, at, **kwargs)
 
         monkeypatch.setattr(LaneController, "_record_session", photographs_the_plate)
 
@@ -2087,12 +2095,151 @@ def _break_the_validation_prompt(monkeypatch):
 
     elif mode == "seal_reports_the_record":
         # The seal says the fee as priced, whatever went up.
+        original_seal_for_the_record = reader_module.ValidatingScreen.seal
+
         def seal_record(self, session_id):
-            shown = self._shown.pop(session_id, None)
-            self._sealed[session_id] = None
+            shown = original_seal_for_the_record(self, session_id)
             return None if shown is None else {"fee_minor": 500, "currency": shown["currency"]}
 
         monkeypatch.setattr(reader_module.ValidatingScreen, "seal", seal_record)
 
     else:
         raise RuntimeError(f"unknown BREAK_VALIDATION_PROMPT mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# scripts/exit_fee_fail_control.py sets BREAK_EXIT_FEE and requires
+# tests/test_exit_fee_published.py to FAIL. A fee published for a second screen
+# that has never been seen to differ from the reader's is not known to match it.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_exit_fee(monkeypatch):
+    mode = os.environ.get("BREAK_EXIT_FEE")
+    if not mode:
+        return
+
+    from lane_controller import reader as reader_module
+    from lane_controller import service as service_module
+
+    original_fee_for = reader_module.exit_fee_for
+    original_show = LaneController.show_reader
+
+    if mode == "fee_resummed":
+        # The published figure added up from the record's lines.
+        def resummed(decision_at, record, shown=None):
+            fee = original_fee_for(decision_at, record, shown)
+            if fee is not None and fee.get("fee_minor") and isinstance(record, dict):
+                fee = {**fee, "fee_minor": sum(line["delta_minor"] for line in record["breakdown"])}
+            return fee
+
+        monkeypatch.setattr(service_module, "exit_fee_for", resummed)
+        monkeypatch.setattr(reader_module, "exit_fee_for", resummed)
+
+    elif mode == "digits_guessed":
+        # Two decimals for every currency.
+        def two(decision_at, record, shown=None):
+            fee = original_fee_for(decision_at, record, shown)
+            if fee is not None and "minor_unit_digits" in fee:
+                fee = {**fee, "minor_unit_digits": 2}
+            return fee
+
+        monkeypatch.setattr(service_module, "exit_fee_for", two)
+
+    elif mode == "discount_not_followed":
+        # The fee as priced, whatever the reader was given after a validation.
+        monkeypatch.setattr(service_module, "exit_fee_for",
+                            lambda decision_at, record, shown=None:
+                            original_fee_for(decision_at, record, None))
+
+    elif mode == "left_up_after_close":
+        # Nothing takes the published fee down once the car has gone.
+        def show_keeping(self, record):
+            kept = self.exit_screen
+            original_show(self, record)
+            if record is None:
+                self.exit_screen = kept
+
+        monkeypatch.setattr(LaneController, "show_reader", show_keeping)
+
+    elif mode == "figure_without_a_cart":
+        # A figure published for a record the reader shows no cart for.
+        def any_figure(decision_at, record, shown=None):
+            fee = original_fee_for(decision_at, record, shown)
+            if fee is not None and fee.get("status") == "priced" and "fee_minor" not in fee:
+                fee = {**fee, "fee_minor": record.get("fee_minor"),
+                       "currency": record.get("currency"), "minor_unit_digits": 2}
+            return fee
+
+        monkeypatch.setattr(reader_module, "exit_fee_for", any_figure)
+        monkeypatch.setattr(service_module, "exit_fee_for", any_figure)
+
+    elif mode == "no_reader_no_fee":
+        # Published only where a reader is fitted.
+        def show_only_with_reader(self, record):
+            original_show(self, record)
+            if self.reader is None:
+                self.exit_screen = None
+
+        monkeypatch.setattr(LaneController, "show_reader", show_only_with_reader)
+
+    elif mode == "stay_on_the_wire":
+        # The stay's session id rides along with the fee.
+        from lane_controller.contract import ExitFee
+
+        original_exit_fee = service_module.LaneService.exit_fee
+
+        def leaky(self):
+            fee = original_exit_fee(self)
+            if fee is None:
+                return None
+            session = self.controller.exit_screen[1].get("session_id")
+
+            class Leaky(ExitFee):
+                def to_dict(inner):
+                    return {**ExitFee.to_dict(inner), "session_id": session}
+
+            return Leaky(**ExitFee.to_dict(fee))
+
+        monkeypatch.setattr(service_module.LaneService, "exit_fee", leaky)
+
+    elif mode == "fee_as_priced_at_the_close":
+        # The seal drops what the reader showed, so between the seal and the
+        # reader being cleared the fee as priced is published.
+        original_seal = reader_module.ValidatingScreen.seal
+
+        def seal_dropping(self, session_id):
+            shown = original_seal(self, session_id)
+            if session_id:
+                self._shown.pop(session_id, None)
+            return shown
+
+        monkeypatch.setattr(reader_module.ValidatingScreen, "seal", seal_dropping)
+
+    elif mode == "figure_outlives_its_hand_over":
+        # What went up is answered for the stay, whichever hand-over of it the
+        # lane is showing now: a second presentation publishes the first one's.
+        def shown_for_the_stay(self, record):
+            session_id = record.get("session_id") if isinstance(record, dict) else None
+            with self._lock:
+                kept = self._shown.get(session_id) if session_id else None
+                return None if kept is None else dict(kept[1])
+
+        monkeypatch.setattr(reader_module.ValidatingScreen, "shown_for", shown_for_the_stay)
+
+    elif mode == "left_up_for_the_next_car":
+        # An exit that makes no money decision hands the reader nothing -- and
+        # nothing is what takes the car before's fee down. Skipped there (and
+        # only there: the close still clears), the last car's fee stays up.
+        import sys
+
+        def show_unless_nothing_was_decided(self, record):
+            if record is None and sys._getframe(1).f_code.co_name == "handle_arrival":
+                return
+            original_show(self, record)
+
+        monkeypatch.setattr(LaneController, "show_reader", show_unless_nothing_was_decided)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_EXIT_FEE mode: {mode}")

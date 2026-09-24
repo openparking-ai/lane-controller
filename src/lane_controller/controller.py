@@ -224,6 +224,12 @@ class LaneController:
         #: `GET /v1/lane/state` publishes as `decision.completed`, and it is
         #: cleared by the next arrival because a new decision is a new case.
         self.last_decision_completed_at: str | None = None
+        #: WHAT THE READER WAS LAST TOLD, as `(decision_at, record)`, or `None`
+        #: when it was told to show nothing. Set by `show_reader()` whether or
+        #: not this lane has a reader, and published on `GET /v1/lane/state` as
+        #: `exit_fee` -- so a second screen at this exit draws from the same
+        #: hand-off the reader does, at the same moments.
+        self.exit_screen: tuple[str, dict] | None = None
         # WHO DRAINS THE OUTBOX. None means "this thread, now" -- the bare
         # controller of the tests and the demo, where `run_once` returns with
         # the record delivered. `LaneRunner` installs a drain of its own so
@@ -1425,6 +1431,14 @@ class LaneController:
         a reader that raises costs its own screen and nothing else: the vend
         and the record go on without it.
         """
+        # RECORDED FIRST, and whether or not a reader is fitted: what goes on
+        # the read contract is what this lane decided to put in front of the
+        # driver, and an exit with a display and no reader still has a fee.
+        self.exit_screen = (
+            (self.last_decision_at, record)
+            if record is not None and self.last_decision_at is not None
+            else None
+        )
         if self.reader is None:
             return
         if self._reader_hand is not None:

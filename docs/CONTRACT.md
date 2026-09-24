@@ -163,7 +163,8 @@ its wiring, its route table — and none is a flag somebody set.
   "transit": {
     "state": "pending",
     "since": "2026-08-30T14:03:11.482913+00:00"
-  }
+  },
+  "exit_fee": null
 }
 ```
 
@@ -181,6 +182,54 @@ memory for as long as the process does; this package has no state store and
 this contract does not add one. After a restart `decision` is `null` and
 `transit.state` is `none` — which is the honest answer, and is not the same
 thing as "nothing has ever happened here".
+
+### `exit_fee` — the fee in front of the driver, at an exit
+
+At an exit lane, what the lane handed its card reader for the car at the
+barrier — and, when a validation is held for the stay, the fee the reader was
+given after it. It is here so a second screen at the same exit (a barrier
+display) draws the reader's number and cannot come to show a different one.
+**It was added within version 2**: a consumer ignores a field it does not know,
+so a reader of this version reads the payload exactly as before.
+
+<!--payload:exit_fee-->
+```json
+{
+  "decision_at": "2026-08-30T14:03:11.482913+00:00",
+  "status": "priced",
+  "fee_minor": 1500,
+  "currency": "USD",
+  "minor_unit_digits": 2
+}
+```
+
+- **`null`** whenever the reader has been told to show nothing: at an entry,
+  before this process has made an exit decision, after a decision with no money
+  decision in it, and **from the moment the car's close is recorded** — so the
+  next driver never reads the last one's fee.
+- **`decision_at`** is the `at` of the decision it belongs to, exactly as
+  `decision.at` published it. A consumer that compares the two can tell a fee
+  about the car in front of it from one that is not.
+- **`status`** is the exit record's own word, verbatim: `priced`, `covered`,
+  `no_cached_entry`, `engine_refused`, `engine_invalid`, `stale_facts`. It is
+  OPEN — a consumer that does not recognise one shows no figure.
+- **`fee_minor`, `currency` and `minor_unit_digits` come together or not at
+  all.** They are present on a `priced` stay the reader has a figure for, and on
+  a priced stay of zero. A priced record the reader shows nothing for carries
+  its status alone, so no screen puts up a number the reader does not. The fee
+  is READ from the record (or from what the reader was given after a held
+  validation) and never added up from lines. A held validation's fee stays the
+  published one while the close is being recorded, up to the moment it turns
+  `null`: at no point does the fee as priced come back. It belongs to the
+  decision it was given for and to no other: when the same stay is put in front
+  of the reader again, the figure is the one that decision puts up.
+- **`minor_unit_digits` is the rate engine's**, the engine that priced the
+  stay: how many minor units make one major unit of `currency`, from its ISO
+  4217 table. Write the figure with it — `1500` at `2` is `15.00` — rather than
+  from a list of your own. The engine refuses to price in a currency it holds no
+  digits for, so a published figure always carries them.
+- Nothing that names the car or the stay is here: no plate, no session, no
+  match.
 
 ### `outcome` is CLOSED. `reason` is OPEN.
 
