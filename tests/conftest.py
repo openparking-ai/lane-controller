@@ -766,9 +766,12 @@ def _break_the_lane_contract(monkeypatch):
 
         original_session = LaneController._record_session
 
-        def photographs_the_plate(self, identity, at, *, confirmation):
+        # Whatever else `_record_session` takes is passed through untouched: a
+        # break whose signature is behind the method's raises TypeError on every
+        # call, and a body that never runs breaks nothing.
+        def photographs_the_plate(self, identity, at, **kwargs):
             self.events.record("entry_photo_taken", self.config.lane_id, plate=identity.plate)
-            return original_session(self, identity, at, confirmation=confirmation)
+            return original_session(self, identity, at, **kwargs)
 
         monkeypatch.setattr(LaneController, "_record_session", photographs_the_plate)
 
