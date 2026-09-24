@@ -648,13 +648,18 @@ def _break_the_lane_contract(monkeypatch):
     elif mode == "drop_code":
         # One code left out of the payload. A consumer cannot tell an absent
         # code from a healthy one, which is the whole reason the set is closed.
+        # Left out of what is SERVED, past `LaneHealth`'s own refusal: a short
+        # table built directly is refused at construction, the server drops the
+        # connection, and no test ever reads a payload with a code missing.
+        original_health = service_module.LaneService.health
+
+        class Short(LaneHealth):
+            def to_dict(inner):
+                payload = LaneHealth.to_dict(inner)
+                return {**payload, "codes": payload["codes"][:-1]}
+
         def short(self):
-            return LaneHealth(
-                entries=tuple(
-                    HealthEntry(code=code.value, state=HealthState.UNKNOWN.value)
-                    for code in list(MalfunctionCode)[:-1]
-                )
-            )
+            return Short(entries=original_health(self).entries)
 
         monkeypatch.setattr(service_module.LaneService, "health", short)
 
