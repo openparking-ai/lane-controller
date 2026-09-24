@@ -388,7 +388,9 @@ class LaneService:
             return None
         decision_at, record = screen
         shown_for = getattr(self.controller.reader, "shown_for", None)
-        shown = shown_for(record.get("session_id")) if shown_for is not None else None
+        # The record itself, not its stay: what went up is answered only for
+        # the hand-over the lane is still showing (`ValidatingScreen.shown_for`).
+        shown = shown_for(record) if shown_for is not None else None
         fee = exit_fee_for(decision_at, record, shown)
         return ExitFee(**fee) if fee is not None else None
 

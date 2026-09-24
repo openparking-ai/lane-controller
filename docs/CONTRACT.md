@@ -220,7 +220,9 @@ so a reader of this version reads the payload exactly as before.
   is READ from the record (or from what the reader was given after a held
   validation) and never added up from lines. A held validation's fee stays the
   published one while the close is being recorded, up to the moment it turns
-  `null`: at no point does the fee as priced come back.
+  `null`: at no point does the fee as priced come back. It belongs to the
+  decision it was given for and to no other: when the same stay is put in front
+  of the reader again, the figure is the one that decision puts up.
 - **`minor_unit_digits` is the rate engine's**, the engine that priced the
   stay: how many minor units make one major unit of `currency`, from its ISO
   4217 table. Write the figure with it — `1500` at `2` is `15.00` — rather than

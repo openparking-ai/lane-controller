@@ -6,7 +6,7 @@ driver would be reading a screen -- while the reader is being handed the fee --
 and the records are the real `price_exit` with the rate engine in-process,
 except where a test plants one on purpose to prove a figure is READ.
 
-`scripts/exit_fee_fail_control.py` breaks the publication in eight ways and
+`scripts/exit_fee_fail_control.py` breaks the publication in nine ways and
 requires this file to go red each time.
 """
 
@@ -21,8 +21,9 @@ from lane_consumer import LaneConsumer
 from lane_controller import reader as reader_module
 from lane_controller.interfaces import VehicleIdentity
 from lane_controller.reader import ValidatingScreen, cart_for
+from lane_controller.runner import LaneRunner
 from lane_controller.service import LaneService, make_server
-from lane_controller.simulated import RecordingVendOutput
+from lane_controller.simulated import RecordingVendOutput, SimulatedLoopInput
 from serving import serving
 from test_exit_decision import ENTRY, NOW, PLAN, a_cache, a_platform, gp_register, gp_row
 from test_reader_fee import CAPPED, a_capped_platform, exit_lane, priced_record
@@ -224,10 +225,137 @@ def test_a_seal_between_reading_the_screen_and_asking_it_changes_nothing():
     assert service.exit_fee().fee_minor == 300, "the discount is not up"
 
     asked = screen.shown_for
-    screen.shown_for = lambda session_id: (screen.seal(session_id), asked(session_id))[1]
+    screen.shown_for = lambda handed: (screen.seal(handed["session_id"]), asked(handed))[1]
     fee = service.exit_fee()
     assert "s-9" in screen._sealed, "the seal did not land in between"
     assert fee.fee_minor == 300 == cart_for(inner.shown[0])["total"]
+
+
+def test_a_closed_stay_presented_again_publishes_what_the_reader_is_given_again():
+    """The same plate read at the exit again after its close, before the next
+    rules sync -- the lane's cache still lists the stay -- is the same stay put
+    in front of the reader a second time, priced again. Its close is recorded,
+    so nothing discounted goes up for it: the prompt and the cart say the fee as
+    priced, and so must the figure published beside them. The first
+    presentation's discount belonged to the first presentation."""
+    inner = ReadsTheState()
+    prompt = PromptThatReads(PHONE, inner)
+    screen = ValidatingScreen(inner, prompt, Claims(held_answer))
+    controller, _ = exit_lane(a_cache(a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])),
+                              "TRNS-9", reader=screen)
+    controller.loop = SimulatedLoopInput(arrivals=2)
+    closes = []
+    record = controller.events.record
+
+    def reading(kind, *args, **detail):
+        if kind == "session_close":
+            closes.append((consumer.state(), detail.get("reader_shown")))
+        return record(kind, *args, **detail)
+
+    controller.events.record = reading
+    with served(controller) as base:
+        consumer = LaneConsumer(base)
+        inner.consumer = consumer
+        first = controller.run_once()
+        second = controller.run_once()
+        after = consumer.state()
+    assert first.exit_pricing.session_id == second.exit_pricing.session_id == "s-9"
+    assert second.exit_pricing.to_detail()["fee_minor"] == 500
+    assert len(closes) == 2 and len(inner.shown) == 4, inner.shown
+    # The first presentation: the discount, up to and inside its close.
+    assert inner.states[0]["exit_fee"]["fee_minor"] == cart_for(inner.shown[0])["total"] == 300
+    assert closes[0][1] == {"fee_minor": 300, "currency": "USD"}
+    assert closes[0][0]["exit_fee"]["fee_minor"] == 300
+    assert inner.shown[1] is None
+    # The second: the fee as priced on the prompt, on the cart and inside its
+    # close -- and the close says the reader was given nothing new.
+    assert prompt.states[1]["exit_fee"]["fee_minor"] == prompt.asked[1]["fee_minor"] == 500
+    assert inner.states[2]["exit_fee"]["fee_minor"] == cart_for(inner.shown[2])["total"] == 500
+    assert closes[1][0]["exit_fee"]["fee_minor"] == 500
+    assert closes[1][1] is None
+    assert inner.shown[3] is None and after["exit_fee"] is None
+
+
+def test_a_stay_presented_again_before_its_close_publishes_the_new_prompts_figure():
+    """A second decision for the same stay with no close in between -- the car
+    left the loop and came back -- puts the prompt up again with the fee as
+    priced. Until something new goes up, that is what is in front of the
+    driver, not the discount the first presentation put up."""
+    inner = ReadsTheState()
+    prompt = PromptThatReads(PHONE, inner)
+    screen = ValidatingScreen(inner, prompt, Claims(held_answer))
+    controller, _ = exit_lane(a_cache(a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])),
+                              "TRNS-9", reader=screen)
+    controller.last_decision_at = "2026-06-10T18:00:00+00:00"
+    with served(controller) as base:
+        inner.consumer = LaneConsumer(base)
+        controller.show_reader(priced_record())
+        prompt.typed = None
+        controller.show_reader(priced_record())
+    assert inner.states[0]["exit_fee"]["fee_minor"] == cart_for(inner.shown[0])["total"] == 300
+    assert prompt.states[1]["exit_fee"]["fee_minor"] == prompt.asked[1]["fee_minor"] == 500
+    assert inner.states[1]["exit_fee"]["fee_minor"] == cart_for(inner.shown[1])["total"] == 500
+
+
+def test_under_the_runner_the_reader_thread_publishes_the_discount_it_put_up():
+    """`LaneRunner` hands the reader the record on a thread of its own. What
+    that thread puts up is what is published: the hand-off carries the
+    presentation the lane made, not a copy of it."""
+    inner = ReadsTheState()
+    screen = ValidatingScreen(inner, Prompt(PHONE), Claims(held_answer))
+    controller, _ = exit_lane(a_cache(a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])),
+                              "TRNS-9", reader=screen)
+    runner = LaneRunner(controller, client=None, rules_refresh_s=300.0, stays_refresh_s=5.0)
+    controller.set_reader_hand(runner.hand_to_reader)
+    controller.last_decision_at = "2026-06-10T18:00:00+00:00"
+    with served(controller) as base:
+        inner.consumer = LaneConsumer(base)
+        controller.show_reader(priced_record())
+        (handed,) = runner._reader_pending
+        runner.reader_turn(handed)
+    assert runner.state.reader_turn_errors == 0
+    assert inner.states[0]["exit_fee"]["fee_minor"] == cart_for(inner.shown[0])["total"] == 300
+
+
+def test_a_stay_handed_over_with_no_cart_publishes_none_of_what_went_up_before():
+    """A discount went up for the stay; the lane then hands the reader a record
+    for the same stay that it shows no cart for -- a priced zero. The figure the
+    earlier hand-over put up is not this one's: the zero is published."""
+    inner = ReadsTheState()
+    screen = ValidatingScreen(inner, Prompt(PHONE), Claims(held_answer))
+    controller, _ = exit_lane(a_cache(a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])),
+                              "TRNS-9", reader=screen)
+    controller.last_decision_at = "2026-06-10T18:00:00+00:00"
+    with served(controller) as base:
+        inner.consumer = LaneConsumer(base)
+        controller.show_reader(priced_record())
+        zero = {**priced_record(), "fee_minor": 0}
+        controller.show_reader(zero)
+    assert inner.states[0]["exit_fee"]["fee_minor"] == 300
+    assert cart_for(inner.shown[1]) is None
+    assert inner.states[1]["exit_fee"]["fee_minor"] == 0
+
+
+def test_the_hand_over_up_now_is_never_the_one_the_screen_forgets():
+    """The screen remembers a bounded number of stays. The one the lane is
+    showing now is always among them, even when that stay was put up long ago
+    and many others since."""
+    class Blank:
+        def present_exit(self, record):
+            pass
+
+    screen = ValidatingScreen(Blank(), Prompt(None), Claims(held_answer))
+    screen.present_exit(priced_record())
+    others = [{**priced_record(), "session_id": f"s-other-{n}"}
+              for n in range(ValidatingScreen.REMEMBERED)]
+    for other in others[:-1]:
+        screen.present_exit(other)
+    again = priced_record()
+    screen.present_exit(again)
+    screen.present_exit(others[-1])
+    assert screen.shown_for(again) == {"fee_minor": 500, "currency": "USD"}
+    assert screen.shown_for(others[0]) is None, "nothing was forgotten"
+    assert screen.shown_for(others[1]) == {"fee_minor": 500, "currency": "USD"}
 
 
 def test_an_exit_with_no_reader_still_publishes_its_fee():

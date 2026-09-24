@@ -2087,9 +2087,10 @@ def _break_the_validation_prompt(monkeypatch):
 
     elif mode == "seal_reports_the_record":
         # The seal says the fee as priced, whatever went up.
+        original_seal_for_the_record = reader_module.ValidatingScreen.seal
+
         def seal_record(self, session_id):
-            shown = self._shown.pop(session_id, None)
-            self._sealed[session_id] = None
+            shown = original_seal_for_the_record(self, session_id)
             return None if shown is None else {"fee_minor": 500, "currency": shown["currency"]}
 
         monkeypatch.setattr(reader_module.ValidatingScreen, "seal", seal_record)
@@ -2203,10 +2204,21 @@ def _break_the_exit_fee(monkeypatch):
         def seal_dropping(self, session_id):
             shown = original_seal(self, session_id)
             if session_id:
-                self._sealed[session_id] = None
+                self._shown.pop(session_id, None)
             return shown
 
         monkeypatch.setattr(reader_module.ValidatingScreen, "seal", seal_dropping)
+
+    elif mode == "figure_outlives_its_hand_over":
+        # What went up is answered for the stay, whichever hand-over of it the
+        # lane is showing now: a second presentation publishes the first one's.
+        def shown_for_the_stay(self, record):
+            session_id = record.get("session_id") if isinstance(record, dict) else None
+            with self._lock:
+                kept = self._shown.get(session_id) if session_id else None
+                return None if kept is None else dict(kept[1])
+
+        monkeypatch.setattr(reader_module.ValidatingScreen, "shown_for", shown_for_the_stay)
 
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_FEE mode: {mode}")

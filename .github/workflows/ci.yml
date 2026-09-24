@@ -128,7 +128,8 @@ jobs:
         # screen at the exit: re-summed from the lines, two decimals guessed,
         # the discount not followed, left up after the close, a figure the
         # reader has no cart for, nothing without a reader, the stay on the
-        # wire -- and requires the exit-fee suite to fail each time.
+        # wire, the fee as priced inside the close, a figure outliving its
+        # hand-over -- and requires the exit-fee suite to fail each time.
         run: python scripts/exit_fee_fail_control.py
 
       - name: Confirmation fail-control

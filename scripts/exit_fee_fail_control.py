@@ -15,6 +15,9 @@ never been seen to differ from the reader's is not known to match it.
   fee_as_priced_at_the_close
                           the fee as priced, between the close's seal and the
                           reader being cleared.
+  figure_outlives_its_hand_over
+                          what went up for a stay is published for a later
+                          hand-over of the same stay.
 """
 
 from __future__ import annotations
@@ -34,6 +37,8 @@ BREAKAGES = [
     ("stay_on_the_wire", "the stay's session id rides along with the fee"),
     ("fee_as_priced_at_the_close",
      "the fee as priced, between the seal and the reader being cleared"),
+    ("figure_outlives_its_hand_over",
+     "what went up for a stay is published for a later hand-over of it"),
 ]
 
 
