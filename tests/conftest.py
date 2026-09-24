@@ -2195,5 +2195,18 @@ def _break_the_exit_fee(monkeypatch):
 
         monkeypatch.setattr(service_module.LaneService, "exit_fee", leaky)
 
+    elif mode == "fee_as_priced_at_the_close":
+        # The seal drops what the reader showed, so between the seal and the
+        # reader being cleared the fee as priced is published.
+        original_seal = reader_module.ValidatingScreen.seal
+
+        def seal_dropping(self, session_id):
+            shown = original_seal(self, session_id)
+            if session_id:
+                self._sealed[session_id] = None
+            return shown
+
+        monkeypatch.setattr(reader_module.ValidatingScreen, "seal", seal_dropping)
+
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_FEE mode: {mode}")

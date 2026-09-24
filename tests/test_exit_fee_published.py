@@ -6,7 +6,7 @@ driver would be reading a screen -- while the reader is being handed the fee --
 and the records are the real `price_exit` with the rate engine in-process,
 except where a test plants one on purpose to prove a figure is READ.
 
-`scripts/exit_fee_fail_control.py` breaks the publication in seven ways and
+`scripts/exit_fee_fail_control.py` breaks the publication in eight ways and
 requires this file to go red each time.
 """
 
@@ -155,6 +155,79 @@ def test_a_skipped_prompt_publishes_the_fee_as_priced():
     run_exit(a_cache(a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])), "TRNS-9",
              reader=screen)
     assert inner.states[0]["exit_fee"]["fee_minor"] == cart_for(inner.shown[0])["total"] == 500
+
+
+def run_exit_read_at_the_close(reader):
+    """The exit, with the published state read INSIDE the close: the close's
+    detail is built first -- `seal()` has run -- and the reader is not yet
+    cleared. Returns (the state then, what the close sealed, the decision)."""
+    controller, _ = exit_lane(a_cache(a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])),
+                              "TRNS-9", reader=reader)
+    seen = {}
+    record = controller.events.record
+
+    def reading(kind, *args, **detail):
+        if kind == "session_close":
+            assert controller.exit_screen is not None, "the reader was cleared first"
+            seen["state"] = consumer.state()
+            seen["sealed"] = detail.get("reader_shown")
+        return record(kind, *args, **detail)
+
+    controller.events.record = reading
+    with served(controller) as base:
+        consumer = LaneConsumer(base)
+        for hook in (reader, getattr(reader, "_inner", None)):
+            if hook is not None and hasattr(hook, "consumer"):
+                hook.consumer = consumer
+        decision = controller.run_once()
+    assert "state" in seen, "no close was recorded"
+    return seen["state"], seen["sealed"], decision
+
+
+def test_a_held_validation_is_still_the_published_fee_inside_the_close():
+    """The close seals what the reader showed BEFORE the reader is cleared. In
+    between, the published fee is still the discounted one the reader was
+    given -- never the fee as priced, which the reader never showed."""
+    inner = ReadsTheState()
+    screen = ValidatingScreen(inner, Prompt(PHONE), Claims(held_answer))
+    state, sealed, decision = run_exit_read_at_the_close(screen)
+    assert decision.exit_pricing.to_detail()["fee_minor"] == 500
+    assert sealed == {"fee_minor": 300, "currency": "USD"}, "the close sealed nothing"
+    assert state["exit_fee"]["fee_minor"] == 300 == cart_for(inner.shown[0])["total"]
+
+
+def test_without_a_validation_the_fee_inside_the_close_is_the_fee_as_priced():
+    """The control for the one above: the same moment, nothing held."""
+    inner = ReadsTheState()
+    state, sealed, _ = run_exit_read_at_the_close(inner)
+    assert sealed is None
+    assert state["exit_fee"]["fee_minor"] == 500 == cart_for(inner.shown[0])["total"]
+
+
+def test_a_seal_between_reading_the_screen_and_asking_it_changes_nothing():
+    """The contract is served on its own thread. It reads what the reader was
+    handed, then asks the screen what went up -- and the lane's thread can seal
+    the stay between the two. The answer must be the same either side."""
+    from lane_controller.service import LaneService
+
+    inner = ReadsTheState()
+    screen = ValidatingScreen(inner, Prompt(PHONE), Claims(held_answer))
+    controller, _ = exit_lane(a_cache(a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])),
+                              "TRNS-9", reader=screen)
+    record = priced_record()
+    assert record["session_id"] == "s-9"
+    controller.last_decision_at = "2026-06-10T18:00:00+00:00"
+    with served(controller) as base:
+        inner.consumer = LaneConsumer(base)
+        controller.show_reader(record)
+    service = LaneService(controller)
+    assert service.exit_fee().fee_minor == 300, "the discount is not up"
+
+    asked = screen.shown_for
+    screen.shown_for = lambda session_id: (screen.seal(session_id), asked(session_id))[1]
+    fee = service.exit_fee()
+    assert "s-9" in screen._sealed, "the seal did not land in between"
+    assert fee.fee_minor == 300 == cart_for(inner.shown[0])["total"]
 
 
 def test_an_exit_with_no_reader_still_publishes_its_fee():

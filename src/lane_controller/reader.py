@@ -315,7 +315,9 @@ class ValidatingScreen:
         self._lock = threading.Lock()
         #: session id -> {"fee_minor", "currency"} last put up, or None once sealed.
         self._shown: OrderedDict[str, dict | None] = OrderedDict()
-        self._sealed: OrderedDict[str, None] = OrderedDict()
+        #: session id -> what the close SEALED for it: the same `{"fee_minor",
+        #: "currency"}` it popped from `_shown`, or None when nothing went up.
+        self._sealed: OrderedDict[str, dict | None] = OrderedDict()
 
     def seal(self, session_id: str | None) -> dict | None:
         """What this screen put up for `session_id`, `{fee_minor, currency}`, or
@@ -325,20 +327,31 @@ class ValidatingScreen:
             return None
         with self._lock:
             shown = self._shown.pop(session_id, None)
-            self._sealed[session_id] = None
+            # KEPT, not dropped: `shown_for` goes on answering this figure
+            # after the seal, so the lane's read contract cannot fall back to
+            # the fee as priced between the seal and the reader being cleared.
+            self._sealed[session_id] = shown
             while len(self._sealed) > self.REMEMBERED:
                 self._sealed.popitem(last=False)
-            return shown
+            return None if shown is None else dict(shown)
 
     def shown_for(self, session_id: str | None) -> dict | None:
         """What this screen has put up for `session_id`, `{fee_minor, currency}`,
         or None -- READ ONLY: unlike `seal`, it changes nothing. The lane's read
         contract asks it, so a display beside this reader draws the amount the
-        reader was given and not the fee as priced when a validation is held."""
+        reader was given and not the fee as priced when a validation is held.
+
+        The same answer before the close is sealed and after it: a sealed stay
+        answers what the seal took, read under the one lock the seal holds. So
+        there is no moment -- in any order of the lane's thread and the one
+        serving the contract -- at which it answers None for a stay whose
+        discount went up, and the display falls back to the fee as priced."""
         if not session_id:
             return None
         with self._lock:
             shown = self._shown.get(session_id)
+            if shown is None:
+                shown = self._sealed.get(session_id)
             return dict(shown) if shown is not None else None
 
     def present_exit(self, record: dict | None) -> None:

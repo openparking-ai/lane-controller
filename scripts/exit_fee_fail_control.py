@@ -12,6 +12,9 @@ never been seen to differ from the reader's is not known to match it.
   figure_without_a_cart   a figure for a record the reader shows nothing for.
   no_reader_no_fee        an exit with no reader publishes nothing.
   stay_on_the_wire        the stay's session id rides along with the fee.
+  fee_as_priced_at_the_close
+                          the fee as priced, between the close's seal and the
+                          reader being cleared.
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ BREAKAGES = [
     ("figure_without_a_cart", "a figure for a record the reader shows nothing for"),
     ("no_reader_no_fee", "an exit with no reader publishes nothing"),
     ("stay_on_the_wire", "the stay's session id rides along with the fee"),
+    ("fee_as_priced_at_the_close",
+     "the fee as priced, between the seal and the reader being cleared"),
 ]
 
 
