@@ -21,7 +21,10 @@ THREE ANSWERS, AND THE THIRD IS PRODUCT-VISIBLE (brief 4.5, 4.6):
                      an entry for it: `rate_engine.contract.run_quote` prices
                      the stay from the cached plans -- the same one function
                      behind the platform's /v1/quote, so this number and the
-                     platform's are one computation.
+                     platform's are one computation -- and
+                     `rate_engine.contract.run_tax` takes the garage's tax on
+                     that subtotal at the exit, the function behind its
+                     /v1/tax (platform 0023). The fee is the taxed total.
   no_cached_entry    no register covers it and the cache holds no entry for
                      it: it entered inside one refresh interval, or during an
                      outage, or at a lane whose events have not propagated.
@@ -49,8 +52,11 @@ PLATFORM 0017 IT DECIDES THE RECORD TOO. The answer travels on the close as
 `local_decision`, and a close the platform can CONSUME -- `covered`, or
 `priced` for this stay, in this stay's currency, in the GARAGE'S space class
 (the stay has none of its own until it is closed), on a plan version the
-garage holds -- is written as the lane decided it, covered or at the lane's
-fee, with NEITHER MODULE'S DOOR ASKED AND NO ENGINE CALL.
+garage holds, taxed with the garage's current tax sets (platform 0023: the
+`tax_sets_held` facts below are how it tells) -- is written as the lane decided
+it, covered or at the lane's fee, with NEITHER MODULE'S DOOR ASKED AND NO
+ENGINE CALL. A validation recorded at the close is the one exception: the
+platform then takes the tax again, on the discounted subtotal.
 
 THE DOORS ARE FOR THE PATHS THAT ARE NOT CONSUMED, and they are every other
 one: a close carrying no decision at all; a `priced` decision that names
@@ -80,7 +86,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from rate_engine.contract import run_quote
+from rate_engine.contract import run_quote, run_tax
 
 from .decision import DecisionCache
 
@@ -110,6 +116,13 @@ class ExitPricing:
     exit_at: str | None = None
     session_id: str | None = None
     space_class: str | None = None
+    #: The fee before tax: the quote's total, on which the tax was taken.
+    subtotal_minor: int | None = None
+    #: Two facts about the cache's tax sets -- how many it held and the newest
+    #: `effective_from` among them -- and NEVER which set was used: that choice
+    #: is the engine's alone (`tax.select_tax_set`) and is not reported. The
+    #: platform judges a stale copy by these (platform 0023).
+    tax_sets_held: dict | None = None
     #: The engine's own words on a refusal, verbatim.
     refusal: dict | None = None
     #: What the answer was made from: when the facts were last refreshed, the
@@ -139,6 +152,8 @@ class ExitPricing:
                 currency=self.currency,
                 plan_version=self.plan_version,
                 breakdown=self.breakdown,
+                subtotal_minor=self.subtotal_minor,
+                tax_sets_held=self.tax_sets_held,
             )
         if self.refusal is not None:
             detail["refusal"] = self.refusal
@@ -239,6 +254,12 @@ def price_exit(identity_text: str, cache: DecisionCache, *, now: float) -> ExitP
     stays = cache.open_stays_for(identity_text)
     if not stays:
         return ExitPricing(status=NO_CACHED_ENTRY, computed_from=computed_from)
+    # NO TAX SETS IS A STALE CACHE, never a stay taxed at zero: a garage
+    # cannot be active without a set in force, so a copy holding none is a
+    # copy that never received them (a platform older than 0023, or a cache
+    # restored from before it).
+    if not cache.tax_sets:
+        return ExitPricing(status=STALE_FACTS, computed_from=computed_from)
     # The newest entry, when the cache holds more than one under this
     # identity -- which the platform's own index forbids for one vehicle and
     # a ticket cannot share -- and the count is said rather than hidden.
@@ -256,11 +277,35 @@ def price_exit(identity_text: str, cache: DecisionCache, *, now: float) -> ExitP
         space_class=cache.space_class, computed_from=computed_from,
         ambiguous_stays=len(stays) if len(stays) > 1 else 0,
     )
-    if status == 200:
+    if status != 200:
         return ExitPricing(
-            status=PRICED, fee_minor=body["fee_minor"], currency=body["currency"],
-            plan_version=body["plan_version"], breakdown=list(body["breakdown"]), **common,
+            status=ENGINE_REFUSED if status == 422 else ENGINE_INVALID, refusal=body, **common,
+        )
+    # THE TAX, LAST, on the quote's total at the exit -- the instant the
+    # platform uses for this decision too. No validation exists yet here: the
+    # fee the barrier draws is the subtotal plus the engine's tax lines.
+    tax_status, tax = run_tax({
+        "tax_sets": cache.tax_sets,
+        "subtotal_minor": body["fee_minor"],
+        "currency": body["currency"],
+        "at": exit_at,
+    })
+    if tax_status != 200:
+        return ExitPricing(
+            status=ENGINE_REFUSED if tax_status == 422 else ENGINE_INVALID, refusal=tax, **common,
         )
     return ExitPricing(
-        status=ENGINE_REFUSED if status == 422 else ENGINE_INVALID, refusal=body, **common,
+        status=PRICED, fee_minor=body["fee_minor"] + tax["total_minor"], currency=body["currency"],
+        plan_version=body["plan_version"], breakdown=[*body["breakdown"], *tax["lines"]],
+        subtotal_minor=body["fee_minor"], tax_sets_held=tax_sets_held(cache.tax_sets), **common,
     )
+
+
+def tax_sets_held(tax_sets: list) -> dict:
+    """How many sets the cache held, and the newest `effective_from` among
+    them, as the payload spelled it -- the latest INSTANT, compared as one.
+    Called only after the engine loaded these sets, so every instant parses."""
+    newest = max(
+        tax_sets, key=lambda s: datetime.fromisoformat(s["effective_from"].replace("Z", "+00:00")),
+    )["effective_from"]
+    return {"count": len(tax_sets), "newest_effective_from": newest}

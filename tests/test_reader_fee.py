@@ -144,7 +144,7 @@ def test_the_cart_carries_the_engines_ledger_as_stored_and_the_stored_fee():
     # the shapes this test exists for: a zero line and a negative line, kept
     amounts = [item["amount"] for item in cart["line_items"]]
     assert 0 in amounts and min(amounts) < 0, amounts
-    assert "tax" not in cart, "a tax figure nobody computed went on the cart"
+    assert "tax" not in cart, "cart[tax] is set: the tax lines are line items, already in the total"
 
 
 def test_the_total_is_the_stored_fee_even_when_it_is_not_the_sum_of_the_lines():

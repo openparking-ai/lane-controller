@@ -91,6 +91,15 @@ jobs:
         # exit-decision suite to fail each time.
         run: python scripts/exit_decision_fail_control.py
 
+      - name: Exit-tax fail-control
+        # Breaks tax at the barrier (platform 0023) -- the quote drawn untaxed,
+        # the set chosen by the box's clock instead of the exit, a cache with
+        # no sets priced at no tax, the newest set read as the latest spelling,
+        # the sets merged instead of replaced or not kept on disk, a held
+        # validation put up after the lane's own tax or taken on the taxed fee
+        # -- and requires the exit-tax suite to fail each time.
+        run: python scripts/exit_tax_fail_control.py
+
       - name: Close-decision fail-control
         # Breaks the decision on the close -- the close carrying nothing, the
         # settle recording the last decision instead of the one it was

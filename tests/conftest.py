@@ -2243,3 +2243,108 @@ def _break_the_exit_fee(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_FEE mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# scripts/exit_tax_fail_control.py sets BREAK_EXIT_TAX and requires
+# tests/test_exit_tax.py to FAIL. A tax that has never been seen to be wrong
+# is not known to be right (platform 0023).
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_exit_tax(monkeypatch):
+    mode = os.environ.get("BREAK_EXIT_TAX")
+    if not mode:
+        return
+
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    from lane_controller import decision as decision_module
+    from lane_controller import exit_pricing as pricing_module
+    from lane_controller import reader as reader_module
+
+    if mode == "untaxed":
+        # The barrier draws the quote alone: no tax is taken.
+        monkeypatch.setattr(
+            pricing_module, "run_tax",
+            lambda request: (200, {"schema_version": 3, "lines": [], "total_minor": 0}),
+        )
+
+    elif mode == "chosen_by_the_clock":
+        # The set is chosen by the box's real clock, not by the exit instant.
+        original = pricing_module.run_tax
+
+        def by_the_clock(request):
+            return original({**request, "at": _datetime.now(_UTC).isoformat()})
+
+        monkeypatch.setattr(pricing_module, "run_tax", by_the_clock)
+
+    elif mode == "empty_taxed_at_zero":
+        # A cache holding no tax sets prices anyway, at no tax.
+        original = pricing_module.price_exit
+
+        def at_zero(identity_text, cache, *, now):
+            if not cache.tax_sets:
+                cache.tax_sets = [{"effective_from": "2000-01-01T00:00:00Z", "rules": []}]
+            return original(identity_text, cache, now=now)
+
+        monkeypatch.setattr(pricing_module, "price_exit", at_zero)
+
+    elif mode == "newest_by_text":
+        # The newest set is the latest SPELLING, not the latest instant.
+        def by_text(tax_sets):
+            newest = max(s["effective_from"] for s in tax_sets)
+            return {"count": len(tax_sets), "newest_effective_from": newest}
+
+        monkeypatch.setattr(pricing_module, "tax_sets_held", by_text)
+
+    elif mode == "sets_merged":
+        # A refresh merges the payload's sets into the cached ones.
+        original = decision_module.DecisionCache.load_payload
+
+        def merging(self, payload, *, now=None):
+            before = list(self.tax_sets)
+            original(self, payload, now=now)
+            self.tax_sets = before + [s for s in self.tax_sets if s not in before]
+
+        monkeypatch.setattr(decision_module.DecisionCache, "load_payload", merging)
+
+    elif mode == "sets_not_kept":
+        # The sets are not written to the disk the cache restores from.
+        original = decision_module.DecisionCache.state
+
+        def without_sets(self):
+            state = original(self)
+            state.pop("tax_sets", None)
+            return state
+
+        monkeypatch.setattr(decision_module.DecisionCache, "state", without_sets)
+
+    elif mode == "reader_keeps_lane_tax":
+        # A held validation is appended after the lane's own tax lines.
+        original = reader_module.with_validation
+
+        def keeping(record, answer):
+            shown = original(record, answer)
+            if shown is not None:
+                shown["breakdown"] = [*record["breakdown"], answer["line"], *answer["tax_lines"]]
+            return shown
+
+        monkeypatch.setattr(reader_module, "with_validation", keeping)
+
+    elif mode == "reader_claims_on_taxed":
+        # The reader takes an answer made on the TAXED fee as one about this record.
+        original = reader_module.with_validation
+
+        def on_taxed(record, answer):
+            taxed = record.get("fee_minor")
+            if isinstance(answer, dict) and answer.get("fee_before_minor") == taxed:
+                record = {**record, "subtotal_minor": record.get("fee_minor")}
+            return original(record, answer)
+
+        monkeypatch.setattr(reader_module, "with_validation", on_taxed)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_EXIT_TAX mode: {mode}")
