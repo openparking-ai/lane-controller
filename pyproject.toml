@@ -27,7 +27,7 @@ dependencies = [
   # the platform would compute are one computation. Standard-library only,
   # like everything else here. Pinned the same way and for the same reason;
   # `.github/scripts/check-rate-engine-pin.sh` holds it to main.
-  "openparking-rate-engine @ git+https://github.com/openparking-ai/rate-engine@e04c391beb680fd9db0b56d07f042ba29d91ad81",
+  "openparking-rate-engine @ git+https://github.com/openparking-ai/rate-engine@a4d4324c0c7e71e2fbe6fd66c15e4e1254f59329",
 ]
 
 [project.optional-dependencies]
