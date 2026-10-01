@@ -31,8 +31,9 @@ it and nothing in this package can charge at all.
     filtered: a zero line (the stay itself) and a negative one (a cap) are the
     engine's ledger too;
   * the total is the record's `fee_minor`, read, never added up;
-  * no `tax`: the engine states none, and a figure nobody computed is not put
-    on a screen;
+  * no `cart[tax]`: the engine's tax lines are ledger lines like any other
+    (platform 0023), shown as line items and already inside the total, and a
+    second place for the same money is what the one-ledger rule forbids;
   * the currency is the record's, lower-cased because the API takes it so.
 
 **Every state with no payment clears the reader** -- covered, a priced stay of
@@ -261,25 +262,50 @@ class PhonePrompt(Protocol):
     def ask(self, prompt: dict) -> str | None: ...
 
 
+#: The code every tax line carries (`rate_engine.tax`), and the only way a tax
+#: line is told from any other: by its code, never by its position.
+TAX_LINE_CODE = "tax.applied"
+
+
+def _whole(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def with_validation(record: dict, answer: dict | None) -> dict | None:
     """The record as the driver is shown it once a validation is HELD for the
-    stay: the platform's line appended to the ledger AS IT CAME and the fee the
-    PLATFORM'S fee after it, read. `None` when the answer is anything else, or
-    was made on a fee other than this record's -- a number this screen did not
-    show is not put up in its place."""
+    stay, in the ledger's one order (platform 0023): the record's BASE lines,
+    the platform's validation line, then the platform's tax lines on the
+    discounted subtotal -- each AS IT CAME -- and the fee the PLATFORM'S taxed
+    figure, read. The record's own tax lines, taken on the undiscounted fee,
+    are dropped: kept, they would be tax on money nobody pays.
+
+    `None` when the answer is anything else, was made on a subtotal other than
+    this record's, or does not add up (the subtotal after the discount plus its
+    tax lines is not the figure) -- a number this screen cannot account for is
+    not put up in its place."""
     if not isinstance(answer, dict) or answer.get("outcome") != "held":
         return None
     line, fee = answer.get("line"), answer.get("fee_minor")
-    if answer.get("fee_before_minor") != record.get("fee_minor"):
+    subtotal, tax_lines = answer.get("subtotal_minor"), answer.get("tax_lines")
+    if answer.get("fee_before_minor") != record.get("subtotal_minor"):
         return None
     if answer.get("currency") != record.get("currency"):
         return None
-    if not isinstance(line, dict) or isinstance(fee, bool) or not isinstance(fee, int) or fee < 0:
+    if not isinstance(line, dict) or not _whole(fee) or fee < 0 or not _whole(subtotal):
         return None
+    if not isinstance(tax_lines, list) or not all(
+        isinstance(t, dict) and t.get("code") == TAX_LINE_CODE and _whole(t.get("delta_minor"))
+        for t in tax_lines
+    ):
+        return None
+    if subtotal + sum(t["delta_minor"] for t in tax_lines) != fee:
+        return None
+    base = [entry for entry in record["breakdown"] if entry.get("code") != TAX_LINE_CODE]
     return {
         **record,
         "fee_minor": fee,
-        "breakdown": [*record["breakdown"], line],
+        "subtotal_minor": subtotal,
+        "breakdown": [*base, line, *tax_lines],
         "validation": {
             "held": True,
             "fee_before_minor": record["fee_minor"],

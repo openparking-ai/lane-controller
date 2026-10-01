@@ -53,15 +53,24 @@ def holds_phone(text: str) -> bool:
     return re.search(r"[\s().+-]{0,3}".join(DIGITS), text) is not None
 
 
-def held_answer(record: dict, *, discount: int = 200, fee_after: int | None = None) -> dict:
-    """The platform's answer for a held claim (platform `presentClaim`)."""
+def held_answer(record: dict, *, discount: int = 200, fee_after: int | None = None,
+                tax_lines: list | None = None) -> dict:
+    """The platform's answer for a held claim (platform `presentClaim`, 0023):
+    the claim on the record's PRE-TAX subtotal, the subtotal after it, the tax
+    the platform took on that, and the taxed figure the reader is told."""
+    subtotal = record["subtotal_minor"] - discount
+    taxes = tax_lines or []
     return {
         "outcome": "held",
         "replay": False,
         "currency": record["currency"],
-        "fee_before_minor": record["fee_minor"],
+        "fee_before_minor": record["subtotal_minor"],
         "discount_minor": discount,
-        "fee_minor": record["fee_minor"] - discount if fee_after is None else fee_after,
+        "subtotal_minor": subtotal,
+        "tax_lines": taxes,
+        "fee_minor": (
+            subtotal + sum(t["delta_minor"] for t in taxes) if fee_after is None else fee_after
+        ),
         "line": {"code": "validation", "rule_id": None, "delta_minor": -discount,
                  "text": "Validation from Example Name (2.00 USD off): -2.00 USD"},
         "held_at": "2026-09-23T17:00:00.000Z",
@@ -142,11 +151,16 @@ def test_a_phone_entered_is_claimed_first_and_the_amount_shown_is_the_discounted
 
 
 def test_the_fee_shown_is_the_platforms_read_not_one_the_lane_worked_out():
-    # A planted answer whose fee is NOT the record's fee minus the line: only a
-    # screen that READS the platform's fee shows 111.
+    # A planted answer whose fee is NOT the record's subtotal minus the line
+    # (500 - 200): the platform's own subtotal and tax lines, which add up to
+    # 111 as an answer must. Only a screen that READS the platform's figure
+    # shows 111.
     record = priced_record()
     inner = RecordingReader()
-    claims = Claims(lambda r: held_answer(r, fee_after=111))
+    tax = {"code": "tax.applied", "rule_id": "city", "text": "City parking tax", "delta_minor": 11}
+    claims = Claims(
+        lambda r: {**held_answer(r), "subtotal_minor": 100, "tax_lines": [tax], "fee_minor": 111}
+    )
     ValidatingScreen(inner, Prompt(PHONE), claims).present_exit(record)
     assert cart_for(inner.shown[0])["total"] == 111
 
@@ -186,6 +200,11 @@ def test_an_answer_made_on_another_fee_is_not_put_up_in_place_of_this_one():
     assert with_validation(record, other) is None
     assert with_validation(record, {**held_answer(record), "currency": "EUR"}) is None
     assert with_validation(record, {**held_answer(record), "fee_minor": -1}) is None
+    # Its own figures do not add up: the subtotal after the discount plus its
+    # tax lines is not the figure it names.
+    assert with_validation(record, held_answer(record, fee_after=111)) is None
+    # CONTROL: the same answer adding up is put up.
+    assert with_validation(record, held_answer(record))["fee_minor"] == 300
     inner = RecordingReader()
     ValidatingScreen(inner, Prompt(PHONE), Claims(other)).present_exit(record)
     assert inner.shown == [record]

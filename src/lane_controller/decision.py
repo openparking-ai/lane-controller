@@ -151,6 +151,13 @@ class DecisionCache:
         # `rate_engine.quote` takes.
         self.plans: list = []
         self.space_class: str | None = None
+        # The garage's tax sets, WHOLE, as `rate_engine.contract.run_tax`
+        # takes them (platform 0023). Replaced on every refresh and never
+        # merged: the count and the newest instant the exit reports with a
+        # priced decision describe every set this copy holds, which is what
+        # the platform judges a stale copy by. Empty is a stale cache for
+        # pricing, never a stay taxed at zero.
+        self.tax_sets: list = []
         # Each entitlement module's register, verbatim, keyed by module. A
         # module is REPLACED only when the payload carries its `register`: a
         # module the platform could not read (`unavailable`, no `register`)
@@ -206,6 +213,7 @@ class DecisionCache:
             "refreshed_at": self._refreshed_at,
             "plans": self.plans,
             "space_class": self.space_class,
+            "tax_sets": self.tax_sets,
             "entitlements": self.entitlements,
             "entitlements_complete": self.entitlements_complete,
             "stays": self.stays,
@@ -241,6 +249,7 @@ class DecisionCache:
         self._refreshed_at = float(state["refreshed_at"])
         self.plans = list(state.get("plans") or [])
         self.space_class = state.get("space_class")
+        self.tax_sets = list(state.get("tax_sets") or [])
         self.entitlements = dict(state.get("entitlements") or {})
         self.entitlements_complete = state.get("entitlements_complete")
         self.stays = dict(state.get("stays") or {})
@@ -260,6 +269,7 @@ class DecisionCache:
         self.default_action = None
         self.plans = []
         self.space_class = None
+        self.tax_sets = []
         self.entitlements = {}
         self.entitlements_complete = None
         self.stays = {}
@@ -292,8 +302,8 @@ class DecisionCache:
     def load_payload(self, payload: dict, *, now: float | None = None) -> None:
         """Everything `GET /lane/rules` carries, in one replacement.
 
-        The plate rules and the default action as `load` takes them; the plans
-        and the space class whole; the entitlements per module by the rule
+        The plate rules and the default action as `load` takes them; the plans,
+        the tax sets and the space class whole; the entitlements per module by the rule
         above (`register` present -> replaced, absent -> kept); and the open
         stays as a full set with their cursor, replacing whatever the deltas
         had built -- the slow cadence is the resync that bounds what a delta
@@ -306,6 +316,7 @@ class DecisionCache:
         self.load(rules, default_action=payload.get("default_action"), now=now)
         self.plans = list(payload.get("rate_plans") or [])
         self.space_class = payload.get("space_class")
+        self.tax_sets = list(payload.get("tax_sets") or [])
         self.timezone = payload.get("timezone")
         self.currency = payload.get("currency")
         facts = payload.get("entitlements") or {}

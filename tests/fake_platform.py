@@ -43,6 +43,10 @@ class FakePlatform:
         #: What `get_rules` and `get_stays` serve (platform 0016), and what a
         #: test moves to make a delta.
         self.rate_plans: list[dict] = [{"plan_version": "flat-250-USD", "currency": "USD"}]
+        #: The garage's tax sets as platform 0023 serves them. By default one
+        #: set stating NO tax -- what a garage that charges none states -- so
+        #: every fee here is the engine's quote alone unless a test says more.
+        self.tax_sets: list[dict] = [{"effective_from": "2000-01-01T00:00:00.000000Z", "rules": []}]
         self.entitlements: dict = {"complete": True,
                                    "garage_pass": {"consulted": False, "reason": "not linked"},
                                    "monthly_billing": {"consulted": False, "reason": "not linked"}}
@@ -61,7 +65,8 @@ class FakePlatform:
     def get_rules(self) -> dict:
         """The payload as platform 0016 serves it: the plans whole, the space
         class, each module's register (or its unavailability), the open stays
-        with their cursor. `hourly_minor` is gone from the real one and is
+        with their cursor -- and since 0023 the tax sets, whole. `hourly_minor`
+        is gone from the real one and is
         gone from here."""
         self._check()
         self.rules_reads += 1
@@ -72,6 +77,7 @@ class FakePlatform:
             "default_action": self.default_action,
             "active": True,
             "rate_plans": list(self.rate_plans),
+            "tax_sets": list(self.tax_sets),
             "entitlements": {"read_at": "2026-09-21T00:00:00Z", **self.entitlements},
             "stays": {"cursor": str(self.cursor), "open": [s for s in self.stays if s["open"]]},
             "synced_at": "2026-09-21T00:00:00Z",
