@@ -8,10 +8,9 @@ lane DOES with the record it is handed, which is the part that opens a barrier.
 
 from __future__ import annotations
 
-from vehicle_id.contract import ANSWER, FALLBACK, Engine, Identity, Read
-
 from lane_controller import DecisionCache, Fallback, Frame, Outcome, decide
 from lane_controller.vehicle_id_client import VehicleIdClient
+from lane_controller.vehicle_id_contract import ANSWER, FALLBACK, Engine, Identity, Read
 
 
 def a_frame(camera_id: str = "lane-1") -> Frame:

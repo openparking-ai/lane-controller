@@ -1688,6 +1688,11 @@ def _break_the_exit_decision(monkeypatch):
         # The camera's spelling and the registrar's must match byte for byte.
         monkeypatch.setattr(decision_module, "normalise_identity", lambda text: text)
 
+    elif mode == "slow_identifier":
+        # The identification service answers slower than the one-second bound.
+        # Applied by the stand-in service in tests/test_exit_decision.py itself.
+        pass
+
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_DECISION mode: {mode}")
 

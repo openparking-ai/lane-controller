@@ -21,14 +21,9 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: ruff check .
 
-      - name: The vehicle-id pin names a commit on vehicle-id main
-        # A pin to a feature-branch commit resolves until that branch is
-        # deleted and then breaks `pip install` for everyone. The comment in
-        # pyproject.toml saying so was not a check; this is.
-        run: bash .github/scripts/check-vehicle-id-pin.sh
-
       - name: The rate-engine pin names a commit on rate-engine main
-        # The same rule for the second pinned contract: the exit's local
+        # A pin to a feature-branch commit resolves until that branch is
+        # deleted and then breaks `pip install` for everyone. The exit's local
         # pricing runs the engine in-process, from a commit that must exist
         # on the engine's main.
         run: bash .github/scripts/check-rate-engine-pin.sh

@@ -3,9 +3,10 @@
 Vehicle ID is a separate system with its own contract, and this lane is an
 ORDINARY CLIENT of it -- the same door a third party uses. There is no
 in-process path reserved for us, and there is deliberately no import of the
-engine anywhere in this package: only `vehicle_id.contract`, which is the
-public record shape and nothing else. `tests/test_vehicle_id_boundary.py`
-enforces that, and fails if it is ever untrue.
+engine anywhere in this package: only the contract, which is the public
+record shape and nothing else, and which this package carries as its own copy
+(`vehicle_id_contract`). `tests/test_vehicle_id_boundary.py` enforces that,
+and fails if it is ever untrue.
 
 Local, not remote. The default address is loopback, because identification runs
 on the same device and the lane has to work with the internet
@@ -42,9 +43,8 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 
-from vehicle_id.contract import Read
-
 from .interfaces import Frame, Unavailable, VehicleIdentity
+from .vehicle_id_contract import Read
 
 log = logging.getLogger(__name__)
 

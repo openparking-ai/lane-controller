@@ -19,7 +19,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
-from vehicle_id.contract import ANSWER, SCHEMA_VERSION, Engine, Identity, Read
 
 from lane_consumer import LaneConsumer
 from lane_controller import (
@@ -86,6 +85,7 @@ from lane_controller.simulated import (
 from lane_controller.sync import SESSION_OPEN as SESSION_OPEN_KIND
 from lane_controller.sync import PlatformTransport
 from lane_controller.vehicle_id_client import VehicleIdClient
+from lane_controller.vehicle_id_contract import ANSWER, SCHEMA_VERSION, Engine, Identity, Read
 from serving import serving
 
 CONTRACT_DOC = Path(__file__).resolve().parent.parent / "docs" / "CONTRACT.md"
@@ -1251,7 +1251,7 @@ def test_every_closed_set_value_in_the_document_is_a_member_of_that_set():
 
 
 def test_read_ref_on_the_state_route_is_the_engines_own_read_id():
-    """Driven against a real `vehicle_id.contract.Read`, through a real client.
+    """Driven against a real contract `Read` (`vehicle_id_contract`), through a real client.
 
     "Resolves" means what the Vehicle ID contract can support: the value equals
     the `read_id` of a record the consumer has already received. That engine
