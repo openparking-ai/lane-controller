@@ -11,6 +11,7 @@ is not known to decide rightly.
   platform_on_the_path  the exit asks the platform before it decides.
   plate_in_the_record   the decision event names the plate.
   no_folding            the camera's spelling must match the registrar's.
+  slow_identifier       the identification service answers over the second.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ BREAKAGES = [
     ("platform_on_the_path", "the exit asks the platform before it decides"),
     ("plate_in_the_record", "the decision event names the plate"),
     ("no_folding", "the camera's spelling must match the registrar's"),
+    ("slow_identifier", "the identification service answers over the second"),
 ]
 
 

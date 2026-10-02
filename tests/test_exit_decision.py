@@ -19,10 +19,12 @@ not here.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
 from datetime import UTC, date, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -448,25 +450,29 @@ def test_the_local_decision_travels_to_the_platform_on_the_decision_event():
 
 
 class StubReader:
-    """An engine for the REAL Vehicle ID service: the contract's `Read`, from
-    a plate this test chooses. The plate recogniser needs torch; the service
-    around it does not, and the service is what the lane talks to."""
+    """The engine behind the stand-in Vehicle ID service: the contract's
+    `Read`, from a plate this test chooses."""
 
     def __init__(self, plate: str):
-        from vehicle_id.contract import Engine
+        from lane_controller.vehicle_id_contract import Engine
 
         self.plate = plate
         self.engine = Engine(name="stub-for-the-lane", version="0", weights_id=None)
         self.threshold = 0.5
-        self.camera_faults: dict = {}
 
     def read(self, captures):
-        from vehicle_id.contract import ANSWER, Identity, Read, new_read_id, utc_now
+        from lane_controller.vehicle_id_contract import (
+            ANSWER,
+            Identity,
+            Read,
+            new_read_id,
+            utc_now,
+        )
 
         return Read(
             read_id=new_read_id(),
-            captured_at=captures[0].captured_at if captures else utc_now(),
-            camera_id=captures[0].camera_id if captures else "unknown",
+            captured_at=captures[0]["captured_at"] if captures else utc_now(),
+            camera_id=captures[0]["camera_id"] if captures else "unknown",
             identity=Identity(plate=self.plate),
             confidence=0.99,
             engine=self.engine,
@@ -476,12 +482,43 @@ class StubReader:
         )
 
 
+#: How much later than the bound the stand-in answers under the
+#: `slow_identifier` break (scripts/exit_decision_fail_control.py).
+SLOW_BY = 0.25
+
+
+def _stand_in_vehicle_id(reader: StubReader) -> ThreadingHTTPServer:
+    """A Vehicle ID service on loopback, speaking the contract's `POST
+    /v1/reads`: a JSON body of captures in, `{"cursor", "read"}` out, the
+    shape the lane's client parses. The lane makes the same real HTTP call it
+    makes to the real service; that the real service answers it this way is
+    proven where the real service lives."""
+    slow = os.environ.get("BREAK_EXIT_DECISION") == "slow_identifier"
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_POST(self):  # noqa: N802  (http.server's spelling)
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length))
+            if slow:
+                time.sleep(ONE_SECOND + SLOW_BY)
+            read = reader.read(body["captures"])
+            payload = json.dumps({"cursor": 1, "read": read.to_dict()}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+
+
 @pytest.fixture
 def vehicle_id_on_loopback():
-    from vehicle_id.service import VehicleIdService, make_server
-
     reader = StubReader("PASS-1")
-    server = make_server(VehicleIdService(reader), host="127.0.0.1", port=0)
+    server = _stand_in_vehicle_id(reader)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -562,7 +599,7 @@ def test_no_platform_call_on_the_barriers_path_with_vehicle_id_live_on_loopback(
                 identifier=VehicleIdClient(f"http://127.0.0.1:{port}"), cache=cache,
                 events=EventQueue(PlatformTransport(dead_platform)), clock=lambda: NOW,
             )
-            del identity  # the plate comes back from the REAL service, not from a stub
+            del identity  # the plate comes back over HTTP from the service, not from a stub
             started = time.perf_counter()
             decision = controller.run_once()
             finished = time.perf_counter()

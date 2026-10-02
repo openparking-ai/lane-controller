@@ -56,8 +56,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from vehicle_id.contract import SCHEMA_VERSION
-
 from .contract import (
     CONTRACT_VERSION,
     Capabilities,
@@ -76,6 +74,7 @@ from .interfaces import Unavailable
 from .reader import exit_fee_for
 from .sync import to_iso
 from .vehicle_id_client import VehicleIdClient
+from .vehicle_id_contract import SCHEMA_VERSION
 from .vend import AssistedVend, BadVendRequest
 from .vend import parse as parse_vend
 

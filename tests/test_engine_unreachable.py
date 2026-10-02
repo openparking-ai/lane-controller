@@ -26,7 +26,6 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from vehicle_id.contract import ANSWER, FALLBACK, Engine, Identity, Read
 
 from lane_controller import (
     CameraConfig,
@@ -56,6 +55,7 @@ from lane_controller.vehicle_id_client import (
     CAUSE_UNREACHABLE,
     VehicleIdClient,
 )
+from lane_controller.vehicle_id_contract import ANSWER, FALLBACK, Engine, Identity, Read
 
 THRESHOLD = 0.85
 
