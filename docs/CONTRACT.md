@@ -62,9 +62,10 @@ lane, and must not read its absence as `false`.
 - **An unrecognised version is refused, not partially read.** Half-understanding
   a payload about a vehicle is worse than admitting you cannot read it.
 
-This is the same policy the [Vehicle ID
-contract](https://github.com/openparking-ai/vehicle-id/blob/main/docs/CONTRACT.md)
-states, in the same words, so one consumer can hold one policy for both.
+This is the same policy the Vehicle ID contract states, in the same words, so
+one consumer can hold one policy for both. That service's repository is not
+public; the lane's copy of its contract is
+`src/lane_controller/vehicle_id_contract.py`.
 
 ---
 

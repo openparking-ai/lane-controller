@@ -275,11 +275,12 @@ python scripts/deactivate_fail_control.py    # breaks the deactivate loop's hold
 
 ## Vehicle ID
 
-Identification is a **separate system**: [openparking-ai/vehicle-id](https://github.com/openparking-ai/vehicle-id).
+Identification is a **separate system**, and its repository is not public.
 This lane is an ordinary client of its contract — the same interface a third
-party integrating their own system uses. There is no in-process path reserved
-for us, and `tests/test_vehicle_id_boundary.py` fails if this package ever
-imports anything from that one except its public contract.
+party integrating their own system uses. The lane carries its own copy of that
+contract (`src/lane_controller/vehicle_id_contract.py`); there is no
+in-process path reserved for us, and `tests/test_vehicle_id_boundary.py` fails
+if this package ever imports anything from the identity service's package.
 
 ```sh
 # in the vehicle-id repository, on the same device
@@ -322,9 +323,8 @@ None of it is required to run this package, and none of it has been purchased ye
 
 RTSP and PoE are required for any camera.
 
-Vehicle ID runs in its own process on the Jetson, beside this one — see
-[openparking-ai/vehicle-id](https://github.com/openparking-ai/vehicle-id). The
-platform server is Node/Express/Postgres — see
+Vehicle ID runs in its own process on the Jetson, beside this one; its
+repository is not public. The platform server is Node/Express/Postgres — see
 [openparking-ai/platform](https://github.com/openparking-ai/platform).
 
 ## Licence and contributing
