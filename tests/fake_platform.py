@@ -55,6 +55,24 @@ class FakePlatform:
         self.stay_page = 500
         self.rules_reads = 0
         self.stays_reads: list[str | None] = []
+        #: This lane's closing and board (platform 0026, 0030), served on BOTH
+        #: reads when set, as the real platform does. `None` serves neither
+        #: field -- a platform older than them.
+        self.lane: dict | None = None
+        self.board: dict | None = None
+        #: When True, `get_stays` leaves both out: a platform that carries them
+        #: on the slow read only. The fail-control's plant, and a test's.
+        self.lane_on_slow_read_only = False
+
+    def _lane_fields(self, *, fast: bool) -> dict:
+        if fast and self.lane_on_slow_read_only:
+            return {}
+        fields = {}
+        if self.lane is not None:
+            fields["lane"] = dict(self.lane)
+        if self.board is not None:
+            fields["board"] = dict(self.board)
+        return fields
 
     # -- the PlatformClient surface ---------------------------------------
 
@@ -81,6 +99,7 @@ class FakePlatform:
             "entitlements": {"read_at": "2026-09-21T00:00:00Z", **self.entitlements},
             "stays": {"cursor": str(self.cursor), "open": [s for s in self.stays if s["open"]]},
             "synced_at": "2026-09-21T00:00:00Z",
+            **self._lane_fields(fast=False),
         }
 
     def get_stays(self, since: str | None = None) -> dict:
@@ -89,14 +108,16 @@ class FakePlatform:
         self._check()
         self.stays_reads.append(since)
         if since is None:
-            return {"cursor": str(self.cursor), "open": [s for s in self.stays if s["open"]]}
+            return {"cursor": str(self.cursor), "open": [s for s in self.stays if s["open"]],
+                    **self._lane_fields(fast=True)}
         if not since.isdigit():
             raise PlatformRejected(400, "since must be a cursor this route handed out")
         changed = [s for s in self.stays if int(s["change_seq"]) > int(since)]
         page = changed[: self.stay_page]
         more = len(changed) > self.stay_page
         cursor = page[-1]["change_seq"] if page else since
-        return {"since": since, "cursor": cursor, "changes": page, "more": more}
+        return {"since": since, "cursor": cursor, "changes": page, "more": more,
+                **self._lane_fields(fast=True)}
 
     # -- the stays the fake holds, and how a test moves them ------------------
 

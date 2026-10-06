@@ -56,13 +56,16 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from .board import board_items
 from .contract import (
     CONTRACT_VERSION,
+    Board,
     Capabilities,
     EventPage,
     ExitFee,
     HealthEntry,
     HealthState,
+    LaneClosing,
     LaneDescription,
     LaneHealth,
     LaneState,
@@ -70,6 +73,7 @@ from .contract import (
     MalfunctionCode,
     Transit,
 )
+from .decision import closed_to
 from .interfaces import Unavailable
 from .reader import exit_fee_for
 from .sync import to_iso
@@ -377,7 +381,17 @@ class LaneService:
                 since=controller.transit_since,
             ),
             exit_fee=self.exit_fee(),
+            lane=self.closing(),
+            board=Board(items=tuple(board_items(controller.cache, now=controller.now()))),
         )
+
+    def closing(self) -> LaneClosing:
+        """Whether the owner has closed this lane, as the barrier ACTS on it."""
+        cache = self.controller.cache
+        closed = closed_to(cache, self.controller.config.direction)
+        if closed is None:
+            return LaneClosing(state="open")
+        return LaneClosing(state="closed", reason=closed, message=cache.lane.get("message"))
 
     def exit_fee(self) -> ExitFee | None:
         """The fee in front of the driver at this exit, from what the reader was

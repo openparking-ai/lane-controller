@@ -51,6 +51,72 @@ class Fallback(StrEnum):
     #: lane's response is the same for all of them (a human, never a guess) and
     #: a member per cause would be a set of codes nobody can act on differently.
     ENGINE_UNREACHABLE = "engine_unreachable"
+    #: THE OWNER CLOSED THIS LANE, and the car in front of it is not one the
+    #: closing lets in: closed to everyone, or closed `full` and no pass or
+    #: monthly register covers this car today. The lane opens for it by
+    #: nobody's say but a person's -- `human_open_now` or `human_open_and_flag`
+    #: through `POST /v1/lane/vend`, so a driver can always get help. A display
+    #: code does not complete it (`vend.py`), because a ticket is a driver
+    #: serving themselves and a closing is the owner saying they may not.
+    LANE_CLOSED = "lane_closed"
+
+
+#: A lane nobody has closed. What a cache holds until the platform says
+#: otherwise, and what it goes back to when it holds nothing.
+OPEN_LANE: dict = {"state": "open", "reason": None, "message": None, "closed_at": None}
+
+#: The closing reasons this lane acts on. `full` lets in a car a register covers
+#: today and nobody else; `everyone` lets in nobody. ANY OTHER CLOSED STATE --
+#: a reason this build does not know, or `full` at an exit, which the platform
+#: refuses -- is acted on as `everyone`: a person still opens it, and a closing
+#: read as less than it says would let in the cars the owner closed it to.
+CLOSED_FULL = "full"
+CLOSED_EVERYONE = "everyone"
+
+
+def lane_from_payload(value) -> dict | None:
+    """The `lane` object as the platform sends it, or None when it is not one.
+
+    `None` means "the payload said nothing this build can read": the caller
+    keeps what it holds rather than reading a malformed answer as open.
+    """
+    if not isinstance(value, dict):
+        return None
+    if value.get("state") == "open":
+        return dict(OPEN_LANE)
+    if value.get("state") != "closed":
+        return None
+    reason, message = value.get("reason"), value.get("message")
+    if not isinstance(reason, str) or not isinstance(message, str):
+        return None
+    closed_at = value.get("closed_at")
+    return {
+        "state": "closed",
+        "reason": reason,
+        "message": message,
+        "closed_at": closed_at if isinstance(closed_at, str) else None,
+    }
+
+
+def board_from_payload(value) -> dict | None:
+    """The `board` object as the platform sends it, or None when it is not one.
+
+    Only the fields this lane uses are kept; a message without readable text is
+    dropped rather than shown as something else.
+    """
+    if not isinstance(value, dict):
+        return None
+    messages = []
+    for item in value.get("messages") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        messages.append({
+            "id": item.get("id") if isinstance(item.get("id"), str) else None,
+            "text": item["text"],
+            "starts_at": item.get("starts_at") if isinstance(item.get("starts_at"), str) else None,
+            "ends_at": item.get("ends_at") if isinstance(item.get("ends_at"), str) else None,
+        })
+    return {"prices": value.get("prices") is True, "messages": messages}
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +244,15 @@ class DecisionCache:
         # in the garage's currency.
         self.timezone: str | None = None
         self.currency: str | None = None
+        # THIS LANE, OPEN OR CLOSED BY THE OWNER, and the owner's board for
+        # it (platform 0026, 0030). Both ride the FAST read as well as the
+        # slow one, so a closing reaches the barrier inside one stays cadence;
+        # both are kept on disk with the rest of the cache, under the same
+        # bound, so a lane that restarts offline still obeys the last closing
+        # it was told about. Past the bound the cache holds nothing -- and an
+        # empty cache is a lane falling back on every plate anyway.
+        self.lane: dict = dict(OPEN_LANE)
+        self.board: dict = {"prices": False, "messages": []}
         # THE TWO INDEXES THE EXIT READS ON THE BARRIER'S PATH, rebuilt whole
         # on every change so the read is one dict lookup and never a scan:
         # identity -> the register rows that name it, per module; identity ->
@@ -221,6 +296,8 @@ class DecisionCache:
             "stays_refreshed_at": self.stays_refreshed_at,
             "timezone": self.timezone,
             "currency": self.currency,
+            "lane": self.lane,
+            "board": self.board,
         }
 
     def _persist(self) -> None:
@@ -257,6 +334,8 @@ class DecisionCache:
         self.stays_refreshed_at = state.get("stays_refreshed_at")
         self.timezone = state.get("timezone")
         self.currency = state.get("currency")
+        self.lane = lane_from_payload(state.get("lane")) or dict(OPEN_LANE)
+        self.board = board_from_payload(state.get("board")) or {"prices": False, "messages": []}
         self._reindex_coverage()
         self._reindex_stays()
         return True
@@ -277,6 +356,8 @@ class DecisionCache:
         self.stays_refreshed_at = None
         self.timezone = None
         self.currency = None
+        self.lane = dict(OPEN_LANE)
+        self.board = {"prices": False, "messages": []}
         self._coverage_index = {}
         self._stay_index = {}
         if self._store is not None:
@@ -325,10 +406,32 @@ class DecisionCache:
                 self.entitlements[module] = fact
         self.entitlements_complete = facts.get("complete")
         self._reindex_coverage()
+        self._take_lane(payload)
         stays = payload.get("stays") or {}
         if "cursor" in stays:
             self.replace_stays(stays.get("open") or [], stays["cursor"], now=now)
         self._persist()
+
+    def _take_lane(self, answer: dict) -> bool:
+        """This lane's closing and board, from either read, when the answer
+        carries them. A field the answer does not carry, or carries in a shape
+        this build cannot read, leaves what the cache holds: a platform older
+        than the closing says nothing, and saying nothing is not reopening.
+        True if either changed."""
+        changed = False
+        lane = lane_from_payload(answer.get("lane"))
+        if lane is not None and lane != self.lane:
+            self.lane, changed = lane, True
+        board = board_from_payload(answer.get("board"))
+        if board is not None and board != self.board:
+            self.board, changed = board, True
+        return changed
+
+    def apply_lane(self, answer: dict) -> None:
+        """The fast read's copy of this lane's closing and board, applied and
+        kept on disk. `sync_stays` calls it with every answer it is given."""
+        if self._take_lane(answer):
+            self._persist()
 
     def replace_stays(
         self, open_stays: list[dict], cursor: str, *, now: float | None = None
@@ -404,12 +507,25 @@ class DecisionCache:
         return len(self._rules)
 
 
+def closed_to(cache: DecisionCache, direction: str | None) -> str | None:
+    """How this lane is closed, as it ACTS on it: `full`, `everyone`, or None
+    when it is open. `full` is an entry reason; anywhere else, and for a reason
+    this build does not know, the lane acts as closed to everyone."""
+    if cache.lane.get("state") != "closed":
+        return None
+    if cache.lane.get("reason") == CLOSED_FULL and direction != "exit":
+        return CLOSED_FULL
+    return CLOSED_EVERYONE
+
+
 def decide(
     identity: VehicleIdentity,
     cache: DecisionCache,
     *,
     confidence_threshold: float,
     now: float | None = None,
+    direction: str | None = None,
+    day_at: float | None = None,
 ) -> Decision:
     """Turn an identification into a decision, or into an honest refusal.
 
@@ -428,6 +544,20 @@ def decide(
             outcome=Outcome.NO_VEHICLE,
             reason="no vehicle present; refusing to transact",
             identity=identity,
+        )
+
+    closed = closed_to(cache, direction)
+    if closed == CLOSED_EVERYONE:
+        # CLOSED TO EVERYONE: nothing about the car can open it, so nothing
+        # about the car is asked. Not a covered car, not a paid one, not a
+        # read that failed -- a person's word through the intercom is the one
+        # way through, and the driver is told the lane is closed rather than
+        # that their plate was unclear.
+        return Decision(
+            outcome=Outcome.FALLBACK,
+            reason="this lane is closed to everyone",
+            identity=identity,
+            fallback=Fallback.LANE_CLOSED,
         )
 
     if identity.unavailable is not None:
@@ -476,6 +606,31 @@ def decide(
             reason="cached rules are stale",
             identity=identity,
             fallback=Fallback.STALE_RULES,
+        )
+
+    if closed == CLOSED_FULL:
+        # FULL: a car a pass or monthly register covers TODAY gets in as on any
+        # day -- the same lookup, on the same local day, that the exit's
+        # covered decision makes -- and every other car does not. Only a car
+        # this lane has IDENTIFIED reaches here; one it could not identify fell
+        # back above, to a person, as it does on any day.
+        from .exit_pricing import local_day, register_cover
+
+        # The LANE'S clock for the day, as the exit reads it (`price_exit` is
+        # handed `controller.now()`); staleness above stays on `now`.
+        current = day_at if day_at is not None else (time.time() if now is None else now)
+        covered_by, _ = register_cover(identity.plate, cache, local_day(current, cache.timezone)[0])
+        if covered_by:
+            return Decision(
+                outcome=Outcome.ALLOW,
+                reason="this lane is closed full; a pass or monthly register covers this car",
+                identity=identity,
+            )
+        return Decision(
+            outcome=Outcome.FALLBACK,
+            reason="this lane is closed full; no pass or monthly register covers this car",
+            identity=identity,
+            fallback=Fallback.LANE_CLOSED,
         )
 
     rule = cache.lookup(identity.plate)

@@ -2353,3 +2353,154 @@ def _break_the_exit_tax(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_TAX mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the closing-and-board fail-control (U4c).
+#
+# scripts/closing_fail_control.py sets BREAK_CLOSING and requires
+# tests/test_lane_closing.py to FAIL. A lane nobody has seen open for a car it
+# was closed to is not known to keep it out.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_closing(monkeypatch):
+    mode = os.environ.get("BREAK_CLOSING")
+    if not mode:
+        return
+
+    from lane_controller import board as board_module
+    from lane_controller import controller as controller_module
+    from lane_controller import decision as decision_module
+    from lane_controller import exit_pricing as pricing_module
+    from lane_controller import vend as vend_module
+    from lane_controller.contract import VendRefusal, VendRefused
+
+    original_closed_to = decision_module.closed_to
+
+    if mode == "closed_test_dropped":
+        # 1: the decision no longer asks whether the lane is closed.
+        monkeypatch.setattr(decision_module, "closed_to", lambda cache, direction: None)
+
+    elif mode == "display_code_opens":
+        # 1: the vend route lets a display code complete at a closed lane.
+        monkeypatch.setattr(vend_module, "closed_to", lambda cache, direction: None)
+
+    elif mode == "full_lets_uncovered_in":
+        # 2: `full` is read as open, so a car no register covers gets in.
+        monkeypatch.setattr(
+            decision_module, "closed_to",
+            lambda cache, direction: None
+            if original_closed_to(cache, direction) == decision_module.CLOSED_FULL
+            else original_closed_to(cache, direction),
+        )
+
+    elif mode == "full_refuses_register":
+        # 2: `full` is read as everyone, so a register car is turned away.
+        monkeypatch.setattr(
+            decision_module, "closed_to",
+            lambda cache, direction: decision_module.CLOSED_EVERYONE
+            if original_closed_to(cache, direction) is not None
+            else None,
+        )
+
+    elif mode == "person_refused":
+        # 3: a person's word is refused at a closed lane too.
+        original_refuse = vend_module.AssistedVend._refuse
+
+        def refuse(self, request):
+            if vend_module.closed_to(self._service.controller.cache, None) is not None:
+                return VendRefused(code=VendRefusal.NOT_COMPLETABLE.value, error="closed")
+            return original_refuse(self, request)
+
+        monkeypatch.setattr(vend_module.AssistedVend, "_refuse", refuse)
+
+    elif mode == "closed_exit_publishes_fee":
+        # 4: a closed exit puts the fee on the reader anyway.
+        original_show = controller_module.LaneController.show_reader
+
+        def show(self, record):
+            identity = getattr(self.last_decision, "identity", None)
+            if record is None and self.config.direction == "exit" and identity is not None \
+                    and identity.plate:
+                record = pricing_module.price_exit(identity.plate, self.cache,
+                                                   now=self.now()).to_detail()
+            return original_show(self, record)
+
+        monkeypatch.setattr(controller_module.LaneController, "show_reader", show)
+
+    elif mode == "slow_read_only":
+        # 5: the closing is carried on the slow read only -- the platform's
+        # half of the guarantee, planted where this suite's platform serves it.
+        import fake_platform
+
+        original_fields = fake_platform.FakePlatform._lane_fields
+        monkeypatch.setattr(
+            fake_platform.FakePlatform, "_lane_fields",
+            lambda self, *, fast: {} if fast else original_fields(self, fast=False),
+        )
+
+    elif mode == "fast_read_ignored":
+        # 5: the lane's half -- the fast read carries the closing and the lane
+        # drops it on the floor.
+        monkeypatch.setattr(decision_module.DecisionCache, "apply_lane", lambda self, answer: None)
+
+    elif mode == "closing_not_persisted":
+        # 6: the closing and the board are left out of what goes to disk.
+        original_state = decision_module.DecisionCache.state
+
+        def without_the_lane(self):
+            state = original_state(self)
+            return {k: v for k, v in state.items() if k not in ("lane", "board")}
+
+        monkeypatch.setattr(decision_module.DecisionCache, "state", without_the_lane)
+
+    elif mode == "plate_in_the_refusal":
+        # 11: the refusal names the car it turned away.
+        original_decide = decision_module.decide
+
+        def decide(identity, cache, **kwargs):
+            decision = original_decide(identity, cache, **kwargs)
+            if decision.fallback is decision_module.Fallback.LANE_CLOSED:
+                from dataclasses import replace
+
+                return replace(decision, reason=f"{decision.reason}: {identity.plate}")
+            return decision
+
+        monkeypatch.setattr(controller_module, "decide", decide)
+
+    elif mode == "end_time_ignored":
+        # 13: a message stays up past the end the owner gave it.
+        def in_force(message, now):
+            return board_module.__dict__["_original_in_force"]({**message, "ends_at": None}, now)
+
+        monkeypatch.setitem(board_module.__dict__, "_original_in_force", board_module.in_force)
+        monkeypatch.setattr(board_module, "in_force", in_force)
+
+    elif mode == "board_untaxed":
+        # 14: the board shows the quote without the tax.
+        original_charge = board_module.charge
+
+        def untaxed(cache, entry_at, exit_at):
+            status, quote, tax = original_charge(cache, entry_at, exit_at)
+            return status, quote, ({**tax, "total_minor": 0} if status == 200 else tax)
+
+        monkeypatch.setattr(board_module, "charge", untaxed)
+
+    elif mode == "plan_not_in_force":
+        # 14: the board prices from the newest plan, in force or not.
+        original_charge = board_module.charge
+
+        def newest_plan(cache, entry_at, exit_at):
+            held = cache.plans
+            cache.plans = held[-1:]
+            try:
+                return original_charge(cache, entry_at, exit_at)
+            finally:
+                cache.plans = held
+
+        monkeypatch.setattr(board_module, "charge", newest_plan)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_CLOSING mode: {mode}")

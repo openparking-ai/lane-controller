@@ -46,7 +46,7 @@ from dataclasses import dataclass, replace
 
 from .config import LaneConfig
 from .contract import TransitState
-from .decision import Decision, DecisionCache, Outcome, decide
+from .decision import Decision, DecisionCache, Fallback, Outcome, closed_to, decide
 from .events import EventQueue
 from .exit_pricing import price_exit
 from .interfaces import (
@@ -490,6 +490,8 @@ class LaneController:
             identity,
             self.cache,
             confidence_threshold=self.config.confidence_threshold,
+            direction=self.config.direction,
+            day_at=self.now(),
         )
         if self.config.direction == "exit" and decision.should_vend and identity.plate:
             # THE EXIT'S LOCAL DECISION, BEFORE THE BARRIER MOVES: covered from
@@ -597,6 +599,15 @@ class LaneController:
                 # reader that takes the number without this field is reading a
                 # marginal plate that does not exist.
                 cause=identity.unavailable,
+                # A LANE THE OWNER CLOSED, and how: `full` or `everyone`, as
+                # the lane acted on it. This event is the one record of an
+                # arrival the closing turned away, so it says so -- and, like
+                # every event, names no plate and holds no picture.
+                **(
+                    {"closed_reason": closed_to(self.cache, self.config.direction)}
+                    if decision.fallback is Fallback.LANE_CLOSED
+                    else {}
+                ),
             )
 
         # Best effort, and after the barrier has already been told what to do.

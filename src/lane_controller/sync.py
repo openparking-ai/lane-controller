@@ -164,10 +164,15 @@ def sync_stays(client: PlatformClient, cache: DecisionCache) -> dict | None:
         for _page in range(MAX_STAY_PAGES):
             if cache.stays_cursor is None:
                 answer = client.get_stays()
+                cache.apply_lane(answer)
                 cache.replace_stays(answer.get("open") or [], answer["cursor"])
                 log.info("stays resynced: %d open, cursor=%s", len(cache.stays), cache.stays_cursor)
                 return answer
             answer = client.get_stays(since=cache.stays_cursor)
+            # THE CLOSING RIDES THIS READ (platform 0030): a lane closed or
+            # reopened reaches the barrier inside one fast cadence, not five
+            # minutes later on the slow one.
+            cache.apply_lane(answer)
             cache.apply_stay_changes(answer.get("changes") or [], answer["cursor"])
             if not answer.get("more"):
                 return answer

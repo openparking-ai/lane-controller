@@ -217,6 +217,25 @@ def row_covers(module: str, row: dict, head: dict, day: date) -> bool:
     return False
 
 
+def register_cover(
+    identity_text: str, cache: DecisionCache, day: date
+) -> tuple[list[str], list[dict]]:
+    """Which modules' registers cover this identity on `day`, and the rows
+    that do (pass or agreement id, never the identity text). ONE LOOKUP, and
+    it is the one both doors use: the exit's covered decision and the entry of
+    a lane closed `full`, which lets in exactly the cars this answers for."""
+    covered_by: list[str] = []
+    matched: list[dict] = []
+    for module, row, head in cache.register_rows_for(identity_text):
+        if row_covers(module, row, head, day):
+            if module not in covered_by:
+                covered_by.append(module)
+            matched.append(
+                {"module": module, "pass": row.get("pass"), "agreement": row.get("agreement")}
+            )
+    return covered_by, matched
+
+
 def price_exit(identity_text: str, cache: DecisionCache, *, now: float) -> ExitPricing:
     """The exit's answer for one identity, from the cache alone.
 
@@ -236,15 +255,7 @@ def price_exit(identity_text: str, cache: DecisionCache, *, now: float) -> ExitP
     if cache.is_stale(now=now):
         return ExitPricing(status=STALE_FACTS, computed_from=computed_from)
 
-    covered_by: list[str] = []
-    matched: list[dict] = []
-    for module, row, head in cache.register_rows_for(identity_text):
-        if row_covers(module, row, head, day):
-            if module not in covered_by:
-                covered_by.append(module)
-            matched.append(
-                {"module": module, "pass": row.get("pass"), "agreement": row.get("agreement")}
-            )
+    covered_by, matched = register_cover(identity_text, cache, day)
     if covered_by:
         return ExitPricing(
             status=COVERED, covered_by=tuple(covered_by), matched=tuple(matched),
@@ -264,23 +275,42 @@ def price_exit(identity_text: str, cache: DecisionCache, *, now: float) -> ExitP
     # identity -- which the platform's own index forbids for one vehicle and
     # a ticket cannot share -- and the count is said rather than hidden.
     stay = max(stays, key=lambda s: s.get("entry_at") or "")
-    request = {
-        "plans": cache.plans,
-        "currency": cache.currency,
-        "space_class": cache.space_class,
-        "entry_at": stay.get("entry_at"),
-        "exit_at": exit_at,
-    }
-    status, body = run_quote(request)
     common = dict(
         entry_at=stay.get("entry_at"), exit_at=exit_at, session_id=stay.get("session_id"),
         space_class=cache.space_class, computed_from=computed_from,
         ambiguous_stays=len(stays) if len(stays) > 1 else 0,
     )
+    status, body, tax = charge(cache, stay.get("entry_at"), exit_at)
     if status != 200:
         return ExitPricing(
             status=ENGINE_REFUSED if status == 422 else ENGINE_INVALID, refusal=body, **common,
         )
+    return ExitPricing(
+        status=PRICED, fee_minor=body["fee_minor"] + tax["total_minor"], currency=body["currency"],
+        plan_version=body["plan_version"], breakdown=[*body["breakdown"], *tax["lines"]],
+        subtotal_minor=body["fee_minor"], tax_sets_held=tax_sets_held(cache.tax_sets), **common,
+    )
+
+
+def charge(cache: DecisionCache, entry_at: str | None, exit_at: str) -> tuple[int, dict, dict]:
+    """WHAT THIS LANE CHARGES for a stay from `entry_at` to `exit_at`, from
+    the cache: the engine's quote on the cached plans, then the garage's tax on
+    that subtotal at the exit. `(200, quote, tax)` when both priced; otherwise
+    the failing call's status and its body verbatim, and `{}` for the tax.
+
+    ONE COMPUTATION, and both the exit's fee and the board's prices are it: a
+    price on the screen is the fee the lane would put on the reader for the
+    same stay at the same moment, because it is the same call.
+    """
+    status, body = run_quote({
+        "plans": cache.plans,
+        "currency": cache.currency,
+        "space_class": cache.space_class,
+        "entry_at": entry_at,
+        "exit_at": exit_at,
+    })
+    if status != 200:
+        return status, body, {}
     # THE TAX, LAST, on the quote's total at the exit -- the instant the
     # platform uses for this decision too. No validation exists yet here: the
     # fee the barrier draws is the subtotal plus the engine's tax lines.
@@ -291,14 +321,8 @@ def price_exit(identity_text: str, cache: DecisionCache, *, now: float) -> ExitP
         "at": exit_at,
     })
     if tax_status != 200:
-        return ExitPricing(
-            status=ENGINE_REFUSED if tax_status == 422 else ENGINE_INVALID, refusal=tax, **common,
-        )
-    return ExitPricing(
-        status=PRICED, fee_minor=body["fee_minor"] + tax["total_minor"], currency=body["currency"],
-        plan_version=body["plan_version"], breakdown=[*body["breakdown"], *tax["lines"]],
-        subtotal_minor=body["fee_minor"], tax_sets_held=tax_sets_held(cache.tax_sets), **common,
-    )
+        return tax_status, tax, {}
+    return 200, body, tax
 
 
 def tax_sets_held(tax_sets: list) -> dict:
