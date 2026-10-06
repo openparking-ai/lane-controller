@@ -505,3 +505,27 @@ def test_the_read_contract_publishes_the_board():
     board = LaneService(controller).state().to_dict()["board"]
     assert [item["kind"] for item in board["items"]] == ["message", "prices"]
     assert board["items"][0] == {"kind": "message", "text": "Welcome."}
+
+
+# ---------------------------------------------------------------------------
+# A closing raises no malfunction by being a closing, and hides none
+# ---------------------------------------------------------------------------
+
+
+def test_a_closed_lane_raises_no_malfunction_by_being_closed_and_hides_none():
+    from lane_controller.contract import HealthState, MalfunctionCode
+
+    controller = closed_lane(EVERYONE, [SEEN])
+    controller.run_once()
+    active = [code for code, state in LaneService(controller).derived_states().items()
+              if state is HealthState.ACTIVE]
+    assert active == [], f"closing the lane raised {active}"
+
+    dead_engine = VehicleIdentity(plate=None, confidence=0.0, presence=True,
+                                  unavailable="unreachable")
+    controller = closed_lane(EVERYONE, [dead_engine])
+    assert controller.run_once().fallback is Fallback.LANE_CLOSED
+    states = LaneService(controller).derived_states()
+    assert states[MalfunctionCode.IDENTITY_SERVICE_DOWN] is HealthState.ACTIVE, (
+        "the closing hid a dead identification engine"
+    )
