@@ -329,8 +329,9 @@ repository is not public. The platform server is Node/Express/Postgres — see
 
 ## Licence and contributing
 
-AGPL-3.0-or-later — see [LICENSE](LICENSE). Contributions require a signed CLA;
-see [CONTRIBUTING.md](CONTRIBUTING.md).
+AGPL-3.0-or-later — see [LICENSE](LICENSE).
+
+Open Parking AI does not accept outside contributions. Pull requests, issues and comments are limited to the maintainers.
 
 ---
 
