@@ -39,6 +39,8 @@ from lane_controller.config import (
     DEFAULT_OUTBOX_DEPTH_THRESHOLD,
 )
 from lane_controller.contract import (
+    BOARD_ITEM_KINDS,
+    CLOSED_REASONS,
     CONTRACT_VERSION,
     FALLBACK_REASONS,
     NEVER_ALARM,
@@ -48,9 +50,11 @@ from lane_controller.contract import (
     SOURCES,
     VEND_BLOCKING,
     VEND_IDENTITY_KINDS,
+    Board,
     ExitFee,
     HealthEntry,
     HealthState,
+    LaneClosing,
     LaneHealth,
     LastDecision,
     MalfunctionCode,
@@ -170,7 +174,7 @@ ACT_PAYLOADS = {"vend", "vend_refused"}
 #: Blocks that are ONE FIELD of a route's payload, shown on their own because the
 #: route's own example carries them as `null` -- `exit_fee` is null at every lane
 #: but an exit that has priced a car. Compared against the payload class.
-FIELD_PAYLOADS = {"exit_fee"}
+FIELD_PAYLOADS = {"exit_fee", "lane_closing", "board"}
 
 
 def doc_payloads() -> dict[str, dict]:
@@ -236,6 +240,15 @@ def test_the_document_shows_exactly_the_payloads_the_code_builds():
         decision_at="2026-08-30T14:03:11.482913+00:00", status="priced",
         fee_minor=1500, currency="USD", minor_unit_digits=2,
     ).to_dict()
+    live["lane_closing"] = LaneClosing(
+        state="closed", reason="full", message="Garage is full. Monthly parkers only."
+    ).to_dict()
+    live["board"] = Board(items=(
+        {"kind": "message", "text": "Event parking tonight from 6pm."},
+        {"kind": "prices", "lines": [
+            {"minutes": 60, "fee_minor": 300, "currency": "USD", "minor_unit_digits": 2}
+        ]},
+    )).to_dict()
 
     for name in sorted(ROUTE_PAYLOADS | ACT_PAYLOADS | FIELD_PAYLOADS):
         example = doc[name]
@@ -1718,6 +1731,8 @@ PUBLISHED_SETS = {
     # sequence of checks that is not the one it will meet.
     "vend_refusals": lambda: [refusal.value for refusal in VendRefusal],
     "vend_identity_kinds": lambda: list(VEND_IDENTITY_KINDS),
+    "closed_reasons": lambda: list(CLOSED_REASONS),
+    "board_item_kinds": lambda: list(BOARD_ITEM_KINDS),
 }
 
 

@@ -48,7 +48,7 @@ from .contract import (
     is_idempotency_key,
     is_ticket_ref,
 )
-from .decision import Outcome, decide
+from .decision import Outcome, closed_to, decide
 from .interfaces import VehicleIdentity
 
 log = logging.getLogger(__name__)
@@ -360,6 +360,24 @@ class AssistedVend:
             )
 
         # 7. not_completable -- there is nothing to complete.
+        #
+        # AND AT A LANE THE OWNER HAS CLOSED, a display code completes nothing:
+        # a ticket is a driver serving themselves, and the closing is the owner
+        # saying they may not. Read off the cache NOW, as the loop is: a lane
+        # closed after its decision was made is closed. A person's word --
+        # either human authority -- still opens it, so a driver can always get
+        # help.
+        if (
+            closed_to(controller.cache, controller.config.direction) is not None
+            and request.authorised_by is VendAuthority.DISPLAY_CODE_CONFIRMED
+        ):
+            return VendRefused(
+                code=VendRefusal.NOT_COMPLETABLE.value,
+                error=(
+                    "this lane is closed by its owner; a display code does not open it, "
+                    "only a person's word does (human_open_now or human_open_and_flag)"
+                ),
+            )
         outcome = controller.last_decision.outcome
         if outcome is Outcome.ALLOW:
             return VendRefused(

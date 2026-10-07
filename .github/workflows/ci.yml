@@ -136,6 +136,17 @@ jobs:
         # hand-over -- and requires the exit-fee suite to fail each time.
         run: python scripts/exit_fee_fail_control.py
 
+      - name: Closing fail-control
+        # The lane obeying its owner's closing, and the board (U4c): the
+        # closed test dropped from the decision, a display code completing at
+        # a closed lane, `full` read as open and as everyone, a person's word
+        # refused, a closed exit putting the fee up, the closing carried on
+        # the slow read only or dropped from the fast one, not kept on disk,
+        # the refusal naming the car, a board message outliving its end, the
+        # board's price untaxed or from a plan not in force -- and requires
+        # tests/test_lane_closing.py to fail each time.
+        run: python scripts/closing_fail_control.py
+
       - name: Confirmation fail-control
         # Breaks the entry confirmation on purpose -- the window, the crossing
         # direction, the promotion of an unconfirmed entry, and the

@@ -50,6 +50,8 @@ rules_refresh_seconds = 300
 # This number IS the size of that class in ordinary operation. A site that has
 # measured its own shortest entry-to-exit sets it from that; nothing here has.
 # It cannot exceed rules_refresh_seconds.
+# It is ALSO how long a lane the owner closes or reopens takes to act on it:
+# the closing and the owner's board ride this read as well as the slow one.
 stays_refresh_seconds = 5
 
 # Where the identification service answers. Unset, this lane identifies

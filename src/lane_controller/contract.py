@@ -539,18 +539,94 @@ class ExitFee:
         }
 
 
+#: The two closing reasons a lane publishes, and the only two it acts on. A
+#: CLOSED set inside `lane`, which was added within version 2.
+CLOSED_REASONS: tuple[str, ...] = ("full", "everyone")
+
+
+@dataclass(frozen=True, slots=True)
+class LaneClosing:
+    """`lane` on `GET /v1/lane/state`: open, or closed by its owner with the
+    reason this lane ACTS on and the owner's message for the screen.
+
+    `reason` is what the barrier obeys, not only what was typed: `full` is an
+    entry reason, and a closing this lane cannot act on as `full` is published
+    `everyone`, because that is what it does. `message` is the owner's text as
+    the owner typed it; a screen upper-cases it.
+    """
+
+    state: str
+    reason: str | None = None
+    message: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.state == "open":
+            if self.reason is not None or self.message is not None:
+                raise ValueError("an open lane carries no reason and no message")
+            return
+        if self.state != "closed":
+            raise ValueError(f"lane.state must be open or closed, got {self.state!r}")
+        if self.reason not in CLOSED_REASONS:
+            raise ValueError(f"lane.reason must be one of {', '.join(CLOSED_REASONS)}")
+        _text(self.message, "lane.message")
+
+    def to_dict(self) -> dict:
+        return {"state": self.state, "reason": self.reason, "message": self.message}
+
+
+#: The kinds of item a board publishes. CLOSED inside `board`, which was added
+#: within version 2: a consumer that meets a kind it does not know skips it.
+BOARD_ITEM_KINDS: tuple[str, ...] = ("message", "prices")
+
+
+@dataclass(frozen=True, slots=True)
+class Board:
+    """`board` on `GET /v1/lane/state`: what the screen may show while nothing
+    else wants it, in the order it is shown (`board.py` builds it).
+
+    A `message` item is `{"kind": "message", "text": ...}`, the owner's words
+    as typed. A `prices` item is `{"kind": "prices", "lines": [...]}`, each line
+    `{minutes, fee_minor, currency, minor_unit_digits}`: what this lane would
+    charge for that stay entering now, tax included, from the same call the
+    exit charges with. Nothing here names a car or a stay.
+    """
+
+    items: tuple[dict, ...] = ()
+
+    def __post_init__(self) -> None:
+        for item in self.items:
+            if not isinstance(item, dict) or item.get("kind") not in BOARD_ITEM_KINDS:
+                raise ValueError(f"board items are one of {', '.join(BOARD_ITEM_KINDS)}")
+            if item["kind"] == "message":
+                _text(item.get("text"), "board message text")
+                continue
+            for line in item.get("lines") or ():
+                for name in ("minutes", "fee_minor", "minor_unit_digits"):
+                    value = line.get(name)
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        raise ValueError(f"board price {name} must be a whole number >= 0")
+                _text(line.get("currency"), "board price currency")
+
+    def to_dict(self) -> dict:
+        return {"items": [dict(item) for item in self.items]}
+
+
 @dataclass(frozen=True, slots=True)
 class LaneState:
-    """`GET /v1/lane/state` -- the last decision, the current transit, and at an
-    exit, the fee in front of the driver.
+    """`GET /v1/lane/state` -- the last decision, the current transit, at an
+    exit the fee in front of the driver, whether the owner has closed this lane,
+    and the board.
 
-    `exit_fee` was ADDED within version 2: a consumer ignores a field it does
-    not know, so a reader of this version reads the payload exactly as before.
+    `exit_fee`, `lane` and `board` were ADDED within version 2: a consumer
+    ignores a field it does not know, so a reader of this version reads the
+    payload exactly as before.
     """
 
     decision: LastDecision | None
     transit: Transit
     exit_fee: ExitFee | None = None
+    lane: LaneClosing = LaneClosing(state="open")
+    board: Board = Board()
 
     def __post_init__(self) -> None:
         if self.decision is not None and not isinstance(self.decision, LastDecision):
@@ -559,6 +635,10 @@ class LaneState:
             raise ValueError("transit must be a Transit")
         if self.exit_fee is not None and not isinstance(self.exit_fee, ExitFee):
             raise ValueError("exit_fee must be an ExitFee or null")
+        if not isinstance(self.lane, LaneClosing):
+            raise ValueError("lane must be a LaneClosing")
+        if not isinstance(self.board, Board):
+            raise ValueError("board must be a Board")
 
     def to_dict(self) -> dict:
         return {
@@ -566,6 +646,8 @@ class LaneState:
             "decision": self.decision.to_dict() if self.decision else None,
             "transit": self.transit.to_dict(),
             "exit_fee": self.exit_fee.to_dict() if self.exit_fee else None,
+            "lane": self.lane.to_dict(),
+            "board": self.board.to_dict(),
         }
 
 

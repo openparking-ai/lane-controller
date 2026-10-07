@@ -64,6 +64,7 @@ def build(
     rules_max_age: float | None = None,
     loops_impl: ClosingLoops | None = None,
     clock=None,
+    closed: str | None = None,
 ):
     """A whole lane with the geometry named, and nothing about it implied.
 
@@ -89,6 +90,9 @@ def build(
         DecisionCache() if rules_max_age is None else DecisionCache(max_age_seconds=rules_max_age)
     )
     cache.load(list(rules), default_action=default_action)
+    if closed is not None:
+        cache.apply_lane({"lane": {"state": "closed", "reason": closed,
+                                   "message": "Closed tonight.", "closed_at": None}})
     vend = RecordingVendOutput()
     if loops_impl is not None:
         loops = loops_impl
@@ -557,6 +561,9 @@ PLATE_LEAK_CASES = [
     "unknown_vehicle",
     "allowed_by_rule",
     "denied_by_rule",
+    "lane_closed",
+    "lane_closed_full",
+    "lane_closed_exit",
 ]
 
 
@@ -629,6 +636,12 @@ def test_no_log_event_carries_plate_text(case):
         "unknown_vehicle": dict(default_action=None),
         "allowed_by_rule": dict(rules=[allow_rule]),
         "denied_by_rule": dict(rules=[deny_rule]),
+        # A LANE THE OWNER CLOSED: to everyone, full with no register naming
+        # the car, and an exit closed to everyone. Each is one refused arrival
+        # with its `closed_reason` on the record, and none of them names it.
+        "lane_closed": dict(closed="everyone"),
+        "lane_closed_full": dict(closed="full"),
+        "lane_closed_exit": dict(direction="exit", closed="everyone"),
     }[case]
     settings.setdefault("identities", [seen])
     settings.setdefault("crossings", [(ClosingSequence.FORWARD, 3.0)])

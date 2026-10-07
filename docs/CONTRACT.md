@@ -165,7 +165,15 @@ its wiring, its route table — and none is a flag somebody set.
     "state": "pending",
     "since": "2026-08-30T14:03:11.482913+00:00"
   },
-  "exit_fee": null
+  "exit_fee": null,
+  "lane": {
+    "state": "open",
+    "reason": null,
+    "message": null
+  },
+  "board": {
+    "items": []
+  }
 }
 ```
 
@@ -231,6 +239,90 @@ so a reader of this version reads the payload exactly as before.
   digits for, so a published figure always carries them.
 - Nothing that names the car or the stay is here: no plate, no session, no
   match.
+
+### `lane` — whether the owner has closed this lane
+
+Open, or closed by the garage's owner with a reason and the owner's message for
+the lane's screen. **It was added within version 2**: a consumer ignores a field
+it does not know, so a reader of this version reads the payload exactly as
+before.
+
+<!--payload:lane_closing-->
+```json
+{
+  "state": "closed",
+  "reason": "full",
+  "message": "Garage is full. Monthly parkers only."
+}
+```
+
+- **`state`** is `open` or `closed`. Open carries `reason` and `message` as
+  `null`.
+- **`reason` is what this lane ACTS on**, from the closed set `closed_reasons`
+  below. `everyone`: no car opens the barrier by itself — not a covered car,
+  not a paid one, not a display code. `full`, at an entry: a car a pass or
+  monthly register covers today gets in as on any day, and every other car does
+  not. `full` is an entry reason; a closing this lane cannot act on as `full`
+  is published `everyone`, because that is what the barrier does.
+- **A person's word always opens a closed lane**: `human_open_now` and
+  `human_open_and_flag` through `POST /v1/lane/vend` complete a decision at a
+  closed lane as they do anywhere. `display_code_confirmed` does not: it is
+  refused `not_completable`, and the refusal says the lane is closed.
+- **A car a closing turns away is decided `fallback` with the reason
+  `lane_closed`**, and recorded once, as a `fallback_needs_human` event whose
+  detail carries `closed_reason`. At an exit the reader is shown nothing and
+  `exit_fee` is `null`: no money is asked for at a closed exit.
+- **`message`** is the owner's text exactly as typed. A screen writes it in
+  capitals. It names no car.
+- The closing arrives on the platform's fast read (`/lane/stays`) as well as
+  its slow one, and it is kept on disk with the rest of the cache, under the
+  same age bound: a lane restarted offline obeys the last closing it was told.
+
+### `board` — what the screen may show while nothing else wants it
+
+The owner's messages for this lane that are in force now, then — if the owner
+switched it on for this lane — what this lane would charge for a few lengths of
+stay. **It was added within version 2.**
+
+<!--payload:board-->
+```json
+{
+  "items": [
+    {
+      "kind": "message",
+      "text": "Event parking tonight from 6pm."
+    },
+    {
+      "kind": "prices",
+      "lines": [
+        {
+          "minutes": 60,
+          "fee_minor": 300,
+          "currency": "USD",
+          "minor_unit_digits": 2
+        }
+      ]
+    }
+  ]
+}
+```
+
+- **`items` are in the order they are shown.** `kind` is from the closed set
+  `board_item_kinds` below; a consumer skips a kind it does not know.
+- **A `message`** is the owner's words as typed, for this lane. Its start and
+  end are judged by this lane, on its own clock, from what it holds — offline
+  too — so an event message goes up and comes down by itself.
+- **A `prices` item** has one line per length of stay this lane priced:
+  `minutes` (60, 120, 180 and 1440 in this build), and the fee **with tax**, as
+  `fee_minor`, `currency` and `minor_unit_digits` — the exit fee's own fields.
+  Each line is what this lane would charge for that stay entering now: the same
+  call its exit charges with (the engine's quote on the cached plans, then the
+  garage's tax at the exit), so a special-event rate shows during its window
+  and no line is a price the lane would not charge. **A cache too stale to
+  price publishes no prices item**; a length the engine will not price is left
+  out.
+- **The board is published whatever the closing.** Which of a ticket, a fee, a
+  closed lane's message and the board a screen draws is the screen's rule.
 
 ### `outcome` is CLOSED. `reason` is OPEN.
 
@@ -910,6 +1002,14 @@ does adding one to the enum without adding it here.
   ],
   "vend_identity_kinds": [
     "ticket"
+  ],
+  "closed_reasons": [
+    "full",
+    "everyone"
+  ],
+  "board_item_kinds": [
+    "message",
+    "prices"
   ]
 }
 ```
@@ -933,6 +1033,9 @@ does adding one to the enum without adding it here.
   route applies them. Each arrives as a `409` carrying its name in `code`.
 - **`vend_identity_kinds`** — the identity kinds that route accepts. **One**,
   this version, and a plate is deliberately not on it.
+- **`closed_reasons`** — the reasons `lane.reason` carries on a closed lane,
+  and the whole of what a lane acts on.
+- **`board_item_kinds`** — the kinds of item `board.items` carries.
 
 `reason` and `cause` are **not** here, and that is not an oversight: `reason` is
 an OPEN string with a required closed subset, and a lane that is not ours emits
