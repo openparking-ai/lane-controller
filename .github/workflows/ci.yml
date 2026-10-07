@@ -37,6 +37,16 @@ jobs:
 
   test:
     name: test
+    # `test (3.11)` and `test (3.12)` are the contexts branch protection
+    # requires, and every fail-control used to be a step inside them, one after
+    # another: 22 minutes, 21 of them fail-controls. They are their own jobs now,
+    # side by side -- and a red one must STILL stop a merge. So this job waits
+    # for all of them and its last step fails unless, for THIS interpreter,
+    # every `scripts/*_fail_control.py` reported, exactly once, and passed.
+    # `always()` and not `!cancelled()`: a job skipped because a dependency
+    # failed reports as "skipped", which branch protection accepts as passing.
+    needs: fail-control
+    if: always()
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -57,190 +67,230 @@ jobs:
         # needs any of those, a hardware seam has leaked into the lane logic.
         run: pytest -q
 
-      - name: Offline fail-control
-        # Breaks the outbox on purpose and requires the offline suite to fail.
-        # An offline guarantee nobody has seen fail is not known to be one.
-        run: python scripts/offline_fail_control.py
+      - name: Collect what every fail-control job ran
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fail-control-${{ matrix.python-version }}-*
+          merge-multiple: true
+          path: fail-controls
 
-      - name: Production-loop fail-control
-        # Breaks the loop that keeps the cache fresh -- an outage served as an
-        # empty register, a closed stay never dropped, the fast cadence never
-        # run, a failed refresh unsaid, a raising turn killing the lane thread,
-        # a platform accepted without its token -- and requires the
-        # production-loop suite to fail each time.
-        run: python scripts/refresh_fail_control.py
+      - name: Every fail-control ran, exactly once, and passed
+        # The add-up. The list of controls is the scripts on disk, not the
+        # matrix below: a script added and left out of the matrix, one listed
+        # twice, one that never reported (killed, cancelled, never scheduled)
+        # and one that went red are each named, and each is red.
+        if: always()
+        run: |
+          python .github/scripts/fail_controls_ran.py --self-test
+          python .github/scripts/fail_controls_ran.py fail-controls
 
-      - name: Durable-cache fail-control
-        # Breaks the store the decision cache survives a restart in -- writes
-        # that go nowhere, a restored cache that reads as fresh, the retention
-        # bound never enforced, a world-readable file, any directory accepted,
-        # half the cache persisted -- and requires the durable-cache suite to
-        # fail each time.
-        run: python scripts/durable_fail_control.py
+  fail-control:
+    name: fail-control (${{ matrix.python-version }}, ${{ matrix.control }})
+    runs-on: ubuntu-latest
+    strategy:
+      # A RED CONTROL MAY NOT CANCEL ITS SIBLINGS: a cancelled one is a set of
+      # breaks nobody measured.
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+        # One job per script, each run exactly as the step it was. `test`
+        # checks this list against `scripts/*_fail_control.py`. What each
+        # one breaks:
+        control:
+          # Offline fail-control
+          # Breaks the outbox on purpose and requires the offline suite to fail.
+          # An offline guarantee nobody has seen fail is not known to be one.
+          - offline
+          # Production-loop fail-control
+          # Breaks the loop that keeps the cache fresh -- an outage served as an
+          # empty register, a closed stay never dropped, the fast cadence never
+          # run, a failed refresh unsaid, a raising turn killing the lane thread,
+          # a platform accepted without its token -- and requires the
+          # production-loop suite to fail each time.
+          - refresh
+          # Durable-cache fail-control
+          # Breaks the store the decision cache survives a restart in -- writes
+          # that go nowhere, a restored cache that reads as fresh, the retention
+          # bound never enforced, a world-readable file, any directory accepted,
+          # half the cache persisted -- and requires the durable-cache suite to
+          # fail each time.
+          - durable
+          # Exit-decision fail-control
+          # Breaks the exit's local decision -- the day read on UTC's clock, a
+          # revoked pass covering, an uncached car priced from a guessed entry,
+          # the platform asked on the barrier's path, the plate named in the
+          # record, the identity folding removed -- and requires the
+          # exit-decision suite to fail each time.
+          - exit_decision
+          # Exit-tax fail-control
+          # Breaks tax at the barrier (platform 0023) -- the quote drawn untaxed,
+          # the set chosen by the box's clock instead of the exit, a cache with
+          # no sets priced at no tax, the newest set read as the latest spelling,
+          # the sets merged instead of replaced or not kept on disk, a held
+          # validation put up after the lane's own tax or taken on the taxed fee
+          # -- and requires the exit-tax suite to fail each time.
+          - exit_tax
+          # Close-decision fail-control
+          # Breaks the decision on the close -- the close carrying nothing, the
+          # settle recording the last decision instead of the one it was
+          # handed, the transport dropping it, the fee edited in transit, the
+          # client leaving it off the wire, null where nothing belongs -- and
+          # requires the close-decision suite to fail each time.
+          - close_decision
+          # Outbox-drain fail-control
+          # Breaks the outbox drain -- the flush put back on the lane thread
+          # after the vend, a signal that sends nothing, no retry of a refused
+          # outbox, the deques cleared after the send -- and requires the
+          # outbox-drain suite to fail each time.
+          - drain
+          # Reader-fee fail-control
+          # Breaks the fee on the card reader -- a total re-summed from its
+          # lines, lines re-worded, a zero fee put up as a cart, a cart forced on
+          # every reader, the fee shown after the vend, the last car's fee left
+          # up, the reader on the lane thread, a clear that erases an unshown
+          # fee, a reader that raises through the arrival -- and requires the
+          # reader-fee suite to fail each time.
+          - reader
+          # Validation-prompt fail-control
+          # The phone prompt and the validation claimed when the phone is
+          # entered: one amount shown and it is the discounted one, the fee read
+          # from the platform, Skip asking nothing, the words naming both uses,
+          # and the number in no log line and no URL. Each property is broken in
+          # turn and the suite must go red.
+          - validation_prompt
+          # Exit-fee fail-control
+          # The fee published on GET /v1/lane/state as `exit_fee` for a second
+          # screen at the exit: re-summed from the lines, two decimals guessed,
+          # the discount not followed, left up after the close, a figure the
+          # reader has no cart for, nothing without a reader, the stay on the
+          # wire, the fee as priced inside the close, a figure outliving its
+          # hand-over -- and requires the exit-fee suite to fail each time.
+          - exit_fee
+          # Closing fail-control
+          # The lane obeying its owner's closing, and the board (U4c): the
+          # closed test dropped from the decision, a display code completing at
+          # a closed lane, `full` read as open and as everyone, a person's word
+          # refused, a closed exit putting the fee up, the closing carried on
+          # the slow read only or dropped from the fast one, not kept on disk,
+          # the refusal naming the car, a board message outliving its end, the
+          # board's price untaxed or from a plan not in force -- and requires
+          # tests/test_lane_closing.py to fail each time.
+          - closing
+          # Confirmation fail-control
+          # Breaks the entry confirmation on purpose -- the window, the crossing
+          # direction, the promotion of an unconfirmed entry, and the
+          # both-arming-loops check -- and requires the loop suite to fail each
+          # time. This is also what proves the suite RUNS: a suite that had
+          # quietly stopped being collected would pass intact and then fail to
+          # fail under every break, and this reports that.
+          - confirmation
+          # Unadmitted-entry fail-control
+          # Breaks the entry-nothing-admitted guarantees on purpose -- the two
+          # gates on the idle read of the loops after the gate, the two things
+          # the vend's read must never do (overlap a poll's read, wait behind
+          # an abandoned one), the two halves of the one critical section the
+          # pending check and the read share (either reverted, a vend beginning
+          # between them loses its crossing to the poll), the name, the reason,
+          # the flush, and a session opened on no identity -- and requires
+          # tests/test_unadmitted.py to
+          # fail each time. A crossing with no vend behind it was in no record
+          # until this round; this is what keeps it in one.
+          - unadmitted
+          # Deactivate-loop fail-control
+          # Breaks the third loop's guarantees on purpose -- the level (an edge
+          # deadlocks two queued cars), each end of the held interval, its
+          # record at both ends, the assisted vend's own application of the
+          # check, the stuck measurement and the spacing bound -- and requires
+          # tests/test_deactivate_loop.py to fail each time. A hold that the
+          # record cannot show is the silent non-event this lane refuses to
+          # write; this is what keeps it written.
+          - deactivate
+          # Lane-contract fail-control
+          # Breaks each property the read contract exists to have -- the geometry
+          # it publishes, the completeness of the health table, `unknown` not
+          # being `ok`, the read-only sweep, the derived fallback, the cursor's
+          # reset flag -- and breaks the third-party lane too, because a stub that
+          # satisfies every assertion is a fixture that measures nothing. Each
+          # break must turn the contract suite red.
+          - contract
+          # Fallback-cause fail-control
+          # Merges the cause back into the confidence comparison on purpose --
+          # at the decision, at the client, and in the record -- and requires the
+          # engine-unreachable suite to fail each time. A dead engine reported as
+          # a marginal read is the defect this suite exists for, and a suite that
+          # cannot go red on it is not evidence that it does not happen.
+          - fallback_cause
+          # Descriptor fail-control
+          # The appearance descriptor crosses three points on its way from the
+          # identity service to the platform's session -- the translation from
+          # the service's contract, the session action, and the echo the lane
+          # requires back -- and each is broken in turn. The third is the one
+          # that matters: a platform older than the column answers 201 and
+          # drops the field, and a lane that did not require the echo would
+          # count that open delivered.
+          - descriptor
+          # Assisted-vend fail-control
+          # THE ROUND'S OWN CONTROL, and the most important one in this file.
+          # `POST /v1/lane/vend` is the first route in this project that can open
+          # a barrier. Each break is a barrier that opens when it should not, a
+          # credential that buys what it must not, or a record that is missing
+          # when one does: every named refusal suppressed one at a time, the
+          # order of identity-then-relay swapped, the replay allowed to vend
+          # again, the read token given the act route, a credential in a URL
+          # served, and the ticket reference put on the read contract and in a
+          # log line. Each must turn the suite red.
+          #
+          # The cut round added eight more, one per blocker it closed: the flush
+          # removed so the completed vend never reaches the platform; the decision
+          # left unconsumed so one arrival vends any number of times; the
+          # credential comparison put back on `str` so a non-ASCII query string
+          # drops the connection; the caller's idempotency key put back on an
+          # append-only event; the settle deadline removed so a hung loop driver
+          # leaves the lane `busy` for ever; the malfunction subset widened so a
+          # lane whose engine is down refuses the driver it could not read; the
+          # arming dwell measure removed so a stuck loop vends; and the finite
+          # check removed so `completion_max_age_s = nan` is a legal setting.
+          #
+          # AND EVERY CONTROL SCRIPT NOW JUDGES ON THE PYTEST SUMMARY LINE rather
+          # than on the exit status. A break whose ANCHOR HAS MOVED makes the
+          # suite ERROR, which is also non-zero, and the old judgement reported
+          # that as "fails as required" with the break never applied. See
+          # scripts/_control.py.
+          - vend
+          # Measured-codes fail-control
+          # Malfunction codes have moved from `not_measured` to `measured`, and a `measured` label is a claim that this build derives the
+          # state from something it observes. `HealthEntry` cannot check that
+          # direction -- it refuses a code claiming `ok` without the label, and
+          # says nothing about a code with the label that derives a constant. Each
+          # break removes one thing that makes the derivation a measurement, every
+          # one of them in the reassuring direction, and requires the contract
+          # suite to go red.
+          - measured_codes
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e '.[dev]'
 
-      - name: Exit-decision fail-control
-        # Breaks the exit's local decision -- the day read on UTC's clock, a
-        # revoked pass covering, an uncached car priced from a guessed entry,
-        # the platform asked on the barrier's path, the plate named in the
-        # record, the identity folding removed -- and requires the
-        # exit-decision suite to fail each time.
-        run: python scripts/exit_decision_fail_control.py
+      - name: Fail-control — ${{ matrix.control }}
+        shell: bash
+        run: |
+          set +e
+          python "scripts/${{ matrix.control }}_fail_control.py"
+          status=$?
+          mkdir -p report
+          echo "${{ matrix.control }} exit=$status" \
+            > "report/${{ matrix.control }}-${{ strategy.job-index }}.txt"
+          exit "$status"
 
-      - name: Exit-tax fail-control
-        # Breaks tax at the barrier (platform 0023) -- the quote drawn untaxed,
-        # the set chosen by the box's clock instead of the exit, a cache with
-        # no sets priced at no tax, the newest set read as the latest spelling,
-        # the sets merged instead of replaced or not kept on disk, a held
-        # validation put up after the lane's own tax or taken on the taxed fee
-        # -- and requires the exit-tax suite to fail each time.
-        run: python scripts/exit_tax_fail_control.py
-
-      - name: Close-decision fail-control
-        # Breaks the decision on the close -- the close carrying nothing, the
-        # settle recording the last decision instead of the one it was
-        # handed, the transport dropping it, the fee edited in transit, the
-        # client leaving it off the wire, null where nothing belongs -- and
-        # requires the close-decision suite to fail each time.
-        run: python scripts/close_decision_fail_control.py
-
-      - name: Outbox-drain fail-control
-        # Breaks the outbox drain -- the flush put back on the lane thread
-        # after the vend, a signal that sends nothing, no retry of a refused
-        # outbox, the deques cleared after the send -- and requires the
-        # outbox-drain suite to fail each time.
-        run: python scripts/drain_fail_control.py
-
-      - name: Reader-fee fail-control
-        # Breaks the fee on the card reader -- a total re-summed from its
-        # lines, lines re-worded, a zero fee put up as a cart, a cart forced on
-        # every reader, the fee shown after the vend, the last car's fee left
-        # up, the reader on the lane thread, a clear that erases an unshown
-        # fee, a reader that raises through the arrival -- and requires the
-        # reader-fee suite to fail each time.
-        run: python scripts/reader_fail_control.py
-
-      - name: Validation-prompt fail-control
-        # The phone prompt and the validation claimed when the phone is
-        # entered: one amount shown and it is the discounted one, the fee read
-        # from the platform, Skip asking nothing, the words naming both uses,
-        # and the number in no log line and no URL. Each property is broken in
-        # turn and the suite must go red.
-        run: python scripts/validation_prompt_fail_control.py
-
-      - name: Exit-fee fail-control
-        # The fee published on GET /v1/lane/state as `exit_fee` for a second
-        # screen at the exit: re-summed from the lines, two decimals guessed,
-        # the discount not followed, left up after the close, a figure the
-        # reader has no cart for, nothing without a reader, the stay on the
-        # wire, the fee as priced inside the close, a figure outliving its
-        # hand-over -- and requires the exit-fee suite to fail each time.
-        run: python scripts/exit_fee_fail_control.py
-
-      - name: Closing fail-control
-        # The lane obeying its owner's closing, and the board (U4c): the
-        # closed test dropped from the decision, a display code completing at
-        # a closed lane, `full` read as open and as everyone, a person's word
-        # refused, a closed exit putting the fee up, the closing carried on
-        # the slow read only or dropped from the fast one, not kept on disk,
-        # the refusal naming the car, a board message outliving its end, the
-        # board's price untaxed or from a plan not in force -- and requires
-        # tests/test_lane_closing.py to fail each time.
-        run: python scripts/closing_fail_control.py
-
-      - name: Confirmation fail-control
-        # Breaks the entry confirmation on purpose -- the window, the crossing
-        # direction, the promotion of an unconfirmed entry, and the
-        # both-arming-loops check -- and requires the loop suite to fail each
-        # time. This is also what proves the suite RUNS: a suite that had
-        # quietly stopped being collected would pass intact and then fail to
-        # fail under every break, and this reports that.
-        run: python scripts/confirmation_fail_control.py
-
-      - name: Unadmitted-entry fail-control
-        # Breaks the entry-nothing-admitted guarantees on purpose -- the two
-        # gates on the idle read of the loops after the gate, the two things
-        # the vend's read must never do (overlap a poll's read, wait behind
-        # an abandoned one), the two halves of the one critical section the
-        # pending check and the read share (either reverted, a vend beginning
-        # between them loses its crossing to the poll), the name, the reason,
-        # the flush, and a session opened on no identity -- and requires
-        # tests/test_unadmitted.py to
-        # fail each time. A crossing with no vend behind it was in no record
-        # until this round; this is what keeps it in one.
-        run: python scripts/unadmitted_fail_control.py
-
-      - name: Deactivate-loop fail-control
-        # Breaks the third loop's guarantees on purpose -- the level (an edge
-        # deadlocks two queued cars), each end of the held interval, its
-        # record at both ends, the assisted vend's own application of the
-        # check, the stuck measurement and the spacing bound -- and requires
-        # tests/test_deactivate_loop.py to fail each time. A hold that the
-        # record cannot show is the silent non-event this lane refuses to
-        # write; this is what keeps it written.
-        run: python scripts/deactivate_fail_control.py
-
-      - name: Lane-contract fail-control
-        # Breaks each property the read contract exists to have -- the geometry
-        # it publishes, the completeness of the health table, `unknown` not
-        # being `ok`, the read-only sweep, the derived fallback, the cursor's
-        # reset flag -- and breaks the third-party lane too, because a stub that
-        # satisfies every assertion is a fixture that measures nothing. Each
-        # break must turn the contract suite red.
-        run: python scripts/contract_fail_control.py
-
-      - name: Fallback-cause fail-control
-        # Merges the cause back into the confidence comparison on purpose --
-        # at the decision, at the client, and in the record -- and requires the
-        # engine-unreachable suite to fail each time. A dead engine reported as
-        # a marginal read is the defect this suite exists for, and a suite that
-        # cannot go red on it is not evidence that it does not happen.
-        run: python scripts/fallback_cause_fail_control.py
-
-      - name: Descriptor fail-control
-        # The appearance descriptor crosses three points on its way from the
-        # identity service to the platform's session -- the translation from
-        # the service's contract, the session action, and the echo the lane
-        # requires back -- and each is broken in turn. The third is the one
-        # that matters: a platform older than the column answers 201 and
-        # drops the field, and a lane that did not require the echo would
-        # count that open delivered.
-        run: python scripts/descriptor_fail_control.py
-
-      - name: Assisted-vend fail-control
-        # THE ROUND'S OWN CONTROL, and the most important one in this file.
-        # `POST /v1/lane/vend` is the first route in this project that can open
-        # a barrier. Each break is a barrier that opens when it should not, a
-        # credential that buys what it must not, or a record that is missing
-        # when one does: every named refusal suppressed one at a time, the
-        # order of identity-then-relay swapped, the replay allowed to vend
-        # again, the read token given the act route, a credential in a URL
-        # served, and the ticket reference put on the read contract and in a
-        # log line. Each must turn the suite red.
-        #
-        # The cut round added eight more, one per blocker it closed: the flush
-        # removed so the completed vend never reaches the platform; the decision
-        # left unconsumed so one arrival vends any number of times; the
-        # credential comparison put back on `str` so a non-ASCII query string
-        # drops the connection; the caller's idempotency key put back on an
-        # append-only event; the settle deadline removed so a hung loop driver
-        # leaves the lane `busy` for ever; the malfunction subset widened so a
-        # lane whose engine is down refuses the driver it could not read; the
-        # arming dwell measure removed so a stuck loop vends; and the finite
-        # check removed so `completion_max_age_s = nan` is a legal setting.
-        #
-        # AND EVERY CONTROL SCRIPT NOW JUDGES ON THE PYTEST SUMMARY LINE rather
-        # than on the exit status. A break whose ANCHOR HAS MOVED makes the
-        # suite ERROR, which is also non-zero, and the old judgement reported
-        # that as "fails as required" with the break never applied. See
-        # scripts/_control.py.
-        run: python scripts/vend_fail_control.py
-
-      - name: Measured-codes fail-control
-        # Malfunction codes have moved from `not_measured` to `measured`, and a `measured` label is a claim that this build derives the
-        # state from something it observes. `HealthEntry` cannot check that
-        # direction -- it refuses a code claiming `ok` without the label, and
-        # says nothing about a code with the label that derives a constant. Each
-        # break removes one thing that makes the derivation a measurement, every
-        # one of them in the reassuring direction, and requires the contract
-        # suite to go red.
-        run: python scripts/measured_codes_fail_control.py
+      - name: Report what this job ran
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fail-control-${{ matrix.python-version }}-${{ strategy.job-index }}
+          path: report/
+          if-no-files-found: ignore
+          retention-days: 30
