@@ -67,6 +67,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e '.[dev]'
 
+      - name: PLANT — 3.12 goes red at once
+        run: test "${{ matrix.python-version }}" != "3.12"
+
       - name: Tests
         # No hardware, no camera, no barrier, no vision model. If this ever
         # needs any of those, a hardware seam has leaked into the lane logic.
