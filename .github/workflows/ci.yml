@@ -49,6 +49,11 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     strategy:
+      # A RED LEG MAY NOT CANCEL ITS SIBLING. With the default (fail-fast on),
+      # 3.12 going red cancelled 3.11 on #44, and a cancelled leg is an
+      # interpreter nobody measured. Cancelled stops a merge like red does, but
+      # it hides whether the failure is version specific.
+      fail-fast: false
       matrix:
         # The lowest version supported and a current one. The lane runs on
         # whatever the Jetson image ships; the tests must not quietly depend on
