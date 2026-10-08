@@ -135,7 +135,7 @@ jobs:
           # the sets merged instead of replaced or not kept on disk, a held
           # validation put up after the lane's own tax or taken on the taxed fee
           # -- and requires the exit-tax suite to fail each time.
-          - exit_tax
+          # G2 PLANT: exit_tax dropped from the matrix
           # Close-decision fail-control
           # Breaks the decision on the close -- the close carrying nothing, the
           # settle recording the last decision instead of the one it was
@@ -157,6 +157,7 @@ jobs:
           # fee, a reader that raises through the arrival -- and requires the
           # reader-fee suite to fail each time.
           - reader
+          - reader  # G2 PLANT: listed twice
           # Validation-prompt fail-control
           # The phone prompt and the validation claimed when the phone is
           # entered: one amount shown and it is the discounted one, the fee read
