@@ -140,7 +140,7 @@ class Identity:
     #: The APPEARANCE descriptor: an opaque, versioned, compact record computed
     #: from one capture. It is not an image and it is not human-readable, and
     #: this module deliberately does not parse it -- the contract carries it and
-    #: `vehicle_id.fingerprint` is what produces and compares it.
+    #: `vehicle_id.opa_id` is what produces and compares it.
     #:
     #: Its type is a string for reasons that were measured rather than
     #: preferred. `Identity` is frozen, slots and hashable; `Read.__post_init__`

@@ -95,7 +95,7 @@ def test_the_descriptor_survives_the_translation():
     service with it switched on produced one per read and the lane threw it
     away. The exit's search rests on it reaching the session open.
     """
-    descriptor = "opvid-fp/1:eJwBDiTx2planted"
+    descriptor = "opvid-opa-id/2:eJwBDiTx2planted"
     c = client_returning(
         {"cursor": 1, "read": a_read(identity=Identity(plate="ABC123", descriptor=descriptor))}
     )

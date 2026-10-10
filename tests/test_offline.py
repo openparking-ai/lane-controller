@@ -239,7 +239,7 @@ def test_a_platform_that_does_record_it_delivers_the_open():
     assert platform.opened[0]["entry_confirmation"] == "unconfirmable"
 
 
-DESCRIPTOR = "opvid-fp/1:eJwBDiTx2offline"
+DESCRIPTOR = "opvid-opa-id/2:eJwBDiTx2offline"
 
 
 def test_an_open_carries_the_descriptor_the_read_produced_and_the_platform_echoes_it():
