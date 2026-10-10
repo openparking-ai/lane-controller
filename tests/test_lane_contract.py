@@ -824,7 +824,7 @@ def test_with_a_token_every_route_requires_it():
 # ---------------------------------------------------------------------------
 
 PLATE_ON_THE_WIRE = "PURGEME9"
-DESCRIPTOR_ON_THE_WIRE = "opvid-fp/1:DESCRIPTORONTHEWIRE9"
+DESCRIPTOR_ON_THE_WIRE = "opvid-opa-id/2:DESCRIPTORONTHEWIRE9"
 
 
 def a_lane_that_saw_a_car(events=None):

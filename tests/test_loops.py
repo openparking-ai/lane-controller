@@ -529,7 +529,7 @@ def test_the_same_unmeasured_presence_with_a_real_car_opens_exactly_one_session(
 # ---------------------------------------------------------------------------
 
 PLATE_IN_THE_LOG = "PLATETEXT1"
-DESCRIPTOR_IN_THE_LOG = "opvid-fp/1:DESCRIPTORTEXT1"
+DESCRIPTOR_IN_THE_LOG = "opvid-opa-id/2:DESCRIPTORTEXT1"
 
 
 def _log_events(controller):

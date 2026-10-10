@@ -310,7 +310,7 @@ class VehicleIdentity:
     #: the platform's `vehicles.ticket_ref`, which the retention purge redacts.
     ticket_ref: str | None = None
     #: THE APPEARANCE DESCRIPTOR: an opaque, versioned, compact value
-    #: (`opvid-fp/<version>:…`) produced by the identity service from this read.
+    #: (`opvid-opa-id/<version>:…`) produced by the identity service from this read.
     #: Not an image, and not parsed here: this lane carries it, and the exit's
     #: search compares it against the descriptors of every open stay.
     #:
