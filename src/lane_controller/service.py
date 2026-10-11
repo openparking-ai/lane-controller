@@ -286,7 +286,7 @@ class LaneService:
         controller = self.controller
         return Capabilities(
             # The declared geometry, which is also what the lane writes on
-            # every vehicle. Two closing loops confirm; anything else cannot.
+            # every vehicle. One closing loop or two confirm; none cannot.
             confirms_entry=controller.config.loops.confirms_entry,
             # The WIRING, not a flag. A lane whose identifier is our Vehicle ID
             # client has an identity service; a lane running a stub, or

@@ -32,14 +32,21 @@ class LoopConfig:
     something this software established.
 
     THE VALUES BELOW ARE NOT WHAT A CONFIGURATION FILE GETS. A file declares all
-    seven or it is refused -- see `_declared_loops`. These defaults exist for a
+    eight or it is refused -- see `_declared_loops`. These defaults exist for a
     `LaneConfig` built in code, and they describe the lane this package shipped
     before the loops existed.
 
     Two arming loops BEFORE the barrier: both must read occupied together, so an
-    object has to span the gap. Two closing loops AFTER it, crossed in order:
-    A then B is a vehicle that went in, B then A is one backing out, and one
-    loop cannot tell those apart.
+    object has to span the gap. AFTER it, either the barrier's own closing loop
+    or two confirmation loops:
+
+      * ONE closing loop -- the standard installation, the one in the installer
+        drawings. The loop every barrier lane already has, still wired to the
+        barrier, read through its detector's second output. Occupied after the
+        vend, inside the window, confirms. It cannot see a car that reaches it
+        and then backs out; that car's stay has no exit, as any open stay.
+      * TWO closing loops, crossed in order: A then B is a vehicle that went
+        in, B then A is one backing out.
 
     A site that has installed neither is not refused -- it runs exactly as it
     did, and what it does not get is named in the record on every vehicle
@@ -58,20 +65,26 @@ class LoopConfig:
     arming_loops: int = 1
     #: Metres between the two arming loops. Assumed, never measured here.
     arming_spacing_m: float = 1.5
-    #: 0 or 2. Never 1 -- see __post_init__.
+    #: 0, 1 or 2. 1 is the barrier's own closing loop, read only.
     closing_loops: int = 0
     #: Metres between the two closing loops. Assumed, never measured here.
+    #: 0.0 with one loop -- see __post_init__.
     closing_spacing_m: float = 1.5
     #: How long after a vend the closing sequence may take before the entry is
     #: HELD. Assumed, never measured here.
     confirmation_window_seconds: float = 10.0
     #: 0 or 1. With 1, an occupied deactivate loop holds the arming cycle.
     deactivate_loops: int = 0
-    #: Metres from the deactivate loop to the NEAREST arming loop. Assumed,
-    #: never measured here -- and BOUNDED BELOW, see __post_init__: a loop
-    #: closer than the longest vehicle the lane admits is under that vehicle's
-    #: own tail while its nose is on the arming loop, and it holds itself.
+    #: Metres from the edge of the NEAREST arming loop back to the edge of the
+    #: deactivate loop. Assumed, never measured here -- and it must clear the
+    #: tail below, see __post_init__.
     deactivate_spacing_m: float = 0.0
+    #: Metres from that same arming-loop edge back to the TAIL of the longest
+    #: vehicle this lane admits, stopped at the barrier. Assumed, never
+    #: measured here: it is where the lane's stop line and its longest vehicle
+    #: put a tail, and the deactivate loop must lie beyond it. 0.0 with no
+    #: deactivate loop.
+    longest_vehicle_tail_m: float = 0.0
 
     def __post_init__(self) -> None:
         if self.arming_loops not in (1, 2):
@@ -79,41 +92,54 @@ class LoopConfig:
         if self.deactivate_loops not in (0, 1):
             raise ValueError(f"deactivate_loops must be 0 or 1, got {self.deactivate_loops!r}")
         if self.deactivate_loops == 1:
-            # THE LOWER BOUND, and why it is a refusal and not a warning: a
-            # deactivate loop nearer the arming loop than a vehicle is long
-            # reads occupied under the tail of the very car whose nose is on
-            # the arming loop. That car suppresses its own arming cycle, for
-            # as long as it sits there, and the lane has built a barrier that
-            # holds every long vehicle for ever. The number is an assumption
-            # about vehicles, stated once as `DEACTIVATE_SPACING_MIN_M`, and a
-            # site whose lane admits longer ones declares a larger spacing.
-            if not (
-                isinstance(self.deactivate_spacing_m, (int, float))
-                and math.isfinite(self.deactivate_spacing_m)
-                and self.deactivate_spacing_m >= DEACTIVATE_SPACING_MIN_M
-            ):
+            # THE RULE, and why it is a refusal and not a warning: a
+            # deactivate loop under the tail of the longest vehicle stopped at
+            # the barrier reads occupied under the very car the lane is about
+            # to serve. That car suppresses its own arming cycle, for as long
+            # as it sits there, and the lane has built a barrier that holds
+            # every long vehicle for ever. Where that tail is depends on where
+            # the car stops, not on where the arming loop is -- the arming loop
+            # may sit under the driver's window with the nose well past it --
+            # so the lane declares the tail, and the loop must lie beyond it.
+            for key in ("deactivate_spacing_m", "longest_vehicle_tail_m"):
+                value = getattr(self, key)
+                if not (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    and value >= 0
+                ):
+                    raise ValueError(f"{key} must be a finite number of metres, got {value!r}")
+            if not clears_the_tail(self.deactivate_spacing_m, self.longest_vehicle_tail_m):
                 raise ValueError(
-                    f"deactivate_spacing_m must be a finite number of at least "
-                    f"{DEACTIVATE_SPACING_MIN_M} m, got {self.deactivate_spacing_m!r}: a "
-                    "deactivate loop closer than the longest vehicle sits under that "
-                    "vehicle's own tail and holds it at the barrier for ever"
+                    f"deactivate_spacing_m ({self.deactivate_spacing_m!r} m) must be more than "
+                    f"longest_vehicle_tail_m ({self.longest_vehicle_tail_m!r} m): a deactivate "
+                    "loop under the tail of the longest vehicle stopped at the barrier holds "
+                    "that vehicle at the barrier for ever"
                 )
-        elif self.deactivate_spacing_m != 0.0:
-            # No loop, no spacing. A number here would be published under
-            # `geometry_assumed` as the distance to a loop that does not exist.
+        else:
+            # No loop, no spacing and no tail. A number here would be
+            # published under `geometry_assumed` about a loop that does not exist.
+            for key in ("deactivate_spacing_m", "longest_vehicle_tail_m"):
+                if getattr(self, key) != 0.0:
+                    raise ValueError(
+                        f"{key} must be 0.0 when deactivate_loops is 0, got "
+                        f"{getattr(self, key)!r}: there is no loop for it to be the spacing of"
+                    )
+        if self.closing_loops not in (0, 1, 2):
             raise ValueError(
-                f"deactivate_spacing_m must be 0.0 when deactivate_loops is 0, got "
-                f"{self.deactivate_spacing_m!r}: there is no loop for it to be the spacing of"
+                f"closing_loops must be 0, 1 or 2, got {self.closing_loops!r}: no loops, the "
+                "barrier's own closing loop read through its detector's second output, or two "
+                "confirmation loops crossed in order"
             )
-        if self.closing_loops not in (0, 2):
-            # Not an oversight and not a convenience to be relaxed. ONE closing
-            # loop cannot tell a vehicle going in from one backing out -- it
-            # sees an occupancy either way -- so a site wired with one would be
-            # told it had confirmation and would have a signal that says yes to
-            # the exact case the confirmation exists to catch.
+        if self.closing_loops == 1 and self.closing_spacing_m != 0.0:
+            # One loop, no spacing. A number here would be published under
+            # `geometry_assumed` as the distance to a second loop that is not
+            # there, and a reader would take the lane for one that sees which
+            # way a car went.
             raise ValueError(
-                f"closing_loops must be 0 or 2, got {self.closing_loops!r}: one closing loop "
-                "cannot separate a vehicle entering from one backing out, so it confirms nothing"
+                f"closing_spacing_m must be 0.0 when closing_loops is 1, got "
+                f"{self.closing_spacing_m!r}: there is no second loop for it to be the spacing of"
             )
         if self.confirmation_window_seconds < 0:
             raise ValueError(
@@ -123,8 +149,13 @@ class LoopConfig:
 
     @property
     def confirms_entry(self) -> bool:
-        """Whether this lane can confirm that a vehicle actually went through."""
-        return self.closing_loops == 2
+        """Whether this lane can confirm that a vehicle actually reached past the gate.
+
+        One loop confirms as well as two. What one loop does NOT tell -- a car
+        that reached it and backed out -- is stated on `LoopConfig` and in the
+        README, and `closing_loops: 1` travels on every event that relies on it.
+        """
+        return self.closing_loops in (1, 2)
 
     @property
     def has_deactivate_loop(self) -> bool:
@@ -141,21 +172,24 @@ class LoopConfig:
             "confirmation_window_seconds": self.confirmation_window_seconds,
             "deactivate_loops": self.deactivate_loops,
             "deactivate_spacing_m": self.deactivate_spacing_m,
+            "longest_vehicle_tail_m": self.longest_vehicle_tail_m,
         }
 
 
-#: The least a deactivate loop may sit from the nearest arming loop, in metres.
-#:
-#: A PER-PACKAGE ASSUMPTION ABOUT VEHICLES, NOT A MEASUREMENT: nothing here has
-#: measured a vehicle, and 6 metres is not the length of one. It is drawn
-#: against what the loop MEANS -- "the vehicle behind is too close" -- which is
-#: only true of a loop that a single vehicle cannot cover together with the
-#: arming loop. A long car or a van is under six metres; a lane that admits
-#: anything longer declares a larger spacing, and the record says which value
-#: was in force.
-DEACTIVATE_SPACING_MIN_M = 6.0
+def clears_the_tail(spacing_m: float, tail_m: float) -> bool:
+    """Whether a deactivate loop lies beyond the longest stopped vehicle's tail.
 
-#: The seven keys a `[loops]` table must declare. There is no default for any
+    THE ONE RULE, stated from what the lane declares: both distances run back
+    from the same arming-loop edge, and the loop must start past the tail. What
+    the loop MEANS -- "the vehicle behind is too close" -- is only true of a
+    loop the vehicle being served cannot cover. The longest vehicle is the
+    site's assumption (the installer drawings use a Ford F-150), and the
+    record says which value was in force.
+    """
+    return spacing_m > tail_m
+
+
+#: The eight keys a `[loops]` table must declare. There is no default for any
 #: of them at the file boundary, and that is the whole point of the list.
 LOOP_KEYS = (
     "arming_loops",
@@ -165,6 +199,7 @@ LOOP_KEYS = (
     "confirmation_window_seconds",
     "deactivate_loops",
     "deactivate_spacing_m",
+    "longest_vehicle_tail_m",
 )
 
 
@@ -505,5 +540,6 @@ class LaneConfig:
                 confirmation_window_seconds=float(loops["confirmation_window_seconds"]),
                 deactivate_loops=int(loops["deactivate_loops"]),
                 deactivate_spacing_m=float(loops["deactivate_spacing_m"]),
+                longest_vehicle_tail_m=float(loops["longest_vehicle_tail_m"]),
             ),
         )

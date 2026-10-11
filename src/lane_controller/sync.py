@@ -83,6 +83,10 @@ EXIT_UNCONFIRMABLE = "exit_unconfirmable"
 #: the reason travels to the platform with the session so the money record can
 #: say what confirmed it.
 REASON_FORWARD = "closing_sequence_forward"
+#: The barrier's own closing loop, read through its detector's second output,
+#: read a vehicle inside the window. Its own name, never `closing_sequence_forward`:
+#: one loop saw a vehicle reach it past the gate, and did not see which way it went.
+REASON_CLOSING_LOOP_OCCUPIED = "closing_loop_occupied"
 REASON_REVERSE = "closing_sequence_reverse"
 REASON_WINDOW_ELAPSED = "confirmation_window_elapsed"
 REASON_NO_CLOSING_LOOPS = "no_closing_loops_configured"
@@ -106,8 +110,9 @@ REASON_LOOP_DRIVER_TIMEOUT = "loop_driver_timeout"
 #: went through, and this says a car went through that no vend let in.
 REASON_NO_PENDING_ENTRY = "crossing_with_no_pending_entry"
 
-#: What the platform is told confirmed a session. `confirmed` means two loops
-#: after the gate saw a vehicle cross them forward. `unconfirmable` means this
+#: What the platform is told confirmed a session. `confirmed` means the
+#: barrier's closing loop read a vehicle after the vend, or two loops after the
+#: gate saw one cross them forward; the event's reason says which. `unconfirmable` means this
 #: lane has no closing loops and nothing could have confirmed or refuted it --
 #: which is the honest name for it, and is not the same word as `confirmed`.
 CONFIRMED = "confirmed"

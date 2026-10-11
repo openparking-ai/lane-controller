@@ -6,23 +6,36 @@ box, the vend relay asks the barrier to open, and the loops after the barrier
 say whether a vehicle actually went through.
 
 ```
-arming loops ─▶ grab frames ─▶ identify ─▶ decide ─▶ vend ─▶ closing loops
+arming loops ─▶ grab frames ─▶ identify ─▶ decide ─▶ vend ─▶ closing loop(s)
                                              │                    │
-                                             │                    ├─▶ A→B  confirmed  → session
-                                             │                    ├─▶ B→A  backed out → nothing
-                                             │                    └─▶ none held       → flagged
+                                             │                    ├─▶ occupied (1 loop) confirmed  → session
+                                             │                    ├─▶ A→B (2 loops)     confirmed  → session
+                                             │                    ├─▶ B→A (2 loops)     backed out → nothing
+                                             │                    └─▶ none              held       → flagged
                                              └─▶ fallback (named, logged, never a guess)
 
-          (idle) ─────────────────────────────────────────────▶ closing loops
-                                                                    └─▶ A→B with nothing pending → entry_unadmitted
+          (idle) ─────────────────────────────────────────────▶ closing loop(s)
+                                                                    └─▶ occupied / A→B with nothing pending → entry_unadmitted
 ```
 
 **The ticket is not the entry.** A driver can pull up, take a ticket and drive
 away; a vend with nothing behind it is not an arrival. So the vend creates a
-PENDING entry, and two loops after the barrier, crossed in order inside the
-confirmation window, promote it to a session.
+PENDING entry, and the loop after the barrier promotes it to a session when it
+reads a vehicle inside the confirmation window.
 An entry that is never confirmed is HELD and
 flagged — never voided silently, and never turned into a session.
+
+**One closing loop is the standard installation**, and it is the loop every
+barrier lane already has: the barrier's own closing loop, under the arm, which
+the installer drawings show. It stays wired to the barrier, which closes on it by
+itself. Its loop detector's second output goes to an input on the lane's control
+panel, and the lane only reads that input (`closing_loops = 1`). Occupied after
+the vend, inside the window, is `confirmed`, at an entry and at an exit alike.
+**What one loop does not tell:** which way the car then went. A car that reaches
+the loop and backs out is not seen; its stay simply has no exit, as any open
+stay. A site that wants that seen installs two confirmation loops after the gate
+(`closing_loops = 2`): crossed A then B they confirm, B then A is a car backing
+out. Every event carries the geometry it relied on, `closing_loops` included.
 
 **It narrows the fraud rather than closing it**: a ticket with no car becomes a
 ticket with *a* car, because nothing here binds the crossing to the vehicle that
@@ -32,8 +45,9 @@ took the ticket, and that binding is unbuilt.
 what becomes of a vend, and the loops after the barrier used to be read only
 after one — so a car the lane refused that drove in anyway, a car following the
 one admitted, and every car through a barrier that is simply up were in no
-record at all. The lane now polls those loops on every idle turn, and a forward
-crossing found with nothing pending is an `entry_unadmitted` event: an entry,
+record at all. The lane now polls those loops on every idle turn, and the closing
+loop occupied (or, with two loops, a forward crossing) found with nothing pending
+is an `entry_unadmitted` event: an entry,
 because a vehicle is inside; a different one, because nothing admitted it. It
 opens no session, moves no transit state, and is never folded into
 `entry_confirmed`. A stream of them on `GET /v1/lane/events` is what a broken
@@ -46,9 +60,9 @@ Holding it open instead would leave the stay unbilled and the vehicle counted as
 inside for ever, which would make installing the loops worse than not.
 
 **The barrier still closes itself on its own closing loop.** That loop is wired
-to the barrier and never to this controller, the confirmation loops above are a
-different pair that this package reads and never drives, and there is no
-`close()` anywhere in this package. A controller that could close a barrier is a
+to the barrier; this controller reads its detector's second output and drives
+nothing on it, as it reads and never drives a pair of confirmation loops, and
+there is no `close()` anywhere in this package. A controller that could close a barrier is a
 controller that could close one on a vehicle; the safety case rests on that
 being impossible rather than on us being careful.
 
@@ -319,7 +333,7 @@ None of it is required to run this package, and none of it has been purchased ye
 |---|---|
 | Controller | Seeed reComputer Industrial J3011 (Jetson Orin NX), in the gate housing |
 | Barrier | Q-SAQ, driven by a dry-contact vend relay |
-| Detection | Inductive arming loops before the barrier, an optional deactivate loop before those, and two confirmation loops after it; plus the barrier's own closing loop, which is wired to the barrier |
+| Detection | Inductive arming loops before the barrier, an optional deactivate loop before those, and the barrier's own closing loop, wired to the barrier and read through its detector's second output; or two confirmation loops after the gate |
 | Cameras — default | Reolink RLC-810A |
 | Cameras — upper tiers | Axis P1465-LE, Hanwha XNO-9082R |
 

@@ -85,7 +85,8 @@ public; the lane's copy of its contract is
     "closing_spacing_m": 1.5,
     "confirmation_window_seconds": 10.0,
     "deactivate_loops": 0,
-    "deactivate_spacing_m": 0.0
+    "deactivate_spacing_m": 0.0,
+    "longest_vehicle_tail_m": 0.0
   },
   "event_window_depth": 256,
   "capabilities": {
@@ -119,12 +120,13 @@ the lane armed for it) or `arming_loop_cleared` (the vehicle left without being
 armed for — it backed out, or it followed the car ahead). The hold is a LEVEL,
 re-read on every turn of the lane's sequence, never an edge: it ends the moment
 the loop clears, not on some later arrival. `deactivate_spacing_m` is the
-distance from that loop to the nearest arming loop and is **bounded below at
-6.0 m**: a loop closer than the longest vehicle sits under that vehicle's own
-tail while its nose is on the arming loop, and it would hold itself for ever.
-The bound is an assumption about vehicles, not a measurement; a lane that
-admits longer ones declares a larger spacing. A lane with no such loop declares
-`0` and `0.0` and is never held.
+distance back from the nearest arming loop's edge to that loop, and
+`longest_vehicle_tail_m` the distance back from the same edge to the tail of the
+longest vehicle the lane admits, stopped at the barrier. **The spacing must be
+more than the tail**: a loop under that tail holds the very car the lane is
+serving, for ever. Both are assumptions, not measurements; the installer
+drawings' lane declares 4.12 and 3.32 (a Ford F-150 stopped 1.0 m before the
+arm). A lane with no such loop declares `0`, `0.0` and `0.0` and is never held.
 
 `event_window_depth` is how many events `GET /v1/lane/events` can still serve
 behind the current cursor. Fall further behind than this and you are told
@@ -139,7 +141,7 @@ its wiring, its route table — and none is a flag somebody set.
 
 | | |
 |---|---|
-| `confirms_entry` | Two loops after the barrier can say whether a vehicle actually went through. **`false` is an ordinary lane, not a broken one**, and a consumer must have a case for a lane that cannot confirm anything, because a third-party lane usually cannot. |
+| `confirms_entry` | The barrier's closing loop, read through its detector's second output (`closing_loops: 1`), or two loops after the barrier crossed in order (`closing_loops: 2`), can say whether a vehicle actually went through. One loop does not say which way it then went. **`false` is an ordinary lane, not a broken one**, and a consumer must have a case for a lane that cannot confirm anything, because a third-party lane usually cannot. |
 | `has_identity_service` | This lane is wired to an identification service. `false` means identity comes from somewhere else, or from nowhere. |
 | `has_platform` | This lane reports to a platform. **`false` is standalone, which is a supported mode and not a degraded one.** |
 | `has_display` | A display this lane can put a per-arrival code on. `false` until a display seam exists; derived from the wiring, so the day one is wired this follows it. |

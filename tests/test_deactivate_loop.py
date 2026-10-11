@@ -27,6 +27,8 @@ non-event the record exists to prevent.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from lane_controller import (
@@ -38,7 +40,6 @@ from lane_controller import (
     LoopConfig,
     VehicleIdentity,
 )
-from lane_controller.config import DEACTIVATE_SPACING_MIN_M
 from lane_controller.contract import VEND_BLOCKING, HealthState, MalfunctionCode, VendRefusal
 from lane_controller.events import EventQueue
 from lane_controller.interfaces import ClosingSequence, LoopInput
@@ -61,6 +62,16 @@ from lane_controller.sync import (
 
 READABLE = [VehicleIdentity(plate="SIM-0001", confidence=0.97, presence=True)]
 UNREADABLE = [VehicleIdentity(plate=None, confidence=0.10, presence=True)]
+
+
+
+#: The installer drawings' lane, every distance back from the gate arm (admin
+#: `src/drawings/numbers.js`): L2 centred at 3.5 m, 0.76 m long; an F-150 of
+#: 6.20 m stopped 1.0 m before the arm; L1's near edge at 8.0 m.
+ARMING_FAR_EDGE_M = 3.5 + 0.76 / 2
+DRAWN_SPACING_M = 4.12  # 8.0 - 3.88
+DRAWN_TAIL_M = 3.32  # 1.0 + 6.20 - 3.88
+EXAMPLE = Path(__file__).parent.parent / "config" / "lane.example.toml"
 
 
 class EdgeLoop(LoopInput):
@@ -126,7 +137,8 @@ def a_lane(
             closing_spacing_m=1.5,
             confirmation_window_seconds=10.0,
             deactivate_loops=deactivate_loops,
-            deactivate_spacing_m=DEACTIVATE_SPACING_MIN_M if deactivate_loops else 0.0,
+            deactivate_spacing_m=DRAWN_SPACING_M if deactivate_loops else 0.0,
+            longest_vehicle_tail_m=DRAWN_TAIL_M if deactivate_loops else 0.0,
         ),
         **extra,
     )
@@ -186,7 +198,8 @@ def test_a_vehicle_on_the_deactivate_loop_holds_the_arming_and_the_hold_is_recor
     (start,) = details(controller, ARMING_SUPPRESSED)
     assert start["reason"] == REASON_VEHICLE_TOO_CLOSE
     assert start["geometry_assumed"]["deactivate_loops"] == 1
-    assert start["geometry_assumed"]["deactivate_spacing_m"] == DEACTIVATE_SPACING_MIN_M
+    assert start["geometry_assumed"]["deactivate_spacing_m"] == DRAWN_SPACING_M
+    assert start["geometry_assumed"]["longest_vehicle_tail_m"] == DRAWN_TAIL_M
 
 
 def test_the_control_the_same_lane_arms_when_the_deactivate_loop_is_clear():
@@ -393,25 +406,66 @@ def test_a_lane_with_no_deactivate_loop_answers_unknown_for_its_stuck_code():
 @pytest.mark.parametrize("count", [2, -1, 3])
 def test_deactivate_loops_is_zero_or_one(count):
     with pytest.raises(ValueError, match="deactivate_loops must be 0 or 1"):
-        LoopConfig(deactivate_loops=count, deactivate_spacing_m=6.0)
+        LoopConfig(
+            deactivate_loops=count,
+            deactivate_spacing_m=DRAWN_SPACING_M,
+            longest_vehicle_tail_m=DRAWN_TAIL_M,
+        )
 
 
-@pytest.mark.parametrize("spacing", [0.0, 5.99, -6.0, float("nan"), float("inf")])
-def test_a_deactivate_loop_closer_than_the_longest_vehicle_is_refused(spacing):
-    """Under the tail of the very car whose nose is on the arming loop, it holds
-    that car for ever. Refused at the bound, naming it."""
-    with pytest.raises(ValueError, match=f"at least {DEACTIVATE_SPACING_MIN_M}"):
-        LoopConfig(deactivate_loops=1, deactivate_spacing_m=spacing)
+@pytest.mark.parametrize(
+    "near_edge_from_arm_m",
+    [
+        7.0,  # inside a stopped F-150 (tail at 7.2 m): the U7e brief's case
+        7.2,  # exactly at the tail: touching it is under it
+        4.5,
+    ],
+)
+def test_a_deactivate_loop_under_the_longest_stopped_vehicle_is_refused(near_edge_from_arm_m):
+    """Under the tail of the very car stopped at the barrier, it holds that car
+    for ever. Refused, naming both distances."""
+    with pytest.raises(ValueError, match="must be more than longest_vehicle_tail_m"):
+        LoopConfig(
+            deactivate_loops=1,
+            deactivate_spacing_m=round(near_edge_from_arm_m - ARMING_FAR_EDGE_M, 2),
+            longest_vehicle_tail_m=DRAWN_TAIL_M,
+        )
 
 
-def test_the_bound_itself_is_accepted():
-    loops = LoopConfig(deactivate_loops=1, deactivate_spacing_m=DEACTIVATE_SPACING_MIN_M)
+@pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize("key", ["deactivate_spacing_m", "longest_vehicle_tail_m"])
+def test_a_distance_that_is_not_one_is_refused(key, bad):
+    values = {"deactivate_spacing_m": DRAWN_SPACING_M, "longest_vehicle_tail_m": DRAWN_TAIL_M}
+    values[key] = bad
+    with pytest.raises(ValueError, match=f"{key} must be a finite number of metres"):
+        LoopConfig(deactivate_loops=1, **values)
+
+
+def test_the_drawn_lane_is_accepted():
+    """The installer drawings' lane (admin `src/drawings/numbers.js`): L2
+    centred 3.5 m before the arm, 0.76 m long; an F-150, 6.20 m, stopped 1.0 m
+    before the arm; L1's near edge 8.0 m before the arm. L1 sits 0.8 m behind
+    the tail and 4.12 m from L2 -- under the 6.0 m floor this replaced."""
+    loops = LoopConfig(
+        deactivate_loops=1,
+        deactivate_spacing_m=DRAWN_SPACING_M,
+        longest_vehicle_tail_m=DRAWN_TAIL_M,
+    )
     assert loops.has_deactivate_loop
+    assert DRAWN_SPACING_M < 6.0
 
 
-def test_no_loop_means_no_spacing():
+def test_the_example_config_declares_the_drawn_third_loop():
+    loops = LaneConfig.from_file(EXAMPLE).loops
+    assert loops.deactivate_loops == 1
+    assert loops.deactivate_spacing_m == DRAWN_SPACING_M
+    assert loops.longest_vehicle_tail_m == DRAWN_TAIL_M
+
+
+@pytest.mark.parametrize("key", ["deactivate_spacing_m", "longest_vehicle_tail_m"])
+def test_no_loop_means_no_spacing_and_no_tail(key):
     with pytest.raises(ValueError, match="must be 0.0 when deactivate_loops is 0"):
-        LoopConfig(deactivate_loops=0, deactivate_spacing_m=6.0)
+        LoopConfig(deactivate_loops=0, **{key: 4.12})
 
 
 def test_declared_and_wired_must_agree():
@@ -428,7 +482,14 @@ def test_declared_and_wired_must_agree():
         vend=RecordingVendOutput(),
         identifier=StubVehicleIdentifier(READABLE),
     )
-    declared = LaneConfig(loops=LoopConfig(deactivate_loops=1, deactivate_spacing_m=6.0), **base)
+    declared = LaneConfig(
+        loops=LoopConfig(
+            deactivate_loops=1,
+        deactivate_spacing_m=DRAWN_SPACING_M,
+        longest_vehicle_tail_m=DRAWN_TAIL_M,
+        ),
+        **base,
+    )
     with pytest.raises(ValueError, match="deactivate_loops = 1 but deactivate_loop was not"):
         LaneController(declared, **seams)
     undeclared = LaneConfig(loops=LoopConfig(), **base)
@@ -450,3 +511,4 @@ def test_a_lane_without_the_loop_publishes_zero_and_is_never_held():
     (armed,) = details(controller, ARMED)
     assert armed["geometry_assumed"]["deactivate_loops"] == 0
     assert armed["geometry_assumed"]["deactivate_spacing_m"] == 0.0
+    assert armed["geometry_assumed"]["longest_vehicle_tail_m"] == 0.0

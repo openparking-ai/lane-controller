@@ -3,17 +3,21 @@
     arming loops -> grab frames -> identify -> decide -> vend -> closing loops
 
 The barrier still closes itself on its own closing loop; the controller has no
-part in that and no way to interfere with it. The two loops at the end of the
-line above are a different pair -- after the gate, read and never driven -- and
-they are what says whether a vehicle actually went through.
+part in that and no way to interfere with it. The closing loops at the end of
+the line above are READ and never driven, and they are what says whether a
+vehicle actually went through: either the barrier's own closing loop, read
+through its detector's second output (the standard installation), or a pair of
+confirmation loops after the gate.
 
-THE TICKET IS NOT THE ENTRY. A vend creates a PENDING entry. Two loops after
-the barrier, crossed A then B inside the confirmation window, promote it to a
-session. B then A is somebody backing out and closes it with its own reason.
-The window elapsing with nothing is a third answer -- HELD -- and it is neither
-of the other two: voiding it silently re-creates the abandoned-ticket fraud,
-and turning it into a session is the phantom occupant that fills a garage on
-paper before it fills in concrete.
+THE TICKET IS NOT THE ENTRY. A vend creates a PENDING entry. The closing loop
+reading a vehicle inside the confirmation window promotes it to a session; at a
+lane with two loops, so does A then B, and B then A is somebody backing out and
+closes it with its own reason. The window elapsing with nothing is a third
+answer -- HELD -- and it is neither of the other two: voiding it silently
+re-creates the abandoned-ticket fraud, and turning it into a session is the
+phantom occupant that fills a garage on paper before it fills in concrete. One
+loop cannot see a car that reaches it and then backs out; that car's stay has
+no exit, as any open stay, and `closing_loops: 1` is on every event that says so.
 
 A lane with no closing loops installed is not refused. It opens its sessions as
 it always did, and every one of them carries `unconfirmable` and an
@@ -26,8 +30,9 @@ what becomes of a vend, and until `observe_closing_loops` existed the loops
 were read only after one -- so a car the lane refused that drove in anyway, a
 car following the one admitted, and every car through a barrier that is simply
 up crossed loops nobody was reading and were in no record at all. Now the loops
-are polled on every idle turn of `run_once` while nothing is pending, and a forward
-crossing found that way is an `entry_unadmitted` event: an entry, because a
+are polled on every idle turn of `run_once` while nothing is pending, and a
+crossing found that way that would have confirmed a vend -- forward over two
+loops, an occupancy of one -- is an `entry_unadmitted` event: an entry, because a
 vehicle is inside; a different one, because nothing admitted it. It opens no
 session, it moves no transit state, and it is never folded into
 `entry_confirmed`. A stream of them is what a broken boom looks like from here.
@@ -77,6 +82,7 @@ from .sync import (
     EXIT_UNCONFIRMABLE,
     HELD,
     REASON_ARMING_INCOMPLETE,
+    REASON_CLOSING_LOOP_OCCUPIED,
     REASON_FORWARD,
     REASON_LOOP_DRIVER_TIMEOUT,
     REASON_NO_CLOSING_LOOPS,
@@ -132,6 +138,29 @@ _EXIT = _TransitNames(
     unconfirmable=EXIT_UNCONFIRMABLE,
     session_kind=SESSION_CLOSE,
 )
+
+#: What each closing-loop geometry can report. A lane that receives anything
+#: else from its driver did not get an answer it can use: one loop cannot have
+#: seen a direction, and a two-loop lane is never confirmed on one occupancy.
+_ANSWERS = {
+    1: frozenset({ClosingSequence.OCCUPIED, ClosingSequence.NONE}),
+    2: frozenset({ClosingSequence.FORWARD, ClosingSequence.REVERSE, ClosingSequence.NONE}),
+}
+
+
+
+def _confirmed_by(crossing: ClosingSequence) -> str:
+    """The reason a confirmed transit carries, by what confirmed it.
+
+    Two names, not one: a confirmation that also saw the direction and one that
+    did not are different evidence, and the record says which. Read at call
+    time, not built into a table at import, so the module's names are the ones
+    in force.
+    """
+    if crossing is ClosingSequence.FORWARD:
+        return REASON_FORWARD
+    return REASON_CLOSING_LOOP_OCCUPIED
+
 
 log = logging.getLogger(__name__)
 
@@ -705,8 +734,35 @@ class LaneController:
 
     @staticmethod
     def _confirms(crossing: ClosingSequence) -> bool:
-        """Only A-then-B confirms. Nothing else is folded into it."""
-        return crossing is ClosingSequence.FORWARD
+        """A-then-B over two loops, or the closing loop occupied. Nothing else.
+
+        ONE function for both ends and for both reads: the vend's (entry and
+        exit alike, through `resolve_transit`) and the idle poll's, which
+        records what would have confirmed a vend as an entry nothing admitted.
+        Which geometry may give which answer is `_as_declared`'s.
+        """
+        return crossing in (ClosingSequence.FORWARD, ClosingSequence.OCCUPIED)
+
+    def _as_declared(self, crossing: ClosingSequence) -> ClosingSequence:
+        """The driver's answer, if this lane's declared geometry can give it.
+
+        A one-loop lane whose driver says FORWARD is claiming a direction no
+        loop at this lane can see; a two-loop lane whose driver says OCCUPIED
+        would be confirmed on one occupancy, which is weaker than what that lane
+        declared. Either is a driver that does not match the lane, and its
+        answer is not used: the transit takes the path an absent crossing takes,
+        and the log says why.
+        """
+        if crossing in _ANSWERS[self.config.loops.closing_loops]:
+            return crossing
+        log.error(
+            "lane %s: the closing-loop driver reported %s, which a lane with %d closing "
+            "loop(s) cannot report; not used",
+            self.config.lane_id,
+            crossing.value,
+            self.config.loops.closing_loops,
+        )
+        return ClosingSequence.NONE
 
     @staticmethod
     def _refutes(crossing: ClosingSequence) -> bool:
@@ -861,7 +917,7 @@ class LaneController:
         # session out of a window this lane published on the event and never
         # applied.
         started = self._clock()
-        crossing = self._read_closing_loops(window, at)
+        crossing = self._as_declared(self._read_closing_loops(window, at))
         elapsed = self._clock() - started
 
         # THE DRIVER RETURNED. Whether this call is still the one that may say
@@ -876,7 +932,11 @@ class LaneController:
 
         if self._confirms(crossing) and self._within_window(elapsed, window):
             self.events.record(
-                names.confirmed, lane, reason=REASON_FORWARD, at=at, geometry_assumed=geometry
+                names.confirmed,
+                lane,
+                reason=_confirmed_by(crossing),
+                at=at,
+                geometry_assumed=geometry,
             )
             self._transit(TransitState.CONFIRMED, at)
             self._record_session(identity, at, confirmation=CONFIRMED, exit_pricing=exit_pricing)
@@ -894,8 +954,8 @@ class LaneController:
             self._transit(TransitState.BACKED_OUT, at)
             return
 
-        # No confirmation inside the window: nothing crossed, or a FORWARD
-        # arrived after it. At an ENTRY that is NEVER silently voided -- that is
+        # No confirmation inside the window: nothing crossed, or a FORWARD or
+        # an occupancy arrived after it. At an ENTRY that is NEVER silently voided -- that is
         # the abandoned-ticket fraud, exactly the ticket no car ever followed --
         # and NEVER turned into a session, which is the phantom occupant. Held
         # and flagged. What an attendant does about it is the intercom's job and
@@ -1063,7 +1123,8 @@ class LaneController:
         crossed, or because what crossed was handed to a vend that began
         during the read.
 
-        WHAT IT RECORDS. A FORWARD crossing at an ENTRY lane is
+        WHAT IT RECORDS. A crossing at an ENTRY lane that would have confirmed
+        a vend (`_confirms`: FORWARD over two loops, OCCUPIED over one) is
         `entry_unadmitted`, with its own reason and with what this lane last
         decided and what its last vend became beside it -- the lane cannot bind
         the crossing to either, and the detail says what it knew rather than
@@ -1102,7 +1163,7 @@ class LaneController:
         # `_transit`, and with it `POST /v1/lane/vend` after the relay had
         # pulsed. The claim above is what a vend's read waits for instead.
         try:
-            crossing = self.closing_loops.poll_sequence()
+            crossing = self._as_declared(self.closing_loops.poll_sequence())
         except BaseException:
             with self._board:
                 self._poll_reading = False
@@ -1139,7 +1200,7 @@ class LaneController:
             return None
 
         lane = self.config.lane_id
-        if crossing is not ClosingSequence.FORWARD:
+        if not self._confirms(crossing):
             log.warning(
                 "lane %s: the loops after the gate reported %s with nothing pending; "
                 "not an entry, not recorded",

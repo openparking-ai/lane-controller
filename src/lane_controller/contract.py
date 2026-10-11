@@ -268,8 +268,9 @@ class Capabilities:
     is a capability set that will one day be wrong.
     """
 
-    #: Two loops after the barrier, crossed in order, can say whether a vehicle
-    #: actually went through. `false` is an ordinary lane, not a broken one --
+    #: The barrier's closing loop, read through its detector's second output, or
+    #: two loops after it crossed in order, can say whether a vehicle actually
+    #: went through. `false` is an ordinary lane, not a broken one --
     #: and a consumer must have a case for a lane that cannot confirm anything,
     #: because a third-party lane usually cannot.
     confirms_entry: bool
@@ -357,7 +358,8 @@ class TransitState(StrEnum):
 
     #: A vend happened and nothing has decided its fate yet.
     PENDING = "pending"
-    #: Two loops after the gate saw a vehicle cross them forward, in the window.
+    #: The closing loop read a vehicle, or two loops after the gate saw one cross
+    #: them forward, in the window.
     CONFIRMED = "confirmed"
     #: The window elapsed with no crossing. Flagged, never voided, never promoted.
     HELD = "held"
