@@ -8,7 +8,8 @@ Reference hardware, none of which is required to run this package:
 
   * controller  Seeed reComputer Industrial J3011 (Jetson Orin NX)
   * barrier     Q-SAQ, driven by a dry-contact vend relay
-  * detection   inductive arming loop, plus the barrier's own closing loop
+  * detection   inductive arming loop, plus the barrier's own closing loop,
+                read through its detector's second output and never driven
   * cameras     Reolink RLC-810A (default tier), Axis P1465-LE or
                 Hanwha XNO-9082R (upper tiers). RTSP and PoE, always.
 """
@@ -44,11 +45,10 @@ class LoopInput(Protocol):
     `LoopConfig.arming_loops`; a site with one is not refused and says so in
     every record it writes.
 
-    This is the *arming* stage only. Two other loops exist and neither is this:
-    the barrier's own safety closing loop, which is wired to the barrier and is
-    deliberately not represented anywhere in this package (see VendOutput); and
-    the pair of CONFIRMATION loops after the gate, which this package reads but
-    does not drive (see ClosingLoops).
+    This is the *arming* stage only. The loops after the gate are not this,
+    and this package reads them and never drives them (see ClosingLoops):
+    either the barrier's own closing loop, read through a second output of its
+    detector -- the standard installation -- or a pair of CONFIRMATION loops.
     """
 
     def wait_for_vehicle(self, timeout: float | None = None) -> bool:
@@ -79,10 +79,12 @@ class VendOutput(Protocol):
     """The vend relay: a momentary dry contact that asks the barrier to open.
 
     There is no close() and there will not be one. The barrier closes itself on
-    its own closing loop, which is wired to the barrier and never to us. A
-    controller that could close a barrier is a controller that can close one on
-    a vehicle -- the safety case depends on that not being possible, not on us
-    being careful.
+    its own closing loop, which is wired to the barrier. A lane may READ that
+    loop, through a second output of its detector (see ClosingLoops), and that
+    reading drives nothing: the barrier closes on the loop whether this package
+    reads it or not. A controller that could close a barrier is a controller
+    that can close one on a vehicle -- the safety case depends on that not
+    being possible, not on us being careful.
     """
 
     def vend(self, reason: str) -> None:
@@ -91,19 +93,29 @@ class VendOutput(Protocol):
 
 
 class ClosingSequence(StrEnum):
-    """What the two loops after the gate saw, in order.
+    """What the loops after the gate saw.
 
-    The direction is the whole point, and it is why there are two. Every camera
-    measurement PREDICTS -- is there a vehicle there now -- and a prediction can
-    be quietly wrong. Two loops crossed in order CONFIRM that a vehicle-length
-    object travelled forward through the gate. One loop reads an occupancy and
-    cannot tell a vehicle going in from one backing out.
+    Every camera measurement PREDICTS -- is there a vehicle there now -- and a
+    prediction can be quietly wrong. A loop after the gate reading a vehicle is
+    an observation instead. How much it says depends on how many loops there are,
+    and each lane reports only the answers its own geometry can give:
+
+      * ONE loop -- the barrier's own closing loop, read only -- reports
+        OCCUPIED or NONE. A vehicle reached the loop past the gate. It cannot
+        tell a vehicle going in from one that reached the loop and then backed
+        out, and it does not pretend to: that car's stay simply has no exit, as
+        any open stay.
+      * TWO loops, crossed in order, report FORWARD, REVERSE or NONE: a
+        vehicle-length object travelled through the gate, and which way.
     """
 
-    #: A then B. A vehicle went through the gate.
+    #: A then B. A vehicle went through the gate. Two loops only.
     FORWARD = "forward"
-    #: B then A. Somebody backed out. No session, no occupancy.
+    #: B then A. Somebody backed out. No session, no occupancy. Two loops only.
     REVERSE = "reverse"
+    #: The barrier's closing loop read a vehicle. One loop only: a vehicle
+    #: reached the loop past the gate, which way it then went is not seen.
+    OCCUPIED = "occupied"
     #: The window elapsed with no sequence at all. NOT a confirmation and NOT a
     #: refutation -- a third state, and it is held rather than folded into
     #: either of the other two.
@@ -111,21 +123,29 @@ class ClosingSequence(StrEnum):
 
 
 class ClosingLoops(Protocol):
-    """The pair of confirmation loops AFTER the barrier, read and never driven.
+    """The loops AFTER the barrier, read and never driven.
 
-    Not to be confused with the barrier's own closing loop, which lowers the
-    boom and is wired to the barrier. This package still cannot close a barrier
-    and there is still no close() anywhere in it -- the safety case depends on
-    that remaining impossible. These two loops are an INPUT: they report that
-    something crossed them, in an order, and the controller reads that report.
+    ONE LOOP, the standard installation: the barrier's own closing loop, which
+    lowers the boom and stays wired to the barrier. Its detector's second output
+    goes to an input on the lane's control panel, and that input is all this
+    package sees. The barrier closes on the loop by itself whether or not
+    anything reads it. Reports OCCUPIED or NONE.
+
+    TWO LOOPS: a pair of confirmation loops after the gate, crossed in order.
+    Reports FORWARD, REVERSE or NONE.
+
+    Either way this package still cannot close a barrier and there is still no
+    close() anywhere in it -- the safety case depends on that remaining
+    impossible. The loops are an INPUT: they report what they saw, and the
+    controller reads that report.
     """
 
     def wait_for_sequence(self, window_seconds: float) -> ClosingSequence:
         """Block up to `window_seconds` for a crossing, and say which way it went.
 
         Returns NONE if the window elapses with no complete sequence. An
-        implementation must not report FORWARD for a crossing that took longer
-        than the window -- the window is what makes the confirmation mean "a
+        implementation must not report FORWARD, or OCCUPIED, for a crossing
+        that took longer than the window -- the window is what makes the confirmation mean "a
         vehicle went through in a plausible time" rather than "something
         happened here eventually".
 

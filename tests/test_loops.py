@@ -214,9 +214,11 @@ def test_declared_geometry_and_wired_hardware_must_agree():
         LaneController(config, arming_loop_b=OccupancyLoopInput(), **common)
 
 
-def test_one_closing_loop_is_refused_because_it_confirms_nothing():
-    with pytest.raises(ValueError, match="cannot separate"):
-        LoopConfig(closing_loops=1)
+@pytest.mark.parametrize("count", [3, -1])
+def test_a_closing_loop_count_no_lane_has_is_refused(count):
+    """0, 1 or 2. One is the barrier's own closing loop (tests/test_closing_loop.py)."""
+    with pytest.raises(ValueError, match="must be 0, 1 or 2"):
+        LoopConfig(closing_loops=count)
 
 
 # ---------------------------------------------------------------------------

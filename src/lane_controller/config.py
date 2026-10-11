@@ -37,9 +37,16 @@ class LoopConfig:
     before the loops existed.
 
     Two arming loops BEFORE the barrier: both must read occupied together, so an
-    object has to span the gap. Two closing loops AFTER it, crossed in order:
-    A then B is a vehicle that went in, B then A is one backing out, and one
-    loop cannot tell those apart.
+    object has to span the gap. AFTER it, either the barrier's own closing loop
+    or two confirmation loops:
+
+      * ONE closing loop -- the standard installation, the one in the installer
+        drawings. The loop every barrier lane already has, still wired to the
+        barrier, read through its detector's second output. Occupied after the
+        vend, inside the window, confirms. It cannot see a car that reaches it
+        and then backs out; that car's stay has no exit, as any open stay.
+      * TWO closing loops, crossed in order: A then B is a vehicle that went
+        in, B then A is one backing out.
 
     A site that has installed neither is not refused -- it runs exactly as it
     did, and what it does not get is named in the record on every vehicle
@@ -58,9 +65,10 @@ class LoopConfig:
     arming_loops: int = 1
     #: Metres between the two arming loops. Assumed, never measured here.
     arming_spacing_m: float = 1.5
-    #: 0 or 2. Never 1 -- see __post_init__.
+    #: 0, 1 or 2. 1 is the barrier's own closing loop, read only.
     closing_loops: int = 0
     #: Metres between the two closing loops. Assumed, never measured here.
+    #: 0.0 with one loop -- see __post_init__.
     closing_spacing_m: float = 1.5
     #: How long after a vend the closing sequence may take before the entry is
     #: HELD. Assumed, never measured here.
@@ -105,15 +113,20 @@ class LoopConfig:
                 f"deactivate_spacing_m must be 0.0 when deactivate_loops is 0, got "
                 f"{self.deactivate_spacing_m!r}: there is no loop for it to be the spacing of"
             )
-        if self.closing_loops not in (0, 2):
-            # Not an oversight and not a convenience to be relaxed. ONE closing
-            # loop cannot tell a vehicle going in from one backing out -- it
-            # sees an occupancy either way -- so a site wired with one would be
-            # told it had confirmation and would have a signal that says yes to
-            # the exact case the confirmation exists to catch.
+        if self.closing_loops not in (0, 1, 2):
             raise ValueError(
-                f"closing_loops must be 0 or 2, got {self.closing_loops!r}: one closing loop "
-                "cannot separate a vehicle entering from one backing out, so it confirms nothing"
+                f"closing_loops must be 0, 1 or 2, got {self.closing_loops!r}: no loops, the "
+                "barrier's own closing loop read through its detector's second output, or two "
+                "confirmation loops crossed in order"
+            )
+        if self.closing_loops == 1 and self.closing_spacing_m != 0.0:
+            # One loop, no spacing. A number here would be published under
+            # `geometry_assumed` as the distance to a second loop that is not
+            # there, and a reader would take the lane for one that sees which
+            # way a car went.
+            raise ValueError(
+                f"closing_spacing_m must be 0.0 when closing_loops is 1, got "
+                f"{self.closing_spacing_m!r}: there is no second loop for it to be the spacing of"
             )
         if self.confirmation_window_seconds < 0:
             raise ValueError(
@@ -123,8 +136,13 @@ class LoopConfig:
 
     @property
     def confirms_entry(self) -> bool:
-        """Whether this lane can confirm that a vehicle actually went through."""
-        return self.closing_loops == 2
+        """Whether this lane can confirm that a vehicle actually reached past the gate.
+
+        One loop confirms as well as two. What one loop does NOT tell -- a car
+        that reached it and backed out -- is stated on `LoopConfig` and in the
+        README, and `closing_loops: 1` travels on every event that relies on it.
+        """
+        return self.closing_loops in (1, 2)
 
     @property
     def has_deactivate_loop(self) -> bool:

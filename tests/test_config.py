@@ -157,9 +157,11 @@ def test_the_example_config_is_the_standard_installation():
     loops = LaneConfig.from_file(EXAMPLE).loops
 
     assert loops.arming_loops == 2
-    assert loops.closing_loops == 2
+    # The barrier's own closing loop, read only: the loop the installer
+    # drawings show. No second loop, so no spacing.
+    assert loops.closing_loops == 1
     assert loops.arming_spacing_m == 1.5
-    assert loops.closing_spacing_m == 1.5
+    assert loops.closing_spacing_m == 0.0
     assert loops.confirmation_window_seconds == 10.0
     assert loops.confirms_entry is True
 
@@ -233,6 +235,18 @@ def detail(controller, kind):
     return next(e for e in list(controller.events._queue) if e.kind == kind).detail
 
 
+def two_loop_example(tmp_path: Path) -> Path:
+    """The example file declaring two confirmation loops, 1.5 m apart."""
+    once = edited(tmp_path, r"^closing_loops\b", "closing_loops     = 2")
+    lines = once.read_text().splitlines(keepends=True)
+    hits = [i for i, line in enumerate(lines) if re.match(r"^closing_spacing_m\b", line)]
+    assert len(hits) == 1
+    lines[hits[0]] = "closing_spacing_m = 1.5\n"
+    once.write_text("".join(lines))
+    assert LaneConfig.from_file(once).loops.closing_loops == 2
+    return once
+
+
 @pytest.mark.parametrize(
     ("crossings", "expected_event", "session"),
     [
@@ -241,7 +255,33 @@ def detail(controller, kind):
         ([], "entry_held", None),
     ],
 )
-def test_a_declared_two_loop_lane_gets_the_three_outcomes(crossings, expected_event, session):
+def test_a_declared_two_loop_lane_gets_the_three_outcomes(
+    tmp_path, crossings, expected_event, session
+):
+    controller, vend = build_from(two_loop_example(tmp_path), crossings)
+
+    controller.run_once()
+
+    assert vend.vend_count == 1
+    assert expected_event in kinds(controller)
+    if session is None:
+        assert SESSION_OPEN not in kinds(controller)
+    else:
+        assert detail(controller, SESSION_OPEN)["entry_confirmation"] == session
+
+
+@pytest.mark.parametrize(
+    ("crossings", "expected_event", "session"),
+    [
+        ([(ClosingSequence.OCCUPIED, 3.0)], "entry_confirmed", CONFIRMED),
+        ([], "entry_held", None),
+    ],
+)
+def test_the_standard_one_loop_lane_confirms_on_the_closing_loop(
+    crossings, expected_event, session
+):
+    """The example file as an installer copies it: the closing loop read after
+    the vend confirms, nothing in the window holds."""
     controller, vend = build_from(EXAMPLE, crossings)
 
     controller.run_once()

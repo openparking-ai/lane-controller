@@ -2504,3 +2504,81 @@ def _break_the_closing(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_CLOSING mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the one-closing-loop fail-control.
+#
+# scripts/closing_loop_fail_control.py sets BREAK_CLOSING_LOOP and requires
+# tests/test_closing_loop.py to FAIL. Each mode breaks one decision about the
+# barrier's own closing loop, read through its detector's second output --
+# whether it confirms at all, what it confirms, what it may report, and the
+# drawing's lane counted inside -- and never the fixture that drives it.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_closing_loop(monkeypatch):
+    mode = os.environ.get("BREAK_CLOSING_LOOP")
+    if not mode:
+        return
+
+    from lane_controller.config import LaneConfig, LoopConfig
+    from lane_controller.controller import LaneController
+    from lane_controller.events import EventQueue
+    from lane_controller.interfaces import ClosingSequence
+    from lane_controller.sync import ENTRY_CONFIRMED, ENTRY_UNADMITTED
+
+    if mode == "unconfirmable":
+        # One loop treated as no loops, as before U7e: a lane wired with the
+        # closing loop's second output is told it can confirm nothing.
+        assert isinstance(LoopConfig.confirms_entry, property), "confirms_entry's anchor has moved"
+        monkeypatch.setattr(
+            LoopConfig, "confirms_entry", property(lambda self: self.closing_loops == 2)
+        )
+
+    elif mode == "occupancy":
+        # The closing loop occupied no longer confirms: only A-then-B does, so
+        # every car at a one-loop lane is held.
+        assert hasattr(LaneController, "_confirms"), "_confirms' anchor has moved"
+        monkeypatch.setattr(
+            LaneController,
+            "_confirms",
+            staticmethod(lambda crossing: crossing is ClosingSequence.FORWARD),
+        )
+
+    elif mode == "no_vend":
+        # Confirmed without a vend: the closing loop occupied with nothing
+        # pending is written down as a confirmed entry instead of one nothing
+        # admitted.
+        original_record = EventQueue.record
+
+        def record(self, kind, *args, **kwargs):
+            if kind == ENTRY_UNADMITTED:
+                kind = ENTRY_CONFIRMED
+            return original_record(self, kind, *args, **kwargs)
+
+        monkeypatch.setattr(EventQueue, "record", record)
+
+    elif mode == "geometry":
+        # Every answer accepted whatever the lane declared: a one-loop lane
+        # takes a direction no loop there can see, a two-loop lane is confirmed
+        # on one occupancy.
+        assert hasattr(LaneController, "_as_declared"), "_as_declared's anchor has moved"
+        monkeypatch.setattr(LaneController, "_as_declared", lambda self, crossing: crossing)
+
+    elif mode == "drawing":
+        # The drawing's lane declared with no closing loops, as a lane built to
+        # the drawing had to be before U7e: every car it admits is missing from
+        # the count of cars inside.
+        original_from_dict = LaneConfig.from_dict.__func__
+
+        def from_dict(cls, raw):
+            loops = dict(raw.get("loops", {}))
+            loops["closing_loops"] = 0
+            return original_from_dict(cls, {**raw, "loops": loops})
+
+        monkeypatch.setattr(LaneConfig, "from_dict", classmethod(from_dict))
+
+    else:
+        raise RuntimeError(f"unknown BREAK_CLOSING_LOOP mode: {mode}")

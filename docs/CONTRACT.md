@@ -139,7 +139,7 @@ its wiring, its route table — and none is a flag somebody set.
 
 | | |
 |---|---|
-| `confirms_entry` | Two loops after the barrier can say whether a vehicle actually went through. **`false` is an ordinary lane, not a broken one**, and a consumer must have a case for a lane that cannot confirm anything, because a third-party lane usually cannot. |
+| `confirms_entry` | The barrier's closing loop, read through its detector's second output (`closing_loops: 1`), or two loops after the barrier crossed in order (`closing_loops: 2`), can say whether a vehicle actually went through. One loop does not say which way it then went. **`false` is an ordinary lane, not a broken one**, and a consumer must have a case for a lane that cannot confirm anything, because a third-party lane usually cannot. |
 | `has_identity_service` | This lane is wired to an identification service. `false` means identity comes from somewhere else, or from nowhere. |
 | `has_platform` | This lane reports to a platform. **`false` is standalone, which is a supported mode and not a degraded one.** |
 | `has_display` | A display this lane can put a per-arrival code on. `false` until a display seam exists; derived from the wiring, so the day one is wired this follows it. |

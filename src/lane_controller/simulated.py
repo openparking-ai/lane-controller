@@ -149,9 +149,11 @@ class OccupancyLoopInput(LoopInput):
 
 
 class ScriptedClosingLoops(ClosingLoops):
-    """The two loops after the gate, driven by a script of crossings.
+    """The loops after the gate, driven by a script of crossings.
 
-    Each entry is a direction AND how long the crossing took. The time is not
+    One loop or two: a one-loop lane scripts OCCUPIED, a two-loop lane FORWARD
+    and REVERSE, and the controller refuses an answer its geometry cannot give.
+    Each entry is what the loops saw AND how long the crossing took. The time is not
     decoration: the window is a real branch in the lane's behaviour, so a
     fixture that could not put a crossing on both sides of it would pin the one
     axis the answer depends on, and would read as coverage while measuring one

@@ -202,6 +202,14 @@ jobs:
           # fail each time. A crossing with no vend behind it was in no record
           # until this round; this is what keeps it in one.
           - unadmitted
+          # One-closing-loop fail-control
+          # The barrier's own closing loop, read through its detector's second
+          # output (U7e): one loop treated as none, the occupancy not
+          # confirming, an occupancy with no vend confirmed, an answer the
+          # lane's geometry cannot give used, and the drawing's lane declared
+          # with no loops so its car is missing from the count inside -- and
+          # requires tests/test_closing_loop.py to fail each time.
+          - closing_loop
           # Deactivate-loop fail-control
           # Breaks the third loop's guarantees on purpose -- the level (an edge
           # deadlocks two queued cars), each end of the held interval, its
