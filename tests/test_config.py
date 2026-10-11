@@ -156,9 +156,9 @@ def test_the_example_config_is_the_standard_installation():
     five keys and loads. Without it a broken parser would pass the whole table."""
     loops = LaneConfig.from_file(EXAMPLE).loops
 
-    assert loops.arming_loops == 2
-    # The barrier's own closing loop, read only: the loop the installer
-    # drawings show. No second loop, so no spacing.
+    # One arming loop and the barrier's own closing loop, read only: the loops
+    # the installer drawings show. No second closing loop, so no spacing.
+    assert loops.arming_loops == 1
     assert loops.closing_loops == 1
     assert loops.arming_spacing_m == 1.5
     assert loops.closing_spacing_m == 0.0

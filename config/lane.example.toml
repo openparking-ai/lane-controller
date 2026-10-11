@@ -186,9 +186,9 @@ frames_per_read  = 3
 vend_pulse_ms = 500
 
 [loops]
-# THE LANE'S LOOP GEOMETRY, AND THIS IS THE STANDARD INSTALLATION: two arming
-# loops before the barrier, the barrier's own closing loop read after it, a 10
-# second window.
+# THE LANE'S LOOP GEOMETRY, AND THIS IS THE STANDARD INSTALLATION, as the
+# installer drawings show it: one arming loop before the barrier, the barrier's
+# own closing loop read after it, a 10 second window.
 #
 # EVERY VALUE HERE IS A PER-SITE SETTING AND AN ASSUMPTION -- nothing in this
 # package measures a spacing, and none of these is a
@@ -209,7 +209,7 @@ vend_pulse_ms = 500
 # fraud. With 1, the lane runs exactly as it always has and does NOT get that
 # protection; it records `arming_loops: 1` on every vehicle so the weakness is
 # in the record rather than only in a document.
-arming_loops     = 2
+arming_loops     = 1
 arming_spacing_m = 1.5
 
 # Loops AFTER the barrier that confirm the entry: 0, 1 or 2.
