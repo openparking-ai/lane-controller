@@ -14,6 +14,10 @@ the gate shut; the arming loop's pictures stay as they are -- read, never kept.
   4  a car whose descriptor matches the banned list: no vend, reason `banned`,
      its pictures with the decision. No match, no comparison wired, or a
      comparison that fails: the car is decided as before
+
+The U7f gate's findings, each pinned here (F1-F4): an exit lets a banned car
+out; a different car crossing after a held vend is a tailgater; the list
+survives a restart with the platform unreachable; pictures wait out an outage.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from lane_controller import (
     VehicleIdentity,
 )
 from lane_controller.decision import Outcome, Rule
+from lane_controller.durable import CACHE_DIR_MODE, DurableStore
 from lane_controller.events import EventQueue
 from lane_controller.interfaces import ClosingSequence
 from lane_controller.simulated import (
@@ -48,6 +53,7 @@ from lane_controller.sync import (
     ENTRY_UNADMITTED,
     REASON_BANNED,
     PlatformTransport,
+    sync_rules,
 )
 from lane_controller.vehicle_id_client import VehicleIdSearch
 
@@ -330,3 +336,59 @@ def test_a_picture_leaves_on_its_own_route_and_never_on_the_read_window():
     assert len(platform.pictures) == 4
     window = json.dumps([e.as_dict() for _, e in controller.events._history], default=str)
     assert "image" not in window and "picture" not in window
+
+
+# --- the gate's findings (U7f fix 1) ---------------------------------------------------
+
+
+def test_an_exit_lets_a_banned_car_out():
+    """F1. The exit lanes receive the list too; a banned car is never kept in."""
+    controller, vend, _ = build(
+        identities=(ON_THE_LIST,), banned=BANNED_LIST, crossings=[(OCC, 3.0)], direction="exit"
+    )
+    assert controller.run_once().outcome is Outcome.ALLOW
+    assert vend.vend_count == 1, "the barrier opens for it"
+
+
+def test_a_different_car_crossing_after_a_held_vend_is_a_tailgater():
+    """F2. Only the held car itself, by its plate, is let off as late."""
+    controller, vend, platform = build(
+        identities=(ALLOWED, TAILGATER), crossings=[(OCC, WINDOW + 1.0), (OCC, 3.0)]
+    )
+    controller.run_once()
+    assert vend.vend_count == 1 and platform.opened == [], "held"
+    controller.run_once()
+    [opened] = platform.opened
+    assert opened["plate"] == "TAIL-1"
+    assert opened["tailgater"] is True
+
+
+def test_the_list_survives_a_restart_with_the_platform_unreachable(tmp_path):
+    """F3. A lane that restarts offline still refuses the cars it was told to."""
+    directory = tmp_path / "lane-cache"
+    directory.mkdir(mode=CACHE_DIR_MODE)
+    directory.chmod(CACHE_DIR_MODE)
+    path = directory / "cache.sqlite"
+    platform = FakePlatform()
+    platform.banned = list(BANNED_LIST)
+    first = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    sync_rules(platform, first)
+    assert first.banned == BANNED_LIST, "the premise: the list arrived"
+    platform.online = False
+    second = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    assert sync_rules(platform, second) is None, "the premise: the platform is unreachable"
+    assert second.banned == BANNED_LIST
+
+
+def test_pictures_wait_out_an_outage_and_go_when_it_ends():
+    """F4. The platform unreachable: the pictures stay queued, then are sent."""
+    controller, _, platform = build(crossings=[(OCC, 3.0)])
+    platform.online = False
+    controller.run_once()
+    assert platform.pictures == {}
+    assert controller.events.pending_pictures == 4
+    platform.online = True
+    controller.events.flush()
+    controller.events.flush_pictures()
+    assert len(platform.pictures) == 4
+    assert controller.events.pending_pictures == 0

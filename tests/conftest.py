@@ -2636,5 +2636,56 @@ def _break_the_tailgater(monkeypatch):
         assert hasattr(LaneController, "_banned"), "_banned's anchor has moved"
         monkeypatch.setattr(LaneController, "_banned", lambda self, identity: None)
 
+    elif mode == "exit_refuses_banned":
+        # F1: the direction guard gone -- an exit keeps a banned car inside.
+        assert hasattr(LaneController, "_banned"), "_banned's anchor has moved"
+
+        def everywhere(self, identity):
+            if self.banned_matcher is None or not identity.descriptor or not self.cache.banned:
+                return None
+            return self.banned_matcher.match(identity.descriptor, self.cache.banned)
+
+        monkeypatch.setattr(LaneController, "_banned", everywhere)
+
+    elif mode == "any_car_after_a_held_vend_is_late":
+        # F2: the plate is not compared -- any car crossing after a held vend
+        # is let off as the late admitted one, and a real tailgater never listed.
+        from lane_controller.contract import TransitState
+
+        assert hasattr(LaneController, "_late_admitted"), "_late_admitted's anchor has moved"
+        monkeypatch.setattr(
+            LaneController,
+            "_late_admitted",
+            lambda self, identity: (
+                self.transit_state == TransitState.HELD.value
+                and self.last_decision is not None
+                and self.last_decision.should_vend
+            ),
+        )
+
+    elif mode == "list_not_kept_on_disk":
+        # F3: the list is not in what the store holds -- lost on a restart.
+        from lane_controller.decision import DecisionCache
+
+        original_state = DecisionCache.state
+        monkeypatch.setattr(
+            DecisionCache,
+            "state",
+            lambda self: {k: v for k, v in original_state(self).items() if k != "banned"},
+        )
+
+    elif mode == "pictures_dropped_in_an_outage":
+        # F4: a send that fails clears the queue -- the pictures are lost.
+        original_flush = EventQueue.flush_pictures
+
+        def dropping(self):
+            sent = original_flush(self)
+            if sent == 0:
+                with self._state:
+                    self._pictures.clear()
+            return sent
+
+        monkeypatch.setattr(EventQueue, "flush_pictures", dropping)
+
     else:
         raise RuntimeError(f"unknown BREAK_TAILGATER mode: {mode}")
