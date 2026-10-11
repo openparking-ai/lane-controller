@@ -29,6 +29,10 @@ class FakePlatform:
         self.events: dict[str, dict] = {}  # event_id -> event
         self.event_deliveries = 0  # every accepted item, duplicates included
         self.opened: list[dict] = []
+        #: The pictures the lane sent (U7f), by picture_ref.
+        self.pictures: dict[str, dict] = {}
+        #: The banned list the rules payload serves (U7f).
+        self.banned: list[dict] = []
         self.closed: list[dict] = []
         self.open_sessions: dict[str, dict] = {}
         self.sessions_by_open_event: dict[str, dict] = {}
@@ -98,6 +102,7 @@ class FakePlatform:
             "tax_sets": list(self.tax_sets),
             "entitlements": {"read_at": "2026-09-21T00:00:00Z", **self.entitlements},
             "stays": {"cursor": str(self.cursor), "open": [s for s in self.stays if s["open"]]},
+            "banned": list(self.banned),
             "synced_at": "2026-09-21T00:00:00Z",
             **self._lane_fields(fast=False),
         }
@@ -172,6 +177,12 @@ class FakePlatform:
             )
         return plate or ticket_ref
 
+    def post_picture(self, *, picture_ref: str, event_id: str, taken_at: str, image: bytes) -> dict:
+        """The picture route (U7f): kept by its event, idempotent on its ref."""
+        self._check()
+        self.pictures[picture_ref] = {"event_id": event_id, "taken_at": taken_at, "image": image}
+        return {"picture_ref": picture_ref, "event_id": event_id, "created": True}
+
     def open_session(
         self,
         *,
@@ -182,6 +193,7 @@ class FakePlatform:
         ticket_ref: str | None = None,
         plate_region=None,
         descriptor: str | None = None,
+        tailgater: bool = False,
     ) -> dict:
         self._check()
         identity = self._identity(plate, ticket_ref)
@@ -199,6 +211,7 @@ class FakePlatform:
                 "entry_at": entry_at,
                 "entry_confirmation": entry_confirmation,
                 "descriptor": descriptor,
+                "tailgater": tailgater,
             }
         )
         # Keyed on the event, exactly as the platform is. An entry replayed

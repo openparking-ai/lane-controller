@@ -88,6 +88,9 @@ REASON_FORWARD = "closing_sequence_forward"
 #: one loop saw a vehicle reach it past the gate, and did not see which way it went.
 REASON_CLOSING_LOOP_OCCUPIED = "closing_loop_occupied"
 REASON_REVERSE = "closing_sequence_reverse"
+#: An arriving car whose descriptor matched the garage's banned list (U7f):
+#: refused at the entry, the gate shut. The `decision` event's reason.
+REASON_BANNED = "banned"
 REASON_WINDOW_ELAPSED = "confirmation_window_elapsed"
 REASON_NO_CLOSING_LOOPS = "no_closing_loops_configured"
 REASON_ARMING_INCOMPLETE = "only_one_arming_loop_occupied"
@@ -353,6 +356,25 @@ class PlatformTransport(EventTransport):
             return False
         return True
 
+    def send_pictures(self, pictures) -> bool:
+        """The pictures kept with an entry (U7f), one request each. True only if
+        every one was taken; a refusal is counted and logged as any other and
+        the picture is not sent again."""
+        try:
+            for picture in pictures:
+                self._guarded(
+                    lambda p=picture: self._client.post_picture(
+                        picture_ref=p.picture_ref,
+                        event_id=p.event_id,
+                        taken_at=to_iso(p.taken_at),
+                        image=p.image_bytes,
+                    )
+                )
+        except PlatformUnreachable as err:
+            log.info("platform unreachable, %d picture(s) stay queued: %s", len(pictures), err)
+            return False
+        return True
+
     def _open_session(self, event: LaneEvent) -> dict:
         """Open the session, and require the platform to say it recorded WHAT
         confirmed it. The rule is `require_confirmation_echo` above.
@@ -374,6 +396,8 @@ class PlatformTransport(EventTransport):
             plate_region=event.detail.get("plate_region"),
             entry_confirmation=declared,
             descriptor=descriptor,
+            # Only when true: every other open calls the client as it always did.
+            **({"tailgater": True} if event.detail.get("tailgater") else {}),
         )
         require_confirmation_echo(result, declared, end="entry", action="open")
         require_descriptor_echo(result, descriptor)

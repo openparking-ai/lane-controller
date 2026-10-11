@@ -49,7 +49,7 @@ from .simulated import (
     StubVehicleIdentifier,
 )
 from .sync import PlatformTransport
-from .vehicle_id_client import VehicleIdClient
+from .vehicle_id_client import VehicleIdClient, VehicleIdSearch
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -172,6 +172,21 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
     else:
         identifier = StubVehicleIdentifier()
         seams["identifier"] = "SIMULATED stub (no [lane] vehicle_id_url): every read is a fallback"
+    # The banned-car search (U7f): the identity service's comparison, with the
+    # thresholds this site states. Without both, no car is refused as banned.
+    if config.vehicle_id_url and config.banned_match_structure is not None:
+        banned_matcher = VehicleIdSearch(
+            config.vehicle_id_url,
+            structure=config.banned_match_structure,
+            colour=config.banned_match_colour,
+        )
+        seams["banned"] = f"REAL search at {config.vehicle_id_url}"
+    else:
+        banned_matcher = None
+        seams["banned"] = (
+            "NONE (no [lane] vehicle_id_url, or no banned_match_* thresholds): "
+            "no car is refused as banned"
+        )
     if config.cache_path:
         # Refused, not warned, if the path is not this process's own: a
         # forged row here opens the barrier. `CacheDirectoryUnsafe` reaches
@@ -204,6 +219,7 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
         cache=cache,
         events=events,
         session_lookup=lookup,
+        banned_matcher=banned_matcher,
     )
     return WiredLane(controller, platform, seams)
 

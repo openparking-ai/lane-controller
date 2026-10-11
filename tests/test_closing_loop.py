@@ -80,6 +80,11 @@ ALLOWED = VehicleIdentity(plate="SIM-0001", confidence=0.97, presence=True)
 BANNED = VehicleIdentity(plate="BANNED-1", confidence=0.97, presence=True)
 
 
+#: What the idle poll's pictures read (U7f): nothing -- the tailgater nobody
+#: identified. tests/test_tailgater.py has the one that is read.
+UNREAD = VehicleIdentity(plate=None, confidence=0.0)
+
+
 def build(*, direction="entry", crossings=(), identities=None, closing_loops=1):
     """A lane with the barrier's closing loop read, and nothing else implied."""
     config = LaneConfig(
@@ -105,7 +110,7 @@ def build(*, direction="entry", crossings=(), identities=None, closing_loops=1):
         loop=SimulatedLoopInput(arrivals=1),
         camera=CannedCameraFeed(),
         vend=vend,
-        identifier=StubVehicleIdentifier(identities or [ALLOWED]),
+        identifier=StubVehicleIdentifier([*(identities or [ALLOWED]), UNREAD]),
         closing_loops=loops,
         cache=cache,
     )

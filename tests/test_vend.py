@@ -16,6 +16,7 @@ is a line here, with a positive control beside it.
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1137,6 +1138,22 @@ def a_lane_with_a_platform(**kwargs):
     return controller, platform
 
 
+def holding_the_settle(controller):
+    """Hold the settle thread at its read of the loops until the returned event
+    is set. What the route delivered is then read before anything the settle
+    could flush: without the hold, the settle's own flush races the test's read,
+    and a route that never flushed can pass it (U7f gate, F6)."""
+    release = threading.Event()
+    wait = controller.closing_loops.wait_for_sequence
+
+    def held(window):
+        release.wait(timeout=5)
+        return wait(window)
+
+    controller.closing_loops.wait_for_sequence = held
+    return release
+
+
 def test_the_completed_vend_reaches_the_platform_with_no_further_arrival():
     controller, platform = a_lane_with_a_platform()
     service = LaneService(controller)
@@ -1149,15 +1166,18 @@ def test_the_completed_vend_reaches_the_platform_with_no_further_arrival():
     before = len(platform.events)
     assert before > 0
 
+    release = holding_the_settle(controller)
     status, _ = complete(service, controller)
     assert status == 202
 
     # ALREADY DELIVERED WHEN THE ROUTE ANSWERS: `complete_vend` flushes before
     # it returns, so the identity, the relay's record and the pending entry are
-    # on the platform without waiting for the settle.
+    # on the platform without waiting for the settle -- which is held until
+    # this is read.
     kinds = {event["kind"] for event in platform.events.values()}
     assert {"assisted_identity", "vended", "entry_pending"} <= kinds
 
+    release.set()
     settled(service)
     assert len(platform.opened) == 1, "the stay that bills the customer is on the platform"
     assert controller.events.pending == 0, "nothing is left undelivered"
@@ -1207,10 +1227,12 @@ def test_what_a_kill_at_each_point_leaves_and_the_contract_says_which():
     #    the session is not, because it does not exist yet.
     controller, platform = a_lane_with_a_platform()
     service = LaneService(controller)
+    release = holding_the_settle(controller)
     status, _ = complete(service, controller)
     assert status == 202
     kinds = {event["kind"] for event in platform.events.values()}
     assert {"assisted_identity", "vended", "entry_pending"} <= kinds
+    release.set()
     settled(service)
     assert len(platform.opened) == 1
 

@@ -2593,3 +2593,119 @@ def _break_the_closing_loop(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_CLOSING_LOOP mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# scripts/tailgater_fail_control.py sets BREAK_TAILGATER and requires
+# tests/test_tailgater.py to FAIL. Each mode breaks one decision of U7f --
+# pictures kept with an entry, the tailgater read, the late admitted car, the
+# banned car refused -- and never the fixture that drives it.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_tailgater(monkeypatch):
+    mode = os.environ.get("BREAK_TAILGATER")
+    if not mode:
+        return
+
+    from lane_controller.controller import LaneController
+    from lane_controller.events import EventQueue
+
+    if mode == "no_pictures":
+        # Nothing kept with an entry: the pictures are taken and dropped.
+        assert hasattr(EventQueue, "queue_pictures"), "queue_pictures' anchor has moved"
+        monkeypatch.setattr(EventQueue, "queue_pictures", lambda self, event_id, frames: 0)
+
+    elif mode == "read_left_unadmitted":
+        # The tailgater read at the closing loop is left an entry nothing
+        # admitted, as before U7f: no stay, nothing paid at the exit.
+        assert hasattr(LaneController, "_tailgater_identity"), (
+            "_tailgater_identity's anchor has moved"
+        )
+        monkeypatch.setattr(LaneController, "_tailgater_identity", lambda self, frames: None)
+
+    elif mode == "late_admitted_listed":
+        # The car this lane admitted and held, crossing late, is taken for a
+        # tailgater -- and would be banned for being slow.
+        assert hasattr(LaneController, "_late_admitted"), "_late_admitted's anchor has moved"
+        monkeypatch.setattr(LaneController, "_late_admitted", lambda self, identity: False)
+
+    elif mode == "banned_vends":
+        # The car on the banned list is let in: the vend goes ahead.
+        assert hasattr(LaneController, "_banned"), "_banned's anchor has moved"
+        monkeypatch.setattr(LaneController, "_banned", lambda self, identity: None)
+
+    elif mode == "exit_refuses_banned":
+        # F1: the direction guard gone -- an exit keeps a banned car inside.
+        assert hasattr(LaneController, "_banned"), "_banned's anchor has moved"
+
+        def everywhere(self, identity):
+            if self.banned_matcher is None or not identity.descriptor or not self.cache.banned:
+                return None
+            return self.banned_matcher.match(identity.descriptor, self.cache.banned)
+
+        monkeypatch.setattr(LaneController, "_banned", everywhere)
+
+    elif mode == "any_car_after_a_held_vend_is_late":
+        # F2: the plate is not compared -- any car crossing after a held vend
+        # is let off as the late admitted one, and a real tailgater never listed.
+        from lane_controller.contract import TransitState
+
+        assert hasattr(LaneController, "_late_admitted"), "_late_admitted's anchor has moved"
+        monkeypatch.setattr(
+            LaneController,
+            "_late_admitted",
+            lambda self, identity: (
+                self.transit_state == TransitState.HELD.value
+                and self.last_decision is not None
+                and self.last_decision.should_vend
+            ),
+        )
+
+    elif mode == "list_not_kept_on_disk":
+        # F3: the list is not in what the store holds -- lost on a restart.
+        from lane_controller.decision import DecisionCache
+
+        original_state = DecisionCache.state
+        monkeypatch.setattr(
+            DecisionCache,
+            "state",
+            lambda self: {k: v for k, v in original_state(self).items() if k != "banned"},
+        )
+
+    elif mode == "pictures_dropped_in_an_outage":
+        # F4: a send that fails clears the queue -- the pictures are lost.
+        original_flush = EventQueue.flush_pictures
+
+        def dropping(self):
+            sent = original_flush(self)
+            if sent == 0:
+                with self._state:
+                    self._pictures.clear()
+            return sent
+
+        monkeypatch.setattr(EventQueue, "flush_pictures", dropping)
+
+    elif mode == "thresholds_defaulted":
+        # G1: a site that states no thresholds gets made-up ones -- cars are
+        # refused as banned on an operating point nobody measured.
+        from lane_controller import cli
+        from lane_controller.vehicle_id_client import VehicleIdSearch
+
+        assert hasattr(cli, "wire_lane"), "wire_lane's anchor has moved"
+        original_wire = cli.wire_lane
+
+        def defaulted(config, *, platform):
+            wired = original_wire(config, platform=platform)
+            if config.vehicle_id_url and wired.controller.banned_matcher is None:
+                wired.controller.banned_matcher = VehicleIdSearch(
+                    config.vehicle_id_url, structure=0.5, colour=0.5
+                )
+                wired.seams["banned"] = f"REAL search at {config.vehicle_id_url}"
+            return wired
+
+        monkeypatch.setattr(cli, "wire_lane", defaulted)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_TAILGATER mode: {mode}")

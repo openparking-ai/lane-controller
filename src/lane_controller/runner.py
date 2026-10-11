@@ -242,6 +242,9 @@ class LaneRunner:
         self.state.drain_turns += 1
         try:
             self.controller.events.flush()
+            # The pictures kept with an entry (U7f), after the records they
+            # belong to.
+            self.controller.events.flush_pictures()
         except Exception:  # noqa: BLE001 -- the guard IS the point; see the module docstring
             self.state.drain_turn_errors += 1
             log.exception("a turn of the outbox drain raised; the drain goes round again")

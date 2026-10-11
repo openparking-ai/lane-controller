@@ -442,10 +442,24 @@ class LaneConfig:
     # How long an arming loop may read occupied before `arming_loop_stuck_occupied`
     # is `active`. A per-site setting: see DEFAULT_ARMING_LOOP_MAX_OCCUPIED_S above.
     arming_loop_max_occupied_s: float = DEFAULT_ARMING_LOOP_MAX_OCCUPIED_S
+    # The thresholds the banned-car search states to the identification
+    # service (U7f), as the platform's exit search states its own: no default,
+    # because no operating point has been measured. Both or neither. Neither:
+    # this lane refuses no car as banned, and says so at start.
+    banned_match_structure: float | None = None
+    banned_match_colour: float | None = None
 
     def __post_init__(self) -> None:
         if self.direction not in ("entry", "exit"):
             raise ValueError(f"direction must be 'entry' or 'exit', got {self.direction!r}")
+        if (self.banned_match_structure is None) != (self.banned_match_colour is None):
+            raise ValueError(
+                "banned_match_structure and banned_match_colour are stated together or not at all"
+            )
+        for name in ("banned_match_structure", "banned_match_colour"):
+            value = getattr(self, name)
+            if value is not None and not (math.isfinite(value) and 0 <= value <= 1):
+                raise ValueError(f"{name} must be a number in [0, 1], got {value!r}")
         if not isinstance(self.outbox_depth_threshold, int) or self.outbox_depth_threshold < 1:
             # Zero would make every lane report the fault permanently, which is
             # the same thing as reporting nothing.
@@ -526,6 +540,8 @@ class LaneConfig:
             arming_loop_max_occupied_s=float(
                 lane.get("arming_loop_max_occupied_s", DEFAULT_ARMING_LOOP_MAX_OCCUPIED_S)
             ),
+            banned_match_structure=_optional_float(lane.get("banned_match_structure")),
+            banned_match_colour=_optional_float(lane.get("banned_match_colour")),
             camera=CameraConfig(
                 camera_id=camera.get("id", "cam-1"),
                 rtsp_url=camera.get("rtsp_url", ""),
@@ -543,3 +559,7 @@ class LaneConfig:
                 longest_vehicle_tail_m=float(loops["longest_vehicle_tail_m"]),
             ),
         )
+
+
+def _optional_float(value) -> float | None:
+    return None if value is None else float(value)

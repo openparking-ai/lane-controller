@@ -201,3 +201,16 @@ class ScriptedClosingLoops(ClosingLoops):
     def unread(self) -> int:
         """How many scripted crossings nothing has read yet."""
         return len(self._crossings) - self._index
+
+
+class ExactBannedMatcher:
+    """A `BannedMatcher` for tests and the demo: a car matches a ban whose
+    descriptor is the same string. The real comparison is the identity
+    service's (`vehicle_id_client.VehicleIdSearch`)."""
+
+    def __init__(self) -> None:
+        self.asked = 0
+
+    def match(self, descriptor: str, banned) -> str | None:
+        self.asked += 1
+        return next((b["id"] for b in banned if b["descriptor"] == descriptor), None)

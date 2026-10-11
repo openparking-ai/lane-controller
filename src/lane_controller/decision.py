@@ -178,6 +178,23 @@ def _register_heads(module: str, register: dict) -> dict[str, dict]:
     return {a.get("agreement"): a for a in register.get("agreements") or [] if a.get("agreement")}
 
 
+def banned_from_payload(raw) -> list[dict]:
+    """The `banned` list as the platform sends it, each entry an id and a
+    descriptor, both non-empty strings. An entry in any other shape is not a
+    car this build can match, and is left out rather than guessed at."""
+    if not isinstance(raw, list):
+        return []
+    return [
+        {"id": entry["id"], "descriptor": entry["descriptor"]}
+        for entry in raw
+        if isinstance(entry, dict)
+        and isinstance(entry.get("id"), str)
+        and entry["id"]
+        and isinstance(entry.get("descriptor"), str)
+        and entry["descriptor"]
+    ]
+
+
 class DecisionCache:
     """Local allow and pricing rules, refreshed from the server when it can be.
 
@@ -253,6 +270,10 @@ class DecisionCache:
         # empty cache is a lane falling back on every plate anyway.
         self.lane: dict = dict(OPEN_LANE)
         self.board: dict = {"prices": False, "messages": []}
+        #: The cars this lane refuses (U7f): each ban that reaches this garage,
+        #: as the platform's `banned` list -- `{"id", "descriptor"}`. Matched by
+        #: descriptor at the entry; a match is refused with reason `banned`.
+        self.banned: list[dict] = []
         # THE TWO INDEXES THE EXIT READS ON THE BARRIER'S PATH, rebuilt whole
         # on every change so the read is one dict lookup and never a scan:
         # identity -> the register rows that name it, per module; identity ->
@@ -298,6 +319,7 @@ class DecisionCache:
             "currency": self.currency,
             "lane": self.lane,
             "board": self.board,
+            "banned": self.banned,
         }
 
     def _persist(self) -> None:
@@ -336,6 +358,7 @@ class DecisionCache:
         self.currency = state.get("currency")
         self.lane = lane_from_payload(state.get("lane")) or dict(OPEN_LANE)
         self.board = board_from_payload(state.get("board")) or {"prices": False, "messages": []}
+        self.banned = banned_from_payload(state.get("banned"))
         self._reindex_coverage()
         self._reindex_stays()
         return True
@@ -358,6 +381,7 @@ class DecisionCache:
         self.currency = None
         self.lane = dict(OPEN_LANE)
         self.board = {"prices": False, "messages": []}
+        self.banned = []
         self._coverage_index = {}
         self._stay_index = {}
         if self._store is not None:
@@ -405,6 +429,9 @@ class DecisionCache:
             if isinstance(fact, dict) and "register" in fact:
                 self.entitlements[module] = fact
         self.entitlements_complete = facts.get("complete")
+        # Replaced whole, as the plans are: a platform older than the list
+        # sends none, and none is an empty list.
+        self.banned = banned_from_payload(payload.get("banned"))
         self._reindex_coverage()
         self._take_lane(payload)
         stays = payload.get("stays") or {}
