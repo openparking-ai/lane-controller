@@ -1443,8 +1443,19 @@ def _break_the_deactivate_loop(monkeypatch):
         monkeypatch.setattr(LaneService, "_deactivate_loop_stuck", lambda self: HealthState.UNKNOWN)
 
     elif mode == "no_bound":
-        # A loop under the car's own tail is accepted.
-        monkeypatch.setattr(config_module, "DEACTIVATE_SPACING_MIN_M", 0.0)
+        # The rule removed: a loop under the longest stopped vehicle's tail is
+        # accepted.
+        assert hasattr(config_module, "clears_the_tail"), "the rule's anchor has moved"
+        monkeypatch.setattr(config_module, "clears_the_tail", lambda spacing_m, tail_m: True)
+
+    elif mode == "floor":
+        # The 6.0 m floor from the arming loop put back, as at `9de50c0`: the
+        # drawings' lane, whose third loop is 4.12 m from the arming loop and
+        # clear of a stopped F-150, is refused.
+        assert hasattr(config_module, "clears_the_tail"), "the rule's anchor has moved"
+        monkeypatch.setattr(
+            config_module, "clears_the_tail", lambda spacing_m, tail_m: spacing_m >= 6.0
+        )
 
     else:
         raise RuntimeError(f"unknown BREAK_DEACTIVATE mode: {mode}")

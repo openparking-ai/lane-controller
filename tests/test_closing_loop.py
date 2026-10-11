@@ -288,6 +288,7 @@ def test_a_lane_built_to_the_drawing_counts_inside():
         vend=RecordingVendOutput(),
         identifier=StubVehicleIdentifier([VehicleIdentity(plate="DRAWN-1", confidence=0.97)]),
         arming_loop_b=OccupancyLoopInput(True) if config.loops.arming_loops == 2 else None,
+        deactivate_loop=OccupancyLoopInput(False) if config.loops.has_deactivate_loop else None,
         closing_loops=ScriptedClosingLoops([(OCC, 3.0)]) if config.loops.confirms_entry else None,
         cache=cache,
         events=EventQueue(PlatformTransport(platform)),

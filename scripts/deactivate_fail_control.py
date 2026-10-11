@@ -17,7 +17,10 @@ stuck measurement, the bound -- and never on the fixture that drives it.
   vend_door    the assisted vend no longer applies the check: the intercom is
                a door around the loop
   unmeasured   the stuck code is never derived
-  no_bound     a loop under the car's own tail is accepted
+  no_bound     the rule removed: a loop under the longest stopped vehicle's
+               tail is accepted
+  floor        the 6.0 m floor from the arming loop put back: the drawings'
+               lane, its third loop clear of a stopped F-150, is refused
 
 This also proves the suite RUNS -- see `_control.py` for what a break has to
 do before it is reported as a control.
@@ -41,6 +44,7 @@ BREAKAGES = [
     ("vend_door", "the assisted vend does not apply the check"),
     ("unmeasured", "the stuck code is never derived"),
     ("no_bound", "a spacing under the longest vehicle is accepted"),
+    ("floor", "the drawn third loop is refused by the old 6.0 m floor"),
 ]
 
 

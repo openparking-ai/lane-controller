@@ -187,8 +187,9 @@ vend_pulse_ms = 500
 
 [loops]
 # THE LANE'S LOOP GEOMETRY, AND THIS IS THE STANDARD INSTALLATION, as the
-# installer drawings show it: one arming loop before the barrier, the barrier's
-# own closing loop read after it, a 10 second window.
+# installer drawings show it: one arming loop before the barrier, the third
+# (deactivate) loop behind it, the barrier's own closing loop read after it, a
+# 10 second window.
 #
 # EVERY VALUE HERE IS A PER-SITE SETTING AND AN ASSUMPTION -- nothing in this
 # package measures a spacing, and none of these is a
@@ -196,7 +197,7 @@ vend_pulse_ms = 500
 # `geometry_assumed`, so nobody reading the record can mistake them for
 # something that was measured here.
 #
-# ALL SEVEN KEYS ARE REQUIRED. There is no default for any of them: a file with
+# ALL EIGHT KEYS ARE REQUIRED. There is no default for any of them: a file with
 # no [loops] table, or with one of these spelt wrong, is refused at startup and
 # told which key is missing. A defaulted geometry is indistinguishable from a
 # mistyped one -- both write `unconfirmable` on every session -- and only one of
@@ -243,10 +244,21 @@ confirmation_window_seconds = 10.0
 # the lane does not arm -- a second vehicle that close behind the one at the
 # barrier would follow it through, so the boom stays down until it backs off,
 # and the hold is recorded (`arming_suppressed` / `arming_suppression_ended`).
-# The spacing is from this loop to the NEAREST arming loop and must be at least
-# 6.0 m: a loop closer than the longest vehicle sits under that vehicle's own
-# tail while its nose is on the arming loop, and it holds itself for ever. A
-# lane that admits longer vehicles declares more. A site with no such loop
-# declares 0 and 0.0, and runs exactly as it did.
-deactivate_loops     = 0
-deactivate_spacing_m = 0.0
+#
+# THE RULE: it may not sit under the longest vehicle stopped at the barrier --
+# under that vehicle's own tail it holds the very car the lane is serving, for
+# ever. Both distances run back from the edge of the nearest arming loop:
+#   deactivate_spacing_m    to the near edge of this loop;
+#   longest_vehicle_tail_m  to the tail of the longest vehicle this lane admits,
+#                           stopped at the barrier.
+# The spacing must be MORE than the tail, or the lane refuses to start.
+#
+# The drawings' lane, every distance measured back from the gate arm: the
+# arming loop centred at 3.5 m and 0.76 m long, so its far edge at 3.88 m; a
+# Ford F-150 (6.20 m) stopped 1.0 m before the arm, so its tail at 7.2 m; the
+# third loop's near edge at 8.0 m. Tail 7.2 - 3.88 = 3.32; spacing 8.0 - 3.88 =
+# 4.12. A lane that admits longer vehicles declares its own tail. A site with
+# no such loop declares 0, 0.0 and 0.0, and runs exactly as it did.
+deactivate_loops       = 1
+deactivate_spacing_m   = 4.12
+longest_vehicle_tail_m = 3.32

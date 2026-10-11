@@ -221,6 +221,7 @@ def build_from(path: Path, crossings):
         vend=vend,
         identifier=StubVehicleIdentifier([VehicleIdentity(plate="CFG-1", confidence=0.97)]),
         arming_loop_b=OccupancyLoopInput(True) if config.loops.arming_loops == 2 else None,
+        deactivate_loop=OccupancyLoopInput(False) if config.loops.has_deactivate_loop else None,
         closing_loops=ScriptedClosingLoops(crossings) if config.loops.confirms_entry else None,
         cache=cache,
     )
