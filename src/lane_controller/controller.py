@@ -52,9 +52,10 @@ from dataclasses import dataclass, replace
 from .config import LaneConfig
 from .contract import TransitState
 from .decision import Decision, DecisionCache, Fallback, Outcome, closed_to, decide
-from .events import EventQueue
+from .events import EventQueue, LaneEvent
 from .exit_pricing import price_exit
 from .interfaces import (
+    BannedMatcher,
     CameraFeed,
     ClosingLoops,
     ClosingSequence,
@@ -82,6 +83,7 @@ from .sync import (
     EXIT_UNCONFIRMABLE,
     HELD,
     REASON_ARMING_INCOMPLETE,
+    REASON_BANNED,
     REASON_CLOSING_LOOP_OCCUPIED,
     REASON_FORWARD,
     REASON_LOOP_DRIVER_TIMEOUT,
@@ -164,6 +166,15 @@ def _confirmed_by(crossing: ClosingSequence) -> str:
 
 log = logging.getLogger(__name__)
 
+#: The pictures kept with an entry (U7f), from the lane's camera: between the
+#: vend and the closing loop, at the closing loop, and of a banned car refused
+#: at the gate. A few of each -- enough to see the car and, for a tailgater,
+#: to read it. The arming loop's frames are not among them: they are read and
+#: never kept, as before.
+BETWEEN_PICTURES = 2
+CLOSING_PICTURES = 2
+REFUSED_PICTURES = 2
+
 
 class LaneController:
     def __init__(
@@ -182,8 +193,12 @@ class LaneController:
         clock: Callable[[], float] = time.time,
         session_lookup: Callable[[str], dict | None] | None = None,
         reader: ReaderScreen | None = None,
+        banned_matcher: BannedMatcher | None = None,
     ) -> None:
         self.config = config
+        # The banned-car comparison (U7f). None: this lane refuses no car as
+        # banned, whatever list it holds.
+        self.banned_matcher = banned_matcher
         self.loop = loop
         self.camera = camera
         self.vend = vend
@@ -522,6 +537,12 @@ class LaneController:
             direction=self.config.direction,
             day_at=self.now(),
         )
+        banned = self._banned(identity) if decision.should_vend else None
+        if banned is not None:
+            # A CAR ON THE GARAGE'S BANNED LIST (U7f): the gate stays shut,
+            # under its own reason. The driver who presses help is told the
+            # car was not admitted -- the line every refusal gets.
+            decision = Decision(outcome=Outcome.DENY, reason=REASON_BANNED, identity=identity)
         if self.config.direction == "exit" and decision.should_vend and identity.plate:
             # THE EXIT'S LOCAL DECISION, BEFORE THE BARRIER MOVES: covered from
             # the cache, priced on the box, or said to be unpriceable here --
@@ -532,7 +553,7 @@ class LaneController:
             decision = replace(
                 decision, exit_pricing=price_exit(identity.plate, self.cache, now=self.now())
             )
-        self.events.record(
+        decided = self.events.record(
             "decision",
             lane,
             outcome=decision.outcome.value,
@@ -545,6 +566,10 @@ class LaneController:
                 else {}
             ),
         )
+        if banned is not None:
+            # Recorded with its pictures: taken now, the car at the gate, and
+            # kept against the decision that refused it.
+            self.events.queue_pictures(decided.event_id, self._take_pictures(REFUSED_PICTURES))
         # Held so the read contract can publish it. Taken here rather than
         # reconstructed from the event queue, which `flush()` empties: a
         # consumer asking what the lane last decided must not get a different
@@ -916,6 +941,10 @@ class LaneController:
         # or because somebody wrote it that way -- got a confirmed, billable
         # session out of a window this lane published on the event and never
         # applied.
+        # PICTURES BETWEEN THE VEND AND THE CLOSING LOOP (U7f), at an entry:
+        # the car moving through the gate. Kept with the stay if the closing
+        # loop confirms it, and with nothing otherwise.
+        between = self._take_pictures(BETWEEN_PICTURES) if self.config.direction == "entry" else []
         started = self._clock()
         crossing = self._as_declared(self._read_closing_loops(window, at))
         elapsed = self._clock() - started
@@ -939,7 +968,14 @@ class LaneController:
                 geometry_assumed=geometry,
             )
             self._transit(TransitState.CONFIRMED, at)
-            self._record_session(identity, at, confirmation=CONFIRMED, exit_pricing=exit_pricing)
+            opened = self._record_session(
+                identity, at, confirmation=CONFIRMED, exit_pricing=exit_pricing
+            )
+            if opened is not None:
+                # And at the closing loop: the car that confirmed the entry.
+                self.events.queue_pictures(
+                    opened.event_id, [*between, *self._take_pictures(CLOSING_PICTURES)]
+                )
             return
 
         if self._refutes(crossing):
@@ -1222,10 +1258,18 @@ class LaneController:
             "recorded as an entry nothing admitted",
             lane,
         )
-        self.events.record(
+        # THE TAILGATER (U7f): pictures at the closing loop, and the car's
+        # identity read from them. Read as a regular entry needs it read, it
+        # is a stay like any other -- it pays at the exit -- and the platform
+        # lists it where the garage bans tailgaters. Not read, it stays an
+        # entry nothing admitted, now with its pictures.
+        frames = self._take_pictures(CLOSING_PICTURES)
+        identity = self._tailgater_identity(frames)
+        unadmitted = self.events.record(
             ENTRY_UNADMITTED,
             lane,
             reason=REASON_NO_PENDING_ENTRY,
+            identified=identity is not None,
             at=at,
             geometry_assumed=self.config.loops.as_published(),
             # What this lane knew, not which car this was. `last_decision` is
@@ -1239,6 +1283,13 @@ class LaneController:
             last_decision_at=self.last_decision_at,
             last_transit=self.transit_state,
         )
+        if identity is not None:
+            opened = self._record_session(
+                identity, at, confirmation=CONFIRMED, tailgater=not self._late_admitted(identity)
+            )
+            self.events.queue_pictures(opened.event_id, frames)
+        else:
+            self.events.queue_pictures(unadmitted.event_id, frames)
         self._unadmitted_leaves_the_box()
         return ENTRY_UNADMITTED
 
@@ -1416,25 +1467,97 @@ class LaneController:
         """
         if self._drain is None:
             self.events.flush()
+            self.events.flush_pictures()
         else:
             self._drain()
 
+    def _take_pictures(self, count: int) -> list:
+        """`count` frames from the lane's camera, to keep with an entry (U7f).
+        A camera that fails costs the pictures, never the transit."""
+        try:
+            return list(self.camera.grab(count))
+        except Exception:  # noqa: BLE001 -- a picture is never worth a transit
+            log.exception(
+                "lane %s: the camera failed taking pictures; none kept", self.config.lane_id
+            )
+            return []
+
+    def _tailgater_identity(self, frames):
+        """The tailgater's identity from its pictures, when it is read as a
+        regular entry needs it read: a plate, at the lane's confidence, from a
+        read that happened. None otherwise -- and for an identifier that fails."""
+        if not frames:
+            return None
+        try:
+            identity = self.identifier.identify(frames)
+        except Exception:  # noqa: BLE001 -- an unread tailgater is the record as it was
+            log.exception("lane %s: identifying a tailgater failed", self.config.lane_id)
+            return None
+        if (
+            not identity.plate
+            or identity.presence is False
+            or identity.unavailable is not None
+            or identity.confidence < self.config.confidence_threshold
+        ):
+            return None
+        # A ticket is asserted, never read: the seam `handle_arrival` keeps.
+        return replace(identity, ticket_ref=None)
+
+    def _late_admitted(self, identity) -> bool:
+        """Whether the car read at the closing loop is the one this lane last
+        ADMITTED and held -- vended, but it reached the loop after the window.
+        That car was let in: its stay is not a tailgater's, and it is never
+        put on a banned list for being slow. Same plate as the held vend's."""
+        return (
+            self.transit_state == TransitState.HELD.value
+            and self.last_decision is not None
+            and self.last_decision.should_vend
+            and bool(self.last_decision.identity.plate)
+            and self.last_decision.identity.plate.upper() == identity.plate.upper()
+        )
+
+    def _banned(self, identity) -> str | None:
+        """The ban an arriving car matches, at an entry; None for every other car.
+
+        Asked only of a car the lane would admit, with a descriptor, at a lane
+        holding a list and wired to the comparison. A comparison that could not
+        be made refuses nobody: it is logged, and the car is decided as before.
+        """
+        if (
+            self.config.direction != "entry"
+            or self.banned_matcher is None
+            or not identity.descriptor
+            or not self.cache.banned
+        ):
+            return None
+        try:
+            return self.banned_matcher.match(identity.descriptor, self.cache.banned)
+        except Exception:  # noqa: BLE001 -- a failed comparison is not a refusal
+            log.exception(
+                "lane %s: the banned-car comparison failed; this car is not refused on it",
+                self.config.lane_id,
+            )
+            return None
+
     def _record_session(
-        self, identity, at: str, *, confirmation: str, exit_pricing=None
-    ) -> None:
+        self, identity, at: str, *, confirmation: str, exit_pricing=None, tailgater: bool = False
+    ) -> LaneEvent | None:
         """Put the session action on the queue, saying what confirmed it -- and,
-        at an exit, what the barrier decided (`local_decision`)."""
+        at an exit, what the barrier decided (`local_decision`). Returns the
+        entry's open, which its pictures are kept against; None at an exit."""
         lane = self.config.lane_id
         if self.config.direction == "entry":
-            self.events.record(
+            return self.events.record(
                 SESSION_OPEN,
                 lane,
                 **self._identity_detail(identity, with_region=True),
                 **self._session_descriptor(identity),
                 at=at,
                 entry_confirmation=confirmation,
+                # A car through the gate that no vend let in (U7f). Only when
+                # true, so every other open is the record it always was.
+                **({"tailgater": True} if tailgater else {}),
             )
-            return
         # Ask the platform which session this is, while the answer is still
         # unambiguous. If it cannot be reached the close goes out without an id
         # and the platform falls back to matching on the identity -- which

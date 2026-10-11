@@ -239,10 +239,11 @@ def test_get_stays_asks_the_stays_route_with_and_without_a_cursor():
     ]
     # the whole client surface, so a new method is a deliberate addition. The
     # seventh, `claim_validation`, is the reader's: the validation claimed when
-    # the phone is entered (platform 0019, amendment A1).
+    # the phone is entered (platform 0019, amendment A1). The eighth,
+    # `post_picture`, is a picture kept with an entry (U7f).
     assert sorted(m for m in vars(PlatformClient) if not m.startswith("_")) == [
         "claim_validation", "close_session", "find_open_session", "get_rules", "get_stays",
-        "open_session", "post_events",
+        "open_session", "post_events", "post_picture",
     ]
 
 

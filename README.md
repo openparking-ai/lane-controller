@@ -53,6 +53,31 @@ opens no session, moves no transit state, and is never folded into
 `entry_confirmed`. A stream of them on `GET /v1/lane/events` is what a broken
 boom looks like from here; what broke it is not measured in this package.
 
+**Pictures, the tailgater, and banned cars (U7f).**
+- **Pictures.** A few are taken between the vend and the closing loop, and a few
+  at it, from the lane's camera. They are kept with the entry record: the stay's
+  open when the closing loop confirms it, or the `entry_unadmitted` record. They
+  go to the platform on their own route, `POST /api/v1/lane/pictures`, and never
+  onto `GET /v1/lane/events`, because a picture shows the plate. The platform
+  keeps them one week after the car leaves. A held entry keeps none, and the
+  arming read's frames are still read and never kept.
+- **The tailgater.** A crossing found by the idle poll is pictured and its car
+  identified. Read as a regular entry needs it read (a plate, at the lane's
+  confidence), it opens a stay with `tailgater: true`, which pays at the exit.
+  Not read, it is `entry_unadmitted` as before, with its pictures. Either way
+  the `entry_unadmitted` event is recorded, with `identified` saying which. The
+  car this lane admitted and held, reaching the loop late with the same plate,
+  is a stay but not a tailgater.
+- **Banned cars.** The platform sends the bans that reach this garage on
+  `GET /lane/rules` as `banned: [{id, descriptor}]`. A car the lane would admit
+  whose descriptor matches one is refused instead: no vend, reason `banned`,
+  pictures kept with the `decision` event. The comparison is the identity
+  service's `POST /v1/searches`, as the platform's exit search asks it, with the
+  thresholds the site states in `[lane] banned_match_structure` and
+  `banned_match_colour`. Without those thresholds, or with a search that fails,
+  no car is refused as banned. The driver who presses help hears the line every
+  refusal gets.
+
 **An EXIT is the other way round.** The vend there is the payment moment and the
 barrier opened, so an exit the loops did not confirm still closes the session and
 bills the stay — marked `held`, with an `exit_held` event for a human to look at.

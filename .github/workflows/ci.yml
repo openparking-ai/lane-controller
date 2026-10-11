@@ -210,6 +210,12 @@ jobs:
           # with no loops so its car is missing from the count inside -- and
           # requires tests/test_closing_loop.py to fail each time.
           - closing_loop
+          # U7f fail-control
+          # Pictures kept with an entry, the tailgater read at the closing
+          # loop, the late admitted car not taken for one, and the banned car
+          # refused -- each broken, and requires tests/test_tailgater.py to
+          # fail each time.
+          - tailgater
           # Deactivate-loop fail-control
           # Breaks the third loop's guarantees on purpose -- the level (an edge
           # deadlocks two queued cars), each end of the held interval, its

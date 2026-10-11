@@ -297,3 +297,76 @@ def _post_json(url: str, payload: dict, timeout: float) -> dict:
                 f"vehicle-id returned more than {MAX_RESPONSE_BYTES} bytes; refusing to read it"
             )
         return json.loads(body)
+
+
+#: What a search may answer, as the platform's shadow run reads it.
+SEARCH_OUTCOMES = frozenset({"match", "tie", "no_match"})
+
+
+class VehicleIdSearch:
+    """Implements `BannedMatcher` over the identity service's `POST /v1/searches`
+    -- the route and the body the platform's exit search sends
+    (`platform/src/shadow.js`): the descriptor, the candidates as `{id,
+    descriptor}`, and the stated thresholds, which have no default.
+
+    A match or a tie is a banned car: either way the service found the car
+    among the banned ones. Anything that is not an answer raises.
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        structure: float,
+        colour: float,
+        timeout: float = DEFAULT_TIMEOUT,
+        opener=None,
+    ) -> None:
+        for name, value in (("structure", structure), ("colour", colour)):
+            if not (isinstance(value, (int, float)) and 0 <= value <= 1):
+                raise ValueError(
+                    f"the banned-car search's {name} threshold must be in [0, 1], got {value!r}"
+                )
+        self.endpoint = endpoint.rstrip("/")
+        self.thresholds = {"structure": float(structure), "colour": float(colour)}
+        self.timeout = timeout
+        self._open = opener or _post_search
+
+    def match(self, descriptor: str, banned) -> str | None:
+        if not descriptor or not banned:
+            return None
+        answer = self._open(
+            f"{self.endpoint}/v1/searches",
+            {
+                "descriptor": descriptor,
+                "candidates": [{"id": b["id"], "descriptor": b["descriptor"]} for b in banned],
+                "thresholds": self.thresholds,
+            },
+            self.timeout,
+        )
+        search = answer.get("search") if isinstance(answer, dict) else None
+        if not isinstance(search, dict) or search.get("outcome") not in SEARCH_OUTCOMES:
+            raise ValueError("the search answered without an outcome this build knows")
+        if search["outcome"] == "no_match":
+            return None
+        known = {b["id"] for b in banned}
+        matched = [m for m in (search.get("matched") or []) if m in known]
+        if not matched:
+            raise ValueError("the search said it matched and named no banned car")
+        return matched[0]
+
+
+def _post_search(url: str, payload: dict, timeout: float) -> dict:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(body) > MAX_RESPONSE_BYTES:
+            raise ValueError(
+                f"vehicle-id returned more than {MAX_RESPONSE_BYTES} bytes; refusing to read it"
+            )
+        return json.loads(body)

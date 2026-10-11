@@ -2593,3 +2593,48 @@ def _break_the_closing_loop(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_CLOSING_LOOP mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# scripts/tailgater_fail_control.py sets BREAK_TAILGATER and requires
+# tests/test_tailgater.py to FAIL. Each mode breaks one decision of U7f --
+# pictures kept with an entry, the tailgater read, the late admitted car, the
+# banned car refused -- and never the fixture that drives it.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_tailgater(monkeypatch):
+    mode = os.environ.get("BREAK_TAILGATER")
+    if not mode:
+        return
+
+    from lane_controller.controller import LaneController
+    from lane_controller.events import EventQueue
+
+    if mode == "no_pictures":
+        # Nothing kept with an entry: the pictures are taken and dropped.
+        assert hasattr(EventQueue, "queue_pictures"), "queue_pictures' anchor has moved"
+        monkeypatch.setattr(EventQueue, "queue_pictures", lambda self, event_id, frames: 0)
+
+    elif mode == "read_left_unadmitted":
+        # The tailgater read at the closing loop is left an entry nothing
+        # admitted, as before U7f: no stay, nothing paid at the exit.
+        assert hasattr(LaneController, "_tailgater_identity"), (
+            "_tailgater_identity's anchor has moved"
+        )
+        monkeypatch.setattr(LaneController, "_tailgater_identity", lambda self, frames: None)
+
+    elif mode == "late_admitted_listed":
+        # The car this lane admitted and held, crossing late, is taken for a
+        # tailgater -- and would be banned for being slow.
+        assert hasattr(LaneController, "_late_admitted"), "_late_admitted's anchor has moved"
+        monkeypatch.setattr(LaneController, "_late_admitted", lambda self, identity: False)
+
+    elif mode == "banned_vends":
+        # The car on the banned list is let in: the vend goes ahead.
+        assert hasattr(LaneController, "_banned"), "_banned's anchor has moved"
+        monkeypatch.setattr(LaneController, "_banned", lambda self, identity: None)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_TAILGATER mode: {mode}")

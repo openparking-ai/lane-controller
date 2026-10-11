@@ -14,6 +14,15 @@ pending, and an exit lane's unpended crossing, both read and logged and neither
 recorded. No row moved for any other reason. That comparison is in the round's
 receipt; this file holds the branch side of it so the next change has a base.
 
+U7F MOVED THREE ROWS, ON PURPOSE. A crossing found by the idle poll is now
+pictured and its car identified (U7f): read, it is a stay like any other and
+pays at the exit. The matrix's identifier reads every car, so the three idle
+polls that record `entry_unadmitted` after a car the lane identified -- the
+refused car that drove in, the held car that crossed late, the second car
+through -- each gained one trailing `session_open`, transit and vends
+unchanged. The held car is the one this lane admitted: its stay is not a
+tailgater's (`_late_admitted`). Nothing else moved.
+
 The §3h answers -- A>B promotes, B>A closes, the window elapsing holds, a late
 A>B holds, no loops is unconfirmable -- are the first five rows, and they are
 the rows that did not move.
@@ -114,6 +123,7 @@ EXPECTED = {
             "vehicle_identified",
             "decision",
             "entry_unadmitted",
+            "session_open",
         ],
         "transit": "none",
         "vends": 0,
@@ -155,6 +165,7 @@ EXPECTED = {
             "entry_pending",
             "entry_held",
             "entry_unadmitted",
+            "session_open",
         ],
         "transit": "held",
         "vends": 1,
@@ -171,6 +182,7 @@ EXPECTED = {
             "entry_confirmed",
             "session_open",
             "entry_unadmitted",
+            "session_open",
         ],
         "transit": "confirmed",
         "vends": 1,

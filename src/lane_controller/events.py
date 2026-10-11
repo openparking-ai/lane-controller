@@ -30,6 +30,27 @@ class LaneEvent:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class Picture:
+    """A picture kept with an entry record (U7f): taken between the vend and the
+    closing loop, or at the closing loop, and kept against the lane's event id
+    of the entry record it belongs to -- a stay's open, a tailgater nobody
+    identified, a banned car refused. The platform keeps it one week after the
+    car left.
+
+    NEVER a log event and never on the read window: a picture of a car shows
+    its plate, and `GET /v1/lane/events` publishes no identity. It goes to the
+    platform on its own route, and nowhere else.
+    """
+
+    event_id: str
+    taken_at: float
+    image_bytes: bytes
+    # The lane's own id for the picture, so a resend after a timeout is the
+    # same picture on the platform.
+    picture_ref: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+
 class EventTransport(Protocol):
     """How events get to the server. Stubbed for now; HTTP later."""
 
@@ -70,8 +91,13 @@ class EventQueue:
         *,
         max_events: int = 10_000,
         history: int = DEFAULT_HISTORY,
+        max_pictures: int = 200,
     ) -> None:
         self._log: deque[LaneEvent] = deque(maxlen=max_events)
+        # The pictures kept with an entry (U7f), bounded like the log: a lane
+        # offline for a day keeps the newest, and a drop is counted.
+        self._pictures: deque[Picture] = deque(maxlen=max_pictures)
+        self.pictures_dropped = 0
         self._sessions: deque[LaneEvent] = deque()
         self._transport = transport
         # TWO THREADS MEET HERE. The lane thread records; the outbox drains on
@@ -161,6 +187,53 @@ class EventQueue:
                 ):
                     queue.clear()
                     queue.extend(kept)
+            return len(batch)
+
+    def queue_pictures(self, event_id: str, frames) -> int:
+        """Keep these frames as pictures of the entry record `event_id`.
+
+        Only frames that hold a picture are kept; the platform takes a JPEG or
+        a PNG and nothing else. Returns how many were queued.
+        """
+        pictures = [
+            Picture(event_id=event_id, taken_at=frame.captured_at, image_bytes=frame.image_bytes)
+            for frame in frames
+            if frame.image_bytes
+        ]
+        with self._state:
+            for picture in pictures:
+                full = self._pictures.maxlen is not None
+                if full and len(self._pictures) == self._pictures.maxlen:
+                    self.pictures_dropped += 1
+                self._pictures.append(picture)
+        return len(pictures)
+
+    @property
+    def pending_pictures(self) -> int:
+        with self._state:
+            return len(self._pictures)
+
+    def flush_pictures(self) -> int:
+        """Send the queued pictures, all or nothing, as `flush` sends events.
+
+        A transport that cannot carry pictures (a lane with no platform, or one
+        written before them) keeps none: there is nowhere for them to go.
+        """
+        with self._flushing:
+            with self._state:
+                batch = list(self._pictures)
+            send = getattr(self._transport, "send_pictures", None)
+            if send is None:
+                with self._state:
+                    self._pictures.clear()
+                return 0
+            if not batch or not send(batch):
+                return 0
+            delivered = {id(p) for p in batch}
+            with self._state:
+                kept = [p for p in self._pictures if id(p) not in delivered]
+                self._pictures.clear()
+                self._pictures.extend(kept)
             return len(batch)
 
     @property

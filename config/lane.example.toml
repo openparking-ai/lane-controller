@@ -60,6 +60,12 @@ stays_refresh_seconds = 5
 # address, which is LOOPBACK on any real installation: identification runs on
 # the same box, and the lane has to work with the internet down.
 # vehicle_id_url = "http://127.0.0.1:8088"
+# The banned-car search's thresholds (U7f), stated to the identification
+# service as the platform's exit search states its own: no default, because no
+# operating point has been measured. Both or neither. Neither: this lane refuses
+# no car as banned.
+# banned_match_structure = 0.4
+# banned_match_colour    = 0.3
 
 # Where the decision cache lives ON DISK, so a lane that restarts while the
 # platform is unreachable decides from what it last held -- a power cut, a

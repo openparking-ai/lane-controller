@@ -60,6 +60,10 @@ WINDOW = 10.0
 
 ALLOWED = VehicleIdentity(plate="SIM-0001", confidence=0.97, presence=True)
 BANNED = VehicleIdentity(plate="BANNED-1", confidence=0.97, presence=True)
+#: What the idle poll's pictures read (U7f): nothing. This suite is about the
+#: crossing nobody admitted and nobody identified; tests/test_tailgater.py has
+#: the one that is read.
+UNREAD = VehicleIdentity(plate=None, confidence=0.0)
 
 F = ClosingSequence.FORWARD
 R = ClosingSequence.REVERSE
@@ -109,7 +113,7 @@ def build(
         loop=SimulatedLoopInput(arrivals=arrivals),
         camera=CannedCameraFeed(),
         vend=vend,
-        identifier=StubVehicleIdentifier(identities or [ALLOWED]),
+        identifier=StubVehicleIdentifier([*(identities or [ALLOWED]), UNREAD]),
         closing_loops=loops,
         cache=cache,
         events=EventQueue(transport) if transport is not None else None,
@@ -295,7 +299,7 @@ def test_a_crossing_while_a_vend_is_pending_is_the_vends_answer_not_a_new_entry(
     abandoned worker is still on the board. Either gate failing is one crossing
     recorded as unadmitted AND answered to the vend."""
     loops = HeldLoops()
-    controller, _, _ = build(arrivals=0, loops_impl=loops)
+    controller, _, _ = build(arrivals=0, loops_impl=loops, identities=[UNREAD])
     at = to_iso(controller.now())
 
     # Gate one: pending, and nothing is reading yet.
@@ -928,7 +932,7 @@ def test_a_crossing_the_poll_holds_when_a_vend_begins_during_its_read_is_the_ven
     asking the driver, and the vend is confirmed on it."""
     loops = PollThatHangs()
     loops.answer = ClosingSequence.FORWARD
-    controller, _, _ = build(arrivals=0, loops_impl=loops)
+    controller, _, _ = build(arrivals=0, loops_impl=loops, identities=[UNREAD])
     idle = a_hung_poll(controller)
     at = to_iso(controller.now())
 

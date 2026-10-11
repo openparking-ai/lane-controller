@@ -12,6 +12,7 @@ would just be a loop.
 
 from __future__ import annotations
 
+import base64
 import json
 import urllib.error
 import urllib.parse
@@ -149,6 +150,7 @@ class PlatformClient:
         ticket_ref: str | None = None,
         plate_region: str | None = None,
         descriptor: str | None = None,
+        tailgater: bool = False,
     ) -> dict:
         # event_id is the lane's own, and it is what makes a re-sent flush safe.
         # The platform keys the session on it, so this exact arrival can only
@@ -171,6 +173,23 @@ class PlatformClient:
                 # existed -- so a lane with the descriptor switched off is
                 # unchanged against any platform, old or new.
                 **({"descriptor": descriptor} if descriptor is not None else {}),
+                # A car through the gate that no vend let in (U7f). Only when
+                # true: every other open is byte-identical to before.
+                **({"tailgater": True} if tailgater else {}),
+            },
+        )
+
+    def post_picture(self, *, picture_ref: str, event_id: str, taken_at: str, image: bytes) -> dict:
+        """One picture kept with an entry record (U7f): the platform keeps it one
+        week after the car left. Idempotent on `picture_ref`."""
+        return self._request(
+            "POST",
+            "/api/v1/lane/pictures",
+            {
+                "picture_ref": picture_ref,
+                "event_id": event_id,
+                "taken_at": taken_at,
+                "image": base64.b64encode(image).decode("ascii"),
             },
         )
 

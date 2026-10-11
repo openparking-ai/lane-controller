@@ -385,3 +385,19 @@ class VehicleIdentifier(Protocol):
     """
 
     def identify(self, frames: Sequence[Frame]) -> VehicleIdentity: ...
+
+
+class BannedMatcher(Protocol):
+    """Whether an arriving car is one the garage banned (U7f).
+
+    The comparison is the one the platform's exit search already uses: the
+    identity service's `POST /v1/searches`, given the car's descriptor (its OPA
+    ID), the banned cars' descriptors and the thresholds the site states. This
+    package never compares descriptors itself.
+    """
+
+    def match(self, descriptor: str, banned: Sequence[dict]) -> str | None:
+        """The id of the ban this car matches, or None. `banned` is the
+        platform's list, each `{"id", "descriptor"}`. Raises when the comparison
+        could not be made; the lane then refuses nobody on it."""
+        ...
