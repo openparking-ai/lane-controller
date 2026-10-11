@@ -18,6 +18,7 @@ the gate shut; the arming loop's pictures stay as they are -- read, never kept.
 The U7f gate's findings, each pinned here (F1-F4): an exit lets a banned car
 out; a different car crossing after a held vend is a tailgater; the list
 survives a restart with the platform unreachable; pictures wait out an outage.
+The re-gate's G1: a site that states no thresholds refuses nobody as banned.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from lane_controller import (
     LaneController,
     LoopConfig,
     VehicleIdentity,
+    cli,
 )
 from lane_controller.decision import Outcome, Rule
 from lane_controller.durable import CACHE_DIR_MODE, DurableStore
@@ -392,3 +394,35 @@ def test_pictures_wait_out_an_outage_and_go_when_it_ends():
     controller.events.flush_pictures()
     assert len(platform.pictures) == 4
     assert controller.events.pending_pictures == 0
+
+
+# --- the re-gate's finding (U7f fix 2) -------------------------------------------------
+
+
+def a_wired_entry(**thresholds):
+    config = LaneConfig(
+        lane_id="l",
+        site_id="s",
+        camera=CameraConfig(camera_id="c", rtsp_url=""),
+        gate=GateConfig(),
+        direction="entry",
+        vehicle_id_url="http://127.0.0.1:9",
+        **thresholds,
+    )
+    return cli.wire_lane(config, platform=None)
+
+
+def test_a_site_that_states_no_thresholds_refuses_nobody_as_banned():
+    """G1. No operating point is measured, so there is no default: the lane
+    `serve` builds has no banned comparison until the site states both."""
+    wired = a_wired_entry()
+    assert wired.controller.banned_matcher is None
+    assert wired.seams["banned"].startswith("NONE")
+
+
+def test_the_thresholds_a_site_states_are_the_ones_the_search_sends():
+    """G1's control: stated, the comparison is wired with exactly those."""
+    wired = a_wired_entry(banned_match_structure=0.4, banned_match_colour=0.3)
+    assert wired.controller.banned_matcher is not None
+    assert wired.controller.banned_matcher.thresholds == {"structure": 0.4, "colour": 0.3}
+    assert wired.seams["banned"].startswith("REAL")

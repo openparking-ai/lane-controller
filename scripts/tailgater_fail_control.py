@@ -16,6 +16,7 @@ each break below, where it must FAIL. Every break is on a decision of the lane
   list_not_kept_on_disk the list is lost on a restart offline (F3)
   pictures_dropped_in_an_outage
                         a failed send drops the queued pictures (F4)
+  thresholds_defaulted  a site with no thresholds refuses cars as banned (G1)
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ BREAKAGES = [
     ("any_car_after_a_held_vend_is_late", "a different car after a held vend is not a tailgater"),
     ("list_not_kept_on_disk", "the banned list is lost on a restart offline"),
     ("pictures_dropped_in_an_outage", "a failed send drops the queued pictures"),
+    ("thresholds_defaulted", "a site that states no thresholds refuses cars as banned"),
 ]
 
 

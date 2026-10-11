@@ -2687,5 +2687,25 @@ def _break_the_tailgater(monkeypatch):
 
         monkeypatch.setattr(EventQueue, "flush_pictures", dropping)
 
+    elif mode == "thresholds_defaulted":
+        # G1: a site that states no thresholds gets made-up ones -- cars are
+        # refused as banned on an operating point nobody measured.
+        from lane_controller import cli
+        from lane_controller.vehicle_id_client import VehicleIdSearch
+
+        assert hasattr(cli, "wire_lane"), "wire_lane's anchor has moved"
+        original_wire = cli.wire_lane
+
+        def defaulted(config, *, platform):
+            wired = original_wire(config, platform=platform)
+            if config.vehicle_id_url and wired.controller.banned_matcher is None:
+                wired.controller.banned_matcher = VehicleIdSearch(
+                    config.vehicle_id_url, structure=0.5, colour=0.5
+                )
+                wired.seams["banned"] = f"REAL search at {config.vehicle_id_url}"
+            return wired
+
+        monkeypatch.setattr(cli, "wire_lane", defaulted)
+
     else:
         raise RuntimeError(f"unknown BREAK_TAILGATER mode: {mode}")
