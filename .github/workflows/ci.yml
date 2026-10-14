@@ -136,6 +136,14 @@ jobs:
           # validation put up after the lane's own tax or taken on the taxed fee
           # -- and requires the exit-tax suite to fail each time.
           - exit_tax
+          # Fill-rule fail-control
+          # Breaks how full the garage was at entry, at the barrier (platform
+          # 0034) -- the stay priced without its figure, the record silent on
+          # it, the board pricing a car coming in now with no figure or as if
+          # empty, more cars than spaces read as more than full, the number of
+          # spaces not kept on disk or not checked -- and requires the
+          # fill-rule suite to fail each time.
+          - fill_rule
           # Close-decision fail-control
           # Breaks the decision on the close -- the close carrying nothing, the
           # settle recording the last decision instead of the one it was

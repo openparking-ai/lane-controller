@@ -178,6 +178,19 @@ def _register_heads(module: str, register: dict) -> dict[str, dict]:
     return {a.get("agreement"): a for a in register.get("agreements") or [] if a.get("agreement")}
 
 
+#: Full, in basis points: how full a garage can be, and no fuller.
+FULL_BP = 10_000
+
+
+def spaces_from_payload(raw) -> int | None:
+    """The garage's number of spaces as the payload (or the disk) holds it:
+    a whole number above zero, or None. Anything else is None -- a board
+    with no figure prints no fill-rule prices rather than a guessed one."""
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return None
+    return raw
+
+
 def banned_from_payload(raw) -> list[dict]:
     """The `banned` list as the platform sends it, each entry an id and a
     descriptor, both non-empty strings. An entry in any other shape is not a
@@ -234,6 +247,10 @@ class DecisionCache:
         # `rate_engine.quote` takes.
         self.plans: list = []
         self.space_class: str | None = None
+        # The garage's number of spaces (platform 0034), or None: the price
+        # board prices a car coming in now on how full the garage is now, the
+        # figure the platform freezes onto the stay when it opens.
+        self.spaces: int | None = None
         # The garage's tax sets, WHOLE, as `rate_engine.contract.run_tax`
         # takes them (platform 0023). Replaced on every refresh and never
         # merged: the count and the newest instant the exit reports with a
@@ -309,6 +326,7 @@ class DecisionCache:
             "refreshed_at": self._refreshed_at,
             "plans": self.plans,
             "space_class": self.space_class,
+            "spaces": self.spaces,
             "tax_sets": self.tax_sets,
             "entitlements": self.entitlements,
             "entitlements_complete": self.entitlements_complete,
@@ -348,6 +366,7 @@ class DecisionCache:
         self._refreshed_at = float(state["refreshed_at"])
         self.plans = list(state.get("plans") or [])
         self.space_class = state.get("space_class")
+        self.spaces = spaces_from_payload(state.get("spaces"))
         self.tax_sets = list(state.get("tax_sets") or [])
         self.entitlements = dict(state.get("entitlements") or {})
         self.entitlements_complete = state.get("entitlements_complete")
@@ -371,6 +390,7 @@ class DecisionCache:
         self.default_action = None
         self.plans = []
         self.space_class = None
+        self.spaces = None
         self.tax_sets = []
         self.entitlements = {}
         self.entitlements_complete = None
@@ -421,6 +441,7 @@ class DecisionCache:
         self.load(rules, default_action=payload.get("default_action"), now=now)
         self.plans = list(payload.get("rate_plans") or [])
         self.space_class = payload.get("space_class")
+        self.spaces = spaces_from_payload(payload.get("spaces"))
         self.tax_sets = list(payload.get("tax_sets") or [])
         self.timezone = payload.get("timezone")
         self.currency = payload.get("currency")
@@ -520,6 +541,15 @@ class DecisionCache:
     def open_stays_for(self, identity: str) -> list[dict]:
         """Every open stay under this plate or ticket. One lookup."""
         return self._stay_index.get(normalise_identity(identity), [])
+
+    def occupancy_now_bp(self) -> int | None:
+        """How full the garage is now, as the platform counts it at an open
+        (platform 0034): every open stay this copy holds, against the garage's
+        number of spaces, in basis points rounded down and never more than
+        full. None without a number of spaces -- nothing is guessed."""
+        if self.spaces is None:
+            return None
+        return min(FULL_BP, (FULL_BP * len(self.stays)) // self.spaces)
 
     def is_stale(self, *, now: float | None = None) -> bool:
         if self._refreshed_at is None:
