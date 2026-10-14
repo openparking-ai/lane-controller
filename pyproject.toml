@@ -27,7 +27,7 @@ dependencies = [
   # lane's behaviour can change without a commit here. Bumping it is a
   # deliberate act with its own PR; `.github/scripts/check-rate-engine-pin.sh`
   # holds it to main.
-  "openparking-rate-engine @ git+https://github.com/openparking-ai/rate-engine@1019ade8569e9e7b7a868128d8155362eeae9e4b",
+  "openparking-rate-engine @ git+https://github.com/openparking-ai/rate-engine@9acb5e5ad8d05498a478e093fdb297d355ea76c0",
 ]
 
 [project.optional-dependencies]
