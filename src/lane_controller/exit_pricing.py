@@ -116,6 +116,11 @@ class ExitPricing:
     exit_at: str | None = None
     session_id: str | None = None
     space_class: str | None = None
+    #: How full the garage was when the stay came in (platform 0034), as the
+    #: platform's copy of the open stay carried it, or None. The quote was
+    #: made on it; the platform takes the decision only when it is the stay's
+    #: own figure.
+    occupancy_at_entry_bp: int | None = None
     #: The fee before tax: the quote's total, on which the tax was taken.
     subtotal_minor: int | None = None
     #: Two facts about the cache's tax sets -- how many it held and the newest
@@ -145,6 +150,7 @@ class ExitPricing:
                 exit_at=self.exit_at,
                 session_id=self.session_id,
                 space_class=self.space_class,
+                occupancy_at_entry_bp=self.occupancy_at_entry_bp,
             )
         if self.status == PRICED:
             detail.update(
@@ -275,12 +281,17 @@ def price_exit(identity_text: str, cache: DecisionCache, *, now: float) -> ExitP
     # identity -- which the platform's own index forbids for one vehicle and
     # a ticket cannot share -- and the count is said rather than hidden.
     stay = max(stays, key=lambda s: s.get("entry_at") or "")
+    # HOW FULL THE GARAGE WAS WHEN THIS CAR CAME IN, as the platform froze it
+    # onto the stay (0034): the same figure the platform's close hands the
+    # engine, so the two price the stay to the same cent.
+    figure = stay.get("occupancy_at_entry_bp")
     common = dict(
         entry_at=stay.get("entry_at"), exit_at=exit_at, session_id=stay.get("session_id"),
         space_class=cache.space_class, computed_from=computed_from,
         ambiguous_stays=len(stays) if len(stays) > 1 else 0,
+        occupancy_at_entry_bp=figure,
     )
-    status, body, tax = charge(cache, stay.get("entry_at"), exit_at)
+    status, body, tax = charge(cache, stay.get("entry_at"), exit_at, figure)
     if status != 200:
         return ExitPricing(
             status=ENGINE_REFUSED if status == 422 else ENGINE_INVALID, refusal=body, **common,
@@ -292,23 +303,36 @@ def price_exit(identity_text: str, cache: DecisionCache, *, now: float) -> ExitP
     )
 
 
-def charge(cache: DecisionCache, entry_at: str | None, exit_at: str) -> tuple[int, dict, dict]:
+def charge(
+    cache: DecisionCache,
+    entry_at: str | None,
+    exit_at: str,
+    occupancy_at_entry_bp: int | None = None,
+) -> tuple[int, dict, dict]:
     """WHAT THIS LANE CHARGES for a stay from `entry_at` to `exit_at`, from
     the cache: the engine's quote on the cached plans, then the garage's tax on
     that subtotal at the exit. `(200, quote, tax)` when both priced; otherwise
     the failing call's status and its body verbatim, and `{}` for the tax.
 
+    `occupancy_at_entry_bp` is how full the garage was when the stay came in
+    (platform 0034), handed to the engine when known. Without it a plan with
+    a fill rule is refused by the engine by name -- never priced as if the
+    garage were empty or full.
+
     ONE COMPUTATION, and both the exit's fee and the board's prices are it: a
     price on the screen is the fee the lane would put on the reader for the
     same stay at the same moment, because it is the same call.
     """
-    status, body = run_quote({
+    request = {
         "plans": cache.plans,
         "currency": cache.currency,
         "space_class": cache.space_class,
         "entry_at": entry_at,
         "exit_at": exit_at,
-    })
+    }
+    if occupancy_at_entry_bp is not None:
+        request["occupancy_at_entry_bp"] = occupancy_at_entry_bp
+    status, body = run_quote(request)
     if status != 200:
         return status, body, {}
     # THE TAX, LAST, on the quote's total at the exit -- the instant the

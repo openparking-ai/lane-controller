@@ -80,10 +80,14 @@ def price_lines(cache: DecisionCache, now: float) -> list[dict]:
     if cache.is_stale(now=now) or not cache.plans or not cache.tax_sets:
         return []
     entry = datetime.fromtimestamp(now, UTC)
+    # A car coming in now is counted against the cars inside now, as the
+    # platform counts it at the open (0034): the board shows what that car
+    # would pay, fill rule included.
+    figure = cache.occupancy_now_bp()
     lines = []
     for minutes in BOARD_STAY_MINUTES:
         status, quote, tax = charge(
-            cache, entry.isoformat(), (entry + timedelta(minutes=minutes)).isoformat()
+            cache, entry.isoformat(), (entry + timedelta(minutes=minutes)).isoformat(), figure
         )
         if status != 200:
             continue

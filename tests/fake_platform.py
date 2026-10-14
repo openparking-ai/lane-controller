@@ -55,6 +55,9 @@ class FakePlatform:
                                    "garage_pass": {"consulted": False, "reason": "not linked"},
                                    "monthly_billing": {"consulted": False, "reason": "not linked"}}
         self.stays: list[dict] = []
+        #: The garage's number of spaces (platform 0034), served on the slow
+        #: read. None serves null -- a garage that has not stated one.
+        self.spaces: int | None = None
         self.cursor = 0
         self.stay_page = 500
         self.rules_reads = 0
@@ -96,6 +99,7 @@ class FakePlatform:
             "garage_id": "garage-1",
             "currency": "USD",
             "space_class": "standard",
+            "spaces": self.spaces,
             "default_action": self.default_action,
             "active": True,
             "rate_plans": list(self.rate_plans),

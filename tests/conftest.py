@@ -2709,3 +2709,89 @@ def _break_the_tailgater(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_TAILGATER mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the fill-rule fail-control (platform 0034).
+#
+# scripts/fill_rule_fail_control.py sets BREAK_FILL and requires
+# tests/test_fill_rule.py to FAIL. A lane nobody has seen price a stay on the
+# wrong figure is not known to price it on the right one.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_fill_figure(monkeypatch):
+    mode = os.environ.get("BREAK_FILL")
+    if not mode:
+        return
+
+    from lane_controller import board as board_module
+    from lane_controller import decision as decision_module
+    from lane_controller import exit_pricing as pricing_module
+
+    if mode == "figure_dropped":
+        # The exit prices the stay without the figure the platform froze on it.
+        original = pricing_module.charge
+
+        def without_figure(cache, entry_at, exit_at, occupancy_at_entry_bp=None):
+            return original(cache, entry_at, exit_at)
+
+        monkeypatch.setattr(pricing_module, "charge", without_figure)
+
+    elif mode == "figure_not_recorded":
+        # The record does not say which figure the stay was priced on.
+        original = pricing_module.ExitPricing.to_detail
+
+        def unrecorded(self):
+            detail = original(self)
+            detail.pop("occupancy_at_entry_bp", None)
+            return detail
+
+        monkeypatch.setattr(pricing_module.ExitPricing, "to_detail", unrecorded)
+
+    elif mode == "board_without_figure":
+        # The board prices a car coming in now with no figure.
+        original = board_module.charge
+
+        def blind(cache, entry_at, exit_at, occupancy_at_entry_bp=None):
+            return original(cache, entry_at, exit_at)
+
+        monkeypatch.setattr(board_module, "charge", blind)
+
+    elif mode == "board_guesses_empty":
+        # With no number of spaces, the board prices the garage as empty.
+        original = decision_module.DecisionCache.occupancy_now_bp
+
+        def empty(self):
+            figure = original(self)
+            return 0 if figure is None else figure
+
+        monkeypatch.setattr(decision_module.DecisionCache, "occupancy_now_bp", empty)
+
+    elif mode == "not_clamped":
+        # More cars than spaces is more than full.
+        def unclamped(self):
+            if self.spaces is None:
+                return None
+            return (decision_module.FULL_BP * len(self.stays)) // self.spaces
+
+        monkeypatch.setattr(decision_module.DecisionCache, "occupancy_now_bp", unclamped)
+
+    elif mode == "spaces_not_kept":
+        # The number of spaces is not written to the disk the cache restores from.
+        original = decision_module.DecisionCache.state
+
+        def forgetful(self):
+            state = original(self)
+            state.pop("spaces", None)
+            return state
+
+        monkeypatch.setattr(decision_module.DecisionCache, "state", forgetful)
+
+    elif mode == "spaces_unchecked":
+        # Any value is taken as the number of spaces.
+        monkeypatch.setattr(decision_module, "spaces_from_payload", lambda raw: raw)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_FILL mode: {mode}")
