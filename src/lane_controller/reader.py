@@ -31,6 +31,9 @@ it and nothing in this package can charge at all.
     filtered: a zero line (the stay itself) and a negative one (a cap) are the
     engine's ledger too;
   * the total is the record's `fee_minor`, read, never added up;
+  * every amount in the reader API's units, which are the engine's for every
+    currency but ISK, UGX and MGA (`stripe_amount`): a figure, converted, never
+    re-computed;
   * no `cart[tax]`: the engine's tax lines are ledger lines like any other
     (platform 0023), shown as line items and already inside the total, and a
     second place for the same money is what the one-ledger rule forbids;
@@ -87,12 +90,47 @@ class ReaderScreen(Protocol):
     def present_exit(self, record: dict | None) -> None: ...
 
 
+#: Where the card network's units are not the engine's. The engine counts money
+#: in ISO 4217 minor units (`rate_engine.currency`); the reader's API counts it
+#: in its own, and for these three they differ. ISK and UGX have no decimals in
+#: ISO, but the API still takes them as two-decimal values whose decimals are
+#: always 00 -- 500 ISK is `50000`. MGA has two decimals in ISO and none in the
+#: API. Every other currency the engine prices in is the same number in both.
+#: From docs.stripe.com/currencies, read 2026-10-17: the zero-decimal list and
+#: its special cases. It names no three- or four-decimal currency, so those
+#: stay as they are, as they always went.
+STRIPE_MINOR_UNIT_DIGITS = {"ISK": 2, "UGX": 2, "MGA": 0}
+
+
+def stripe_amount(amount_minor: int, currency: str) -> int | None:
+    """An amount in the engine's minor units, in the units the reader's API
+    takes for `currency`: x100 for ISK and UGX, /100 for MGA, the same number
+    for every other currency. None when the amount cannot be written in the
+    API's units -- an MGA amount with a fraction of an ariary -- because a
+    figure rounded here would be a fee nobody priced.
+
+    Without it an ISK or UGX fee went up as 1/100 of itself: the engine's
+    `500` ISK, handed over as is, is 5 ISK on the reader."""
+    code = currency.upper()
+    if code not in STRIPE_MINOR_UNIT_DIGITS:
+        return amount_minor
+    iso, stripe = minor_unit_digits(code), STRIPE_MINOR_UNIT_DIGITS[code]
+    if stripe >= iso:
+        return amount_minor * 10 ** (stripe - iso)
+    whole, part = divmod(amount_minor, 10 ** (iso - stripe))
+    return None if part else whole
+
+
 def cart_for(record: dict | None) -> dict | None:
     """The cart for this record, or `None` when there is nothing to pay here.
 
     `None` for every status but `priced`, for a priced fee of zero, and for a
     record whose fee, currency or lines are not the shape the lane writes -- a
     line this cannot show AS STORED is not re-worded into one it can.
+
+    The amounts are the record's, in the reader API's units (`stripe_amount`):
+    the same number for every currency but three, never re-summed. A record
+    with an amount the API's units cannot hold has no cart.
     """
     if not isinstance(record, dict) or record.get("status") != PRICED:
         return None
@@ -114,8 +152,14 @@ def cart_for(record: dict | None) -> dict | None:
             return None
         if not isinstance(text, str) or not text:
             return None
+        amount = stripe_amount(amount, currency)
+        if amount is None:
+            return None
         items.append({"amount": amount, "description": text, "quantity": 1})
-    return {"currency": currency.lower(), "line_items": items, "total": fee}
+    total = stripe_amount(fee, currency)
+    if total is None:
+        return None
+    return {"currency": currency.lower(), "line_items": items, "total": total}
 
 
 def exit_fee_for(decision_at: str, record: dict | None, shown: dict | None = None) -> dict | None:
@@ -439,6 +483,7 @@ __all__ = [
     "PRICED",
     "PROMPT_TEXT",
     "SKIP_TEXT",
+    "STRIPE_MINOR_UNIT_DIGITS",
     "PhonePrompt",
     "ReaderScreen",
     "StripeCartScreen",
@@ -447,5 +492,6 @@ __all__ = [
     "cart_form",
     "claim_through",
     "prompt_for",
+    "stripe_amount",
     "with_validation",
 ]

@@ -196,7 +196,11 @@ def row_covers(module: str, row: dict, head: dict, day: date) -> bool:
     monthly-billing (G48): the agreement's latest version is `active`, or
     `cancelled` with a cancellation day still ahead -- the paid period runs
     to its end. A row whose head the register did not list (an id the store
-    holds no version of, `agreements_not_found`) covers nothing.
+    holds no version of, `agreements_not_found`) covers nothing. AND THE DAYS
+    THE MODULE DECIDES COVERAGE BY, when the register carries them (G63, see
+    `monthly_days_cover`): before the start day, inside a pause, blocked by
+    the owner, or from the first day unpaid past grace, the row covers
+    nothing. A register that does not carry them is read as it always was.
     """
     if not head:
         return False
@@ -215,12 +219,48 @@ def row_covers(module: str, row: dict, head: dict, day: date) -> bool:
     if module == "monthly_billing":
         status = head.get("status")
         if status == "active":
-            return True
+            return monthly_days_cover(head, day)
         if status == "cancelled":
             until = _day(head.get("cancelled_effective_day"))
-            return until is not None and day < until
+            return until is not None and day < until and monthly_days_cover(head, day)
         return False
     return False
+
+
+def monthly_days_cover(head: dict, day: date) -> bool:
+    """Whether an agreement's own days leave `day` covered, from the facts
+    monthly-billing's garage register carries beside the status (G63): the
+    latest version's `start_day`, its `pauses` (half-open: `from_day` is
+    paused, `until_day` is not), the owner's `blocked`, and `not_covered_from`
+    -- the first day the payer's earliest unpaid invoice is past grace.
+
+    The register said "active" for a monthly parker who had not paid, who had
+    paused, whose agreement had not started or whom the owner had blocked --
+    and the module itself answers NOT COVERED to each -- so all of them left
+    free. These are DATES, compared with the lane's day; nothing of the
+    module's rules is copied here, and no amount or invoice travels.
+
+    EACH FACT ONLY WHEN IT IS THERE: a register older than these fields reads
+    as it did, so a lane is never stricter than the register it was handed.
+    A fact that is there and cannot be read covers nothing, as a pass whose
+    terms the module cannot read covers nothing.
+    """
+    try:
+        start = _day(head.get("start_day"))
+        if start is not None and day < start:
+            return False
+        for pause in head.get("pauses") or []:
+            if _day(pause["from_day"]) <= day < _day(pause["until_day"]):
+                return False
+        blocked = head.get("blocked")
+        if blocked is not None and blocked is not False:
+            return False
+        unpaid = _day(head.get("not_covered_from"))
+        if unpaid is not None and day >= unpaid:
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
 
 
 def register_cover(

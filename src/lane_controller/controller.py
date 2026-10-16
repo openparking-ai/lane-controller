@@ -191,7 +191,6 @@ class LaneController:
         cache: DecisionCache | None = None,
         events: EventQueue | None = None,
         clock: Callable[[], float] = time.time,
-        session_lookup: Callable[[str], dict | None] | None = None,
         reader: ReaderScreen | None = None,
         banned_matcher: BannedMatcher | None = None,
     ) -> None:
@@ -250,9 +249,6 @@ class LaneController:
         # session times, which is the point: the platform must price the stay
         # from when the car was there, not from when it heard about it.
         self._clock = clock
-        # Injected rather than reached for, so a lane can be built with no
-        # platform at all and the tests need no network.
-        self.session_lookup = session_lookup
         # THE READ SIDE, and it is deliberately nothing more than this. The
         # contract publishes the last decision and the current transit, and
         # both live here, in memory, for exactly as long as this process does.
@@ -607,7 +603,15 @@ class LaneController:
             # HERE rather than after the confirmation: the car arrived when it
             # arrived, whatever time the server eventually hears about it, and
             # pricing a stay by when the network came back would be wrong.
-            at = to_iso(self._clock())
+            #
+            # AT AN EXIT THE LANE PRICED, IT IS THE PRICE'S OWN EXIT TIME: one
+            # reading of the clock for the fee and the close. Read twice --
+            # once for the price, again after the reader and the relay -- the
+            # two differed by the relay's time, and the platform's reconciler,
+            # which compares them to the millisecond, flagged nearly every
+            # lane-priced close `inputs_disagree` with the fee right.
+            exit_at = getattr(decision.exit_pricing, "exit_at", None)
+            at = exit_at if exit_at else to_iso(self._clock())
             self._settle_transit(identity, at, exit_pricing=decision.exit_pricing)
 
         elif decision.outcome is Outcome.NO_VEHICLE:
@@ -1558,21 +1562,15 @@ class LaneController:
                 # true, so every other open is the record it always was.
                 **({"tailgater": True} if tailgater else {}),
             )
-        # Ask the platform which session this is, while the answer is still
-        # unambiguous. If it cannot be reached the close goes out without an id
-        # and the platform falls back to matching on the identity -- which
-        # works, and is merely less precise.
-        #
-        # The lookup takes a PLATE, so a ticket identity skips it. That is not a
-        # gap that can be reached in this version: the vend route is the only
-        # thing that sets a ticket and it serves ENTRY lanes only, and no
-        # identifier may supply one. The close still goes out carrying the
-        # ticket, and the platform finds the open stay from it.
+        # WHICH SESSION THIS IS is asked of the platform when the close is
+        # DELIVERED, by the transport, on the thread that drains the outbox
+        # (`sync.PlatformTransport`) -- never here. Asked here, it was a
+        # network call on the lane's thread with the client's timeout behind
+        # it: in an outage every exit waited five seconds before the next car
+        # was served. The close is recorded without an id, and one the
+        # platform cannot be asked about goes out without one, as it always
+        # did offline: the platform matches it on the identity.
         session_id = None
-        if self.session_lookup is not None and identity.plate:
-            found = self.session_lookup(identity.plate)
-            if found:
-                session_id = found.get("session", {}).get("id")
         # THE DECISION THE BARRIER MOVED ON rides the close, and no other
         # channel: the platform's close CONSUMES it (0017) -- writes its fee,
         # runs no engine -- so what the screen showed and what the row says are
@@ -1597,6 +1595,12 @@ class LaneController:
             session_id=session_id,
             exit_confirmation=confirmation,
         )
+        # AND THE STAY IS CLOSED HERE TOO. Left in the lane's list until the
+        # platform's next delta -- or for hours offline -- a car that backed up
+        # and pulled forward was priced a second time for the same stay, and
+        # the reader put the fee up again.
+        if exit_pricing is not None:
+            self.cache.drop_stay(exit_pricing.session_id)
         # The car this fee belonged to has gone through: the reader shows
         # nothing until the next exit decision, so the next driver never
         # reads this one's fee.

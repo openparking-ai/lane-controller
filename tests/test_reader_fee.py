@@ -6,7 +6,7 @@ computation -- except where a test plants a record on purpose to prove that a
 figure is READ: a record whose fee is not the sum of its lines can only come
 out of the cart as its fee if the cart reads it.
 
-`scripts/reader_fail_control.py` breaks the seam in nine ways and requires
+`scripts/reader_fail_control.py` breaks the seam in ten ways and requires
 this file to go red each time.
 """
 
@@ -184,6 +184,74 @@ def test_a_record_the_lane_did_not_write_is_not_reworded_into_a_cart():
     ):
         record = {**priced_record(), **plant}
         assert reader_module.cart_for(record) is None, plant
+
+
+# ---------------------------------------------------------------------------
+# the reader API's units: the engine's for every currency but ISK, UGX and MGA
+# ---------------------------------------------------------------------------
+
+
+def test_every_currency_the_engine_prices_in_reaches_the_reader_in_the_apis_units():
+    from rate_engine.currency import MINOR_UNIT_DIGITS
+
+    converted = {"ISK": 120000, "UGX": 120000, "MGA": 12}
+    for code in sorted(MINOR_UNIT_DIGITS):
+        assert reader_module.stripe_amount(1200, code) == converted.get(code, 1200), code
+    assert reader_module.stripe_amount(-500, "ISK") == -50000, "a cap line converts too"
+    assert reader_module.stripe_amount(-500, "MGA") == -5
+    assert reader_module.stripe_amount(1234, "MGA") is None, "a fraction of an ariary was rounded"
+    # the exceptions are exactly the currencies whose units the two disagree on
+    for code, digits in reader_module.STRIPE_MINOR_UNIT_DIGITS.items():
+        assert MINOR_UNIT_DIGITS[code] != digits, code
+
+
+def a_record_in(currency: str) -> dict:
+    """A stay priced by the engine in `currency`: the flat plan's 300 an hour,
+    three hours, in that currency's own minor units."""
+    plan = copy.deepcopy(PLAN)
+    plan["plan_version"] = f"flat-{currency.lower()}"
+    plan["currency"] = currency
+    platform = a_platform(stays=[("s-9", "TRNS-9", ENTRY)])
+    platform.rate_plans = [plan]
+    cache = a_cache(platform)
+    cache.currency = currency
+    record = price_exit("TRNS-9", cache, now=NOW).to_detail()
+    assert record["status"] == "priced" and record["currency"] == currency, record
+    return record
+
+
+def test_an_isk_fee_goes_up_as_the_fee_not_a_hundredth_of_it():
+    record = a_record_in("ISK")
+    assert record["fee_minor"] == 900, "the premise: 900 ISK, which has no decimals"
+    cart = reader_module.cart_for(record)
+    assert cart["currency"] == "isk"
+    assert cart["total"] == 90000, "900 ISK is 90000 to the reader; 900 shows 9 ISK"
+    assert [item["amount"] for item in cart["line_items"]] == [
+        line["delta_minor"] * 100 for line in record["breakdown"]
+    ]
+    assert reader_module.cart_form(cart)["cart[total]"] == "90000"
+
+
+def test_a_ugx_fee_and_an_mga_fee_go_up_in_the_apis_units():
+    record = {**priced_record(), "currency": "UGX"}
+    assert reader_module.cart_for(record)["total"] == record["fee_minor"] * 100
+    record = {**priced_record(), "currency": "MGA"}  # 500 = 5.00 MGA in the engine
+    cart = reader_module.cart_for(record)
+    assert cart["total"] == 5
+    assert [item["amount"] for item in cart["line_items"]] == [
+        line["delta_minor"] // 100 for line in record["breakdown"]
+    ]
+    # an amount the API's units cannot hold is not rounded onto the reader
+    assert reader_module.cart_for({**record, "fee_minor": 550}) is None
+
+
+def test_the_control_a_usd_fee_goes_up_as_the_record_says():
+    record = priced_record()
+    cart = reader_module.cart_for(record)
+    assert cart["total"] == record["fee_minor"] == 500
+    assert [item["amount"] for item in cart["line_items"]] == [
+        line["delta_minor"] for line in record["breakdown"]
+    ]
 
 
 def test_the_form_is_the_shape_the_api_reference_names():

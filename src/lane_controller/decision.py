@@ -7,6 +7,7 @@ events are reported afterwards, never something the barrier waits on.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -146,10 +147,22 @@ class Rule:
     rate_plan: str | None = None
 
 
+#: The letters the plate reader never outputs, and the digit it reads each as.
+#: Its alphabet leaves out I and O, so a registered GO4IT arrives as G041T.
+_READER_FOLD = str.maketrans({"O": "0", "I": "1"})
+
+
 def normalise_identity(text: str) -> str:
     """The one folding under which a plate the camera read and an identity a
-    registrar typed are compared: upper-case, letters and digits only.
-    `AB-123`, `ab 123` and `AB123` are one identity here.
+    registrar typed are compared: upper-case, letters and digits only, and O
+    read as 0 and I as 1. `AB-123`, `ab 123` and `AB123` are one identity
+    here, and so are `GO4IT` and `G041T`.
+
+    O AND I ARE FOLDED BECAUSE THE READER CANNOT TELL THEM APART: its alphabet
+    has no I and no O, so it reads a registered `GO4IT` as `G041T`. Folded on
+    both sides -- the read and the registrar's text -- a holder whose plate
+    has an I or an O matches their own pass or agreement instead of paying as
+    a stranger on every visit.
 
     AN ASSUMPTION, STATED: garage-pass stores an identity as the registrar
     typed it and monthly-billing folds it under the garage's own rule
@@ -166,7 +179,7 @@ def normalise_identity(text: str) -> str:
     whose actor is `lane:decision`. A reader can take those to the modules;
     nothing on either side does it for them.
     """
-    return "".join(ch for ch in text.upper() if ch.isalnum())
+    return "".join(ch for ch in text.upper() if ch.isalnum()).translate(_READER_FOLD)
 
 
 def _register_heads(module: str, register: dict) -> dict[str, dict]:
@@ -189,6 +202,13 @@ def spaces_from_payload(raw) -> int | None:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
         return None
     return raw
+
+
+def transient_from_payload(raw) -> bool | None:
+    """The garage's `transient_available` as the payload (or the disk) holds
+    it: True or False, and None for anything else -- absent, null, or a value
+    that is not a boolean. None is read as it always was: no change."""
+    return raw if isinstance(raw, bool) else None
 
 
 def banned_from_payload(raw) -> list[dict]:
@@ -239,6 +259,12 @@ class DecisionCache:
         # platform has said otherwise. A transient garage syncs "allow"; a
         # permit-only garage will sync nothing and keep falling back.
         self.default_action: str | None = None
+        # The owner's "pass holders only" (`transient_available`), as the
+        # payload states it: False when this garage takes no other driver,
+        # True when it does, None when the payload says nothing -- a platform
+        # older than the field, or a garage that has not stated it -- and
+        # None is the lane exactly as it was. Only `False` changes anything.
+        self.transient_available: bool | None = None
         # WHAT THE EXIT WILL DECIDE FROM, held as the platform hands it and
         # consumed by nothing in this file yet: the decision that reads these
         # is its own round. This round only keeps them fresh.
@@ -298,6 +324,12 @@ class DecisionCache:
         # plate the camera read and the identity a registrar typed meet.
         self._coverage_index: dict[str, list[tuple[str, dict, dict]]] = {}
         self._stay_index: dict[str, list[dict]] = {}
+        # TWO THREADS CHANGE THE OPEN STAYS: the refresh thread applies what
+        # the platform says, and the lane thread drops a stay whose close it
+        # has just recorded (`drop_stay`). This lock is held for the dict and
+        # index work only -- never across the disk or the network -- so the
+        # lane thread waits on nothing but a few assignments.
+        self._stays_lock = threading.Lock()
         if self._store is not None:
             self._restore()
 
@@ -323,6 +355,7 @@ class DecisionCache:
                 for r in self._rules.values()
             ],
             "default_action": self.default_action,
+            "transient_available": self.transient_available,
             "refreshed_at": self._refreshed_at,
             "plans": self.plans,
             "space_class": self.space_class,
@@ -363,6 +396,7 @@ class DecisionCache:
             for r in state.get("rules") or []
         }
         self.default_action = state.get("default_action")
+        self.transient_available = transient_from_payload(state.get("transient_available"))
         self._refreshed_at = float(state["refreshed_at"])
         self.plans = list(state.get("plans") or [])
         self.space_class = state.get("space_class")
@@ -388,13 +422,16 @@ class DecisionCache:
         self._rules = {}
         self._refreshed_at = None
         self.default_action = None
+        self.transient_available = None
         self.plans = []
         self.space_class = None
         self.spaces = None
         self.tax_sets = []
         self.entitlements = {}
         self.entitlements_complete = None
-        self.stays = {}
+        with self._stays_lock:
+            self.stays = {}
+            self._stay_index = {}
         self.stays_cursor = None
         self.stays_refreshed_at = None
         self.timezone = None
@@ -403,7 +440,6 @@ class DecisionCache:
         self.board = {"prices": False, "messages": []}
         self.banned = []
         self._coverage_index = {}
-        self._stay_index = {}
         if self._store is not None:
             self._store.wipe()
 
@@ -439,6 +475,7 @@ class DecisionCache:
             for r in payload.get("plate_rules", [])
         ]
         self.load(rules, default_action=payload.get("default_action"), now=now)
+        self.transient_available = transient_from_payload(payload.get("transient_available"))
         self.plans = list(payload.get("rate_plans") or [])
         self.space_class = payload.get("space_class")
         self.spaces = spaces_from_payload(payload.get("spaces"))
@@ -485,10 +522,11 @@ class DecisionCache:
         self, open_stays: list[dict], cursor: str, *, now: float | None = None
     ) -> None:
         """The full open set, and the cursor to continue from."""
-        self.stays = {s["session_id"]: s for s in open_stays}
+        with self._stays_lock:
+            self.stays = {s["session_id"]: s for s in open_stays}
+            self._reindex_stays()
         self.stays_cursor = str(cursor)
         self.stays_refreshed_at = time.time() if now is None else now
-        self._reindex_stays()
         self._persist()
 
     def apply_stay_changes(
@@ -500,15 +538,36 @@ class DecisionCache:
         the cursor moves only after every row landed, so a delta that raised
         halfway would be re-read from where it started.
         """
-        for stay in changes:
-            if stay.get("open"):
-                self.stays[stay["session_id"]] = stay
-            else:
-                self.stays.pop(stay["session_id"], None)
+        with self._stays_lock:
+            for stay in changes:
+                if stay.get("open"):
+                    self.stays[stay["session_id"]] = stay
+                else:
+                    self.stays.pop(stay["session_id"], None)
+            self._reindex_stays()
         self.stays_cursor = str(cursor)
         self.stays_refreshed_at = time.time() if now is None else now
-        self._reindex_stays()
         self._persist()
+
+    def drop_stay(self, session_id: str | None) -> bool:
+        """The lane recorded this stay's close: it is not open here any more.
+
+        Without it the stay stayed listed until the platform's next delta -- or
+        for hours offline -- so a car that backed up and pulled forward again
+        was priced a second time for the same stay, and the reader put the fee
+        up again. Called on the lane thread. The stays are REPLACED, never
+        changed in place, so a copy the refresh thread is writing to disk is
+        never changed under it; and the disk copy itself follows at the next
+        refresh that writes, because the barrier's thread does not wait on the
+        disk. True if the stay was held."""
+        if not session_id:
+            return False
+        with self._stays_lock:
+            if session_id not in self.stays:
+                return False
+            self.stays = {sid: s for sid, s in self.stays.items() if sid != session_id}
+            self._reindex_stays()
+        return True
 
     # -- the indexes the exit reads ---------------------------------------------
 
@@ -692,7 +751,45 @@ def decide(
 
     rule = cache.lookup(identity.plate)
     if rule is None:
+        if cache.default_action == "deny" and direction == "exit":
+            # THE GARAGE'S DEFAULT IS AN ENTRY RULE. "deny" says which strangers
+            # this garage lets IN; a car at an exit is already inside, and
+            # refusing it there refused every car -- pass holders and payers
+            # alike -- with nothing closed. The exit lets it out, and its own
+            # decision (`exit_pricing`) says covered, priced, or not priceable
+            # here, as for any other car.
+            return Decision(
+                outcome=Outcome.ALLOW,
+                reason="no rule for plate; an exit lets the car out (the garage default "
+                "deny applies at entry)",
+                identity=identity,
+            )
         if cache.default_action == "allow":
+            if direction != "exit" and cache.transient_available is False:
+                # "PASS HOLDERS ONLY": the owner said this garage takes no other
+                # driver, so "allow" admits a car a pass or monthly register
+                # covers today -- the same lookup, on the same local day, as a
+                # lane closed `full` -- and every other car takes the fallback
+                # path it takes when a garage admits nobody it does not know.
+                from .exit_pricing import local_day, register_cover
+
+                current = day_at if day_at is not None else (time.time() if now is None else now)
+                covered_by, _ = register_cover(
+                    identity.plate, cache, local_day(current, cache.timezone)[0]
+                )
+                if covered_by:
+                    return Decision(
+                        outcome=Outcome.ALLOW,
+                        reason="pass holders only; a pass or monthly register covers this car",
+                        identity=identity,
+                    )
+                return Decision(
+                    outcome=Outcome.FALLBACK,
+                    reason="no rule for plate; pass holders only, and no pass or monthly "
+                    "register covers this car",
+                    identity=identity,
+                    fallback=Fallback.UNKNOWN_VEHICLE,
+                )
             return Decision(
                 outcome=Outcome.ALLOW,
                 reason="no rule for plate; garage default is allow",

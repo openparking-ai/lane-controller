@@ -232,12 +232,14 @@ def test_a_seal_between_reading_the_screen_and_asking_it_changes_nothing():
 
 
 def test_a_closed_stay_presented_again_publishes_what_the_reader_is_given_again():
-    """The same plate read at the exit again after its close, before the next
-    rules sync -- the lane's cache still lists the stay -- is the same stay put
-    in front of the reader a second time, priced again. Its close is recorded,
-    so nothing discounted goes up for it: the prompt and the cart say the fee as
-    priced, and so must the figure published beside them. The first
-    presentation's discount belonged to the first presentation."""
+    """The same plate read at the exit again after its close, with the stay
+    listed again by a refresh that ran before the platform took the close --
+    the lane drops a stay when it records its close, so only the platform can
+    put it back -- is the same stay put in front of the reader a second time,
+    priced again. Its close is recorded, so nothing discounted goes up for it:
+    the prompt and the cart say the fee as priced, and so must the figure
+    published beside them. The first presentation's discount belonged to the
+    first presentation."""
     inner = ReadsTheState()
     prompt = PromptThatReads(PHONE, inner)
     screen = ValidatingScreen(inner, prompt, Claims(held_answer))
@@ -256,7 +258,9 @@ def test_a_closed_stay_presented_again_publishes_what_the_reader_is_given_again(
     with served(controller) as base:
         consumer = LaneConsumer(base)
         inner.consumer = consumer
+        listed = dict(controller.cache.stays["s-9"])
         first = controller.run_once()
+        controller.cache.apply_stay_changes([listed], "2")
         second = controller.run_once()
         after = consumer.state()
     assert first.exit_pricing.session_id == second.exit_pricing.session_id == "s-9"

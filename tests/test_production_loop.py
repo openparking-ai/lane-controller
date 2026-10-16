@@ -414,7 +414,6 @@ def test_wire_lane_without_a_platform_is_the_standalone_lane_and_says_so():
     wired = cli.wire_lane(a_config(), platform=None)
     assert wired.client is None
     assert wired.controller.events._transport is None
-    assert wired.controller.session_lookup is None
     assert isinstance(wired.controller.identifier, StubVehicleIdentifier)
     assert wired.seams["platform"].startswith("NONE")
     assert wired.seams["identifier"].startswith("SIMULATED")
@@ -427,14 +426,16 @@ def test_wire_lane_with_a_platform_drains_the_outbox_to_it_and_names_the_session
     exit_lane = cli.wire_lane(config, platform=client)
     assert isinstance(exit_lane.controller.events._transport, PlatformTransport)
     assert exit_lane.controller.events._transport._client is client
-    assert exit_lane.controller.session_lookup is not None
+    assert exit_lane.controller.events._transport.session_lookup is not None
     assert isinstance(exit_lane.controller.identifier, VehicleIdClient)
     assert exit_lane.controller.identifier.endpoint == "http://127.0.0.1:8088"
     assert exit_lane.seams["platform"].startswith("REAL http://platform.test")
     assert exit_lane.seams["identifier"].startswith("REAL Vehicle ID")
     assert exit_lane.seams["barrier"].startswith("SIMULATED"), "no relay driver ships"
     entry_lane = cli.wire_lane(a_config(direction="entry"), platform=client)
-    assert entry_lane.controller.session_lookup is None, "only an exit names its session"
+    assert entry_lane.controller.events._transport.session_lookup is None, (
+        "only an exit names its session"
+    )
 
 
 def test_the_platform_is_configured_whole_or_not_at_all(tmp_path, capsys):

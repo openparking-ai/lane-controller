@@ -347,7 +347,7 @@ def test_a_close_carries_the_exit_reads_descriptor_and_the_platform_echoes_it():
         direction="exit",
         identities=[VehicleIdentity(plate="OFF-1", confidence=0.97, descriptor=DESCRIPTOR)],
     )
-    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    transport.session_lookup = lambda plate: platform.find_open_session(plate=plate)
     exit_lane.run_once()
 
     assert vend.vend_count == 1
@@ -370,7 +370,7 @@ def test_a_platform_that_does_not_record_the_exit_descriptor_is_refused_loudly(c
         direction="exit",
         identities=[VehicleIdentity(plate="OFF-1", confidence=0.97, descriptor=DESCRIPTOR)],
     )
-    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    transport.session_lookup = lambda plate: platform.find_open_session(plate=plate)
     exit_lane.run_once()
 
     assert vend.vend_count == 1, "the barrier still opened; the car is not the one being refused"
@@ -392,7 +392,7 @@ def test_a_close_with_no_descriptor_is_unchanged_against_that_platform():
     entry.run_once()
 
     exit_lane, _, transport = build(platform, direction="exit")
-    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    transport.session_lookup = lambda plate: platform.find_open_session(plate=plate)
     exit_lane.run_once()
 
     assert transport.rejected == 0
@@ -410,7 +410,7 @@ def test_a_platform_that_does_not_record_the_exit_confirmation_is_refused_loudly
     entry.run_once()  # the session exists on the platform; its open was dropped loudly
 
     exit_lane, vend, transport = build(platform, direction="exit")
-    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    transport.session_lookup = lambda plate: platform.find_open_session(plate=plate)
     exit_lane.run_once()
 
     assert vend.vend_count == 1, "the barrier still opened; the car is not the one being refused"
@@ -430,7 +430,7 @@ def test_a_platform_that_does_record_it_delivers_the_close():
     entry.run_once()
 
     exit_lane, _, transport = build(platform, direction="exit")
-    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    transport.session_lookup = lambda plate: platform.find_open_session(plate=plate)
     exit_lane.run_once()
 
     assert transport.rejected == 0
@@ -591,14 +591,16 @@ def test_a_dropped_log_event_is_counted_not_silent():
 
 
 def test_the_exit_names_the_session_when_the_platform_is_reachable():
-    """C5(a). Recorded at the exit, while it is still unambiguous which session
-    is open — by the time a queued close is delivered, it may not be."""
+    """C5(a). Asked as the close is delivered, off the lane's thread
+    (`tests/test_outbox_drain.py` holds which thread): a close delivered late
+    is matched as one sent on the plate alone would be, and the platform's
+    order check refuses an exit that precedes the open stay's entry."""
     platform = FakePlatform()
     entry, _, _ = build(platform, direction="entry")
     entry.run_once()
 
-    exit_lane, _, _ = build(platform, direction="exit")
-    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    exit_lane, _, transport = build(platform, direction="exit")
+    transport.session_lookup = lambda plate: platform.find_open_session(plate=plate)
     exit_lane.run_once()
 
     assert len(platform.closed) == 1
@@ -609,8 +611,8 @@ def test_an_offline_exit_still_closes_without_a_session_id():
     """The lookup is best effort: a lane with no network must still open its gate."""
     platform = FakePlatform()
     platform.reject_close_without_open = False
-    exit_lane, vend, _ = build(platform, direction="exit")
-    exit_lane.session_lookup = lambda plate: platform.find_open_session(plate=plate)
+    exit_lane, vend, transport = build(platform, direction="exit")
+    transport.session_lookup = lambda plate: platform.find_open_session(plate=plate)
 
     platform.online = False
     decision = exit_lane.run_once()
