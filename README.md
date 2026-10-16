@@ -139,7 +139,7 @@ card and the row are one computation, and its reconciler re-derives the number
 out of band from what the decision says it was computed from. A platform that
 does not consume it says why on the row; an older platform ignores the field
 and prices as before. `tests/test_close_decision.py` holds the seam, and
-`scripts/close_decision_fail_control.py` breaks it six ways.
+`scripts/close_decision_fail_control.py` breaks it eight ways.
 
 **And it works after a restart with the internet down**, when `[lane]
 cache_path` is set: the cache is written whole to a SQLite file on every
@@ -226,8 +226,9 @@ neither on the path between a car arriving and a barrier opening.
 | `sync_rules()` | the SLOW cadence: `GET /lane/rules` — the garage's rate plans whole, its space class, each entitlement module's register (verbatim; a module the platform could not read is NOT replaced with nothing) and the full set of open stays with a cursor. On failure it keeps the cache it had — a failed request is not a reason to forget good rules. |
 | `sync_stays()` | the FAST cadence: `GET /lane/stays?since=<cursor>` — every stay opened or closed since, closed rows included so the exit lane drops a car that left, paged and followed at once. A refusal drops the cursor so the next read takes the full set. It also carries this lane's closing and the owner's board, so a closing acts within one fast interval. |
 | `decide()` at a closed lane | closed to everyone: no car opens by itself, `fallback` / `lane_closed`. Closed `full` at an entry: a car a register covers today (the exit's own lookup, `register_cover`) gets in, every other identified car is `lane_closed`. A person's word through `POST /v1/lane/vend` opens it; a display code does not. |
+| `decide()` and the garage's settings | the garage's default (`allow`, `deny`) is an ENTRY rule: at an exit a car with no rule is let out, and `price_exit()` says covered, priced or not priceable here. **Pass holders only** (`transient_available: false` on the rules), at a garage whose default is `allow`: at an entry, a car a register covers today gets in and every other car takes the fallback path. A garage whose default is `deny` refuses every car without a rule at the entry, and one with no default sends it to the fallback path, both as before; a payload without the field is the lane as it was. |
 | `board_items()` | the board on `GET /v1/lane/state`: the owner's messages in force on this lane's clock, then — when switched on — the price for 1, 2, 3 and 24 hours entering now, from `charge`, the same quote-and-tax call the exit charges with. |
-| `price_exit()` | the exit's local decision, from the cache alone: `covered`, `priced` (the engine in-process), `no_cached_entry`, or the engine's own refusal verbatim. Reads the registers with the garage's local day; folds the plate and the registrar's identity to letters and digits (an assumption, stated in `normalise_identity`). |
+| `price_exit()` | the exit's local decision, from the cache alone: `covered`, `priced` (the engine in-process), `no_cached_entry`, or the engine's own refusal verbatim. Reads the registers with the garage's local day, and a monthly agreement's own days when its register carries them (start, pauses, the owner's block, the first day unpaid past grace); folds the plate and the registrar's identity to letters and digits, with O read as 0 and I as 1 because the plate reader outputs neither letter (an assumption, stated in `normalise_identity`). A stay whose close the lane records leaves its list, so a car that pulls forward again is not priced twice. |
 | `LaneRunner` | the production loop. The lane thread calls `run_once` for ever; the refresh thread runs the two cadences (`[lane] rules_refresh_seconds`, `stays_refresh_seconds`), the slow one first at start. A refresh that could not run is counted and said on `RunnerState`, never hidden; a turn that raises is logged and the loop goes round again. **The fast interval is the size of the class of cars that entered too recently to be priced at the barrier** — `config/lane.example.toml` says so where the number is set. **The outbox drains on a third thread**: the controller's `deliver()` is a signal under the runner, so the lane thread never waits on the network after the vend either — against a platform that black-holes, the client's timeout per queued action is the drain thread's cost, not the next car's; an outbox the platform refused is retried every `DRAIN_RETRY_S` without waiting for a car. A bare controller (the tests, the demo) drains inline, and `run_once` returns delivered. |
 | `EventQueue` | one outbox holding both the activity log and the session actions, so a lane that was offline replays what happened in the order it happened. Safe to record into from the lane thread while a drain is mid-send on another: a flush removes the batch it delivered, never what was recorded meanwhile. **Session actions are never dropped**; only log events are, and a drop is counted. |
 | `PlatformTransport` | delivers the outbox. All-or-nothing, because every platform endpoint it calls is idempotent. |
@@ -237,8 +238,12 @@ arrives, whatever time the platform eventually hears about it; pricing a stay by
 when the network came back would be wrong.
 
 **At an exit, the lane names the session it is closing** when the platform is
-reachable, so a queued close cannot land on a later visit. Offline it closes on
-the plate alone, which works and is merely less precise.
+reachable: the transport asks for it as it delivers the close, on the drain's
+thread, so a platform that does not answer never holds the next car at the
+barrier. A close delivered late is matched as one sent on the plate alone
+would be: the platform refuses an exit that precedes the open stay's entry.
+Offline it closes on the plate alone, which works and is merely less
+precise.
 
 **Every queued item carries an `event_id` generated on the lane.** That is what
 makes reconnecting safe: the queue re-sends everything it could not confirm, and

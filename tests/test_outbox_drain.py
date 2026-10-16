@@ -17,7 +17,7 @@ drain is mid-send, and a drain removes what it delivered, never what was
 recorded meanwhile.
 
 Each claim is paired with the case that falsifies it, and
-`scripts/drain_fail_control.py` breaks the drain four ways and requires this
+`scripts/drain_fail_control.py` breaks the drain five ways and requires this
 file to go red.
 """
 
@@ -147,6 +147,94 @@ def test_a_bare_controller_still_delivers_before_run_once_returns():
     controller.run_once()
     assert platform.unique_opens == 1, "the offline suite's shape: delivered inline, no runner"
     assert controller.events.pending == 0
+
+
+# ---------------------------------------------------------------------------
+# at an exit, the close's session is asked for on the drain, not on the lane
+# ---------------------------------------------------------------------------
+
+
+class AskingLookup:
+    """The exit's "which session is this?", through the platform, keeping the
+    thread it was asked on -- and taking `seconds` to answer, as a platform
+    that black-holes does."""
+
+    def __init__(self, platform: FakePlatform, seconds: float = 0.0) -> None:
+        self.platform = platform
+        self.seconds = seconds
+        self.threads: list[str] = []
+
+    def __call__(self, plate: str):
+        self.threads.append(threading.current_thread().name)
+        time.sleep(self.seconds)
+        return self.platform.find_open_session(plate=plate)
+
+
+def an_exit_lane(transport, plates):
+    cache = DecisionCache()
+    cache.load([], default_action="allow")
+    config = a_config()
+    config = LaneConfig(lane_id=config.lane_id, site_id=config.site_id, camera=config.camera,
+                        gate=config.gate, direction="exit")
+    vend = TimedVend()
+    controller = LaneController(
+        config,
+        loop=SimulatedLoopInput(arrivals=len(plates)),
+        camera=CannedCameraFeed(),
+        vend=vend,
+        identifier=StubVehicleIdentifier(
+            [VehicleIdentity(plate=plate, confidence=0.97, presence=True) for plate in plates]
+        ),
+        cache=cache,
+        events=EventQueue(transport),
+    )
+    return controller, vend
+
+
+def with_open_stays(platform: FakePlatform, *plates: str) -> FakePlatform:
+    for plate in plates:
+        platform.open_session(event_id=f"open-{plate}", plate=plate,
+                              entry_at="2026-06-10T15:30:00+00:00", entry_confirmation="confirmed")
+    return platform
+
+
+def test_the_close_asks_for_its_session_on_the_drain_and_never_on_the_lane_thread():
+    platform = with_open_stays(FakePlatform(), "CAR-1")
+    lookup = AskingLookup(platform)
+    controller, _ = an_exit_lane(PlatformTransport(platform, session_lookup=lookup), ["CAR-1"])
+    controller.set_drain(lambda: None)  # the signal, with nobody draining yet
+    controller.run_once()
+    assert lookup.threads == [], "the lane thread asked the platform which session this is"
+    closes = [e for e in controller.events._queue if e.kind == "session_close"]
+    assert len(closes) == 1 and closes[0].detail["session_id"] is None
+    drain = threading.Thread(target=controller.events.flush, name="outbox-drain")
+    drain.start()
+    drain.join()
+    assert lookup.threads == ["outbox-drain"]
+    assert platform.closed[0]["session_id"] is not None, "the close no longer names its session"
+
+
+def test_under_the_runner_the_next_exit_is_served_while_the_session_lookup_black_holes():
+    """C5(a)'s lookup against a platform that swallows it for three seconds:
+    the second car still vends well inside one second of the first, and the
+    thread stuck in the lookup is the drain's."""
+    platform = with_open_stays(FakePlatform(), "CAR-1", "CAR-2")
+    lookup = AskingLookup(platform, seconds=BLACK_HOLE_S)
+    controller, vend = an_exit_lane(
+        PlatformTransport(platform, session_lookup=lookup), ["CAR-1", "CAR-2"]
+    )
+    runner = a_runner(controller)
+    runner.start()
+    try:
+        assert wait_for(lambda: len(vend.at) == 2, seconds=2.0), (
+            f"{len(vend.at)} vend(s) inside two seconds: the lane thread waited on the lookup"
+        )
+        gap = vend.at[1] - vend.at[0]
+        assert gap < 1.0, f"the second car waited {gap:.2f}s behind the first car's lookup"
+        assert wait_for(lambda: lookup.threads, seconds=1.0)
+        assert set(lookup.threads) == {"outbox-drain"}, lookup.threads
+    finally:
+        runner.stop(timeout=0.1)
 
 
 # ---------------------------------------------------------------------------

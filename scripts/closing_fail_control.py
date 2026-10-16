@@ -18,6 +18,8 @@ is not known to keep it out.
   end_time_ignored           a board message outlives its end
   board_untaxed              the board's price leaves the tax out
   plan_not_in_force          the board prices from a plan not in force
+  pass_only_ignored          "pass holders only" is not read: the default admits anyone
+  pass_only_beyond_allow     "pass holders only" read where the default is deny or none
 """
 
 from __future__ import annotations
@@ -41,6 +43,8 @@ BREAKAGES = [
     ("end_time_ignored", "a board message outlives its end"),
     ("board_untaxed", "the board's price leaves the tax out"),
     ("plan_not_in_force", "the board prices from a plan not in force"),
+    ("pass_only_ignored", "pass holders only is not read at the entry"),
+    ("pass_only_beyond_allow", "pass holders only is read where the default is not allow"),
 ]
 
 

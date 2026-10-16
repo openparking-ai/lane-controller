@@ -76,13 +76,15 @@ def build_lane(credentials: dict, direction: str, plate: str, confidence: float,
             ]
         ),
         cache=cache,
-        events=EventQueue(PlatformTransport(client)),
+        # At an exit lane, the close names its session as it is delivered.
+        # Best effort: offline, the close goes out without it.
+        events=EventQueue(PlatformTransport(
+            client,
+            session_lookup=(lambda plate: client.find_open_session(plate=plate))
+            if direction == "exit"
+            else None,
+        )),
         clock=clock,
-        # At an exit lane, name the session while it is still unambiguous which
-        # one is open. Best effort: offline, the close goes out without it.
-        session_lookup=(lambda plate: client.find_open_session(plate=plate))
-        if direction == "exit"
-        else None,
     )
     return controller, rules, client
 

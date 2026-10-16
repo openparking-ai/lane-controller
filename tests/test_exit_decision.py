@@ -11,7 +11,7 @@ makes is counted by destination, and the only one allowed is loopback to
 Vehicle ID. The whole of `run_once`, arrival to vend, is timed against his
 one-second requirement, and the number is a FLOOR for a Jetson, said so.
 
-`scripts/exit_decision_fail_control.py` breaks the decision in six ways and
+`scripts/exit_decision_fail_control.py` breaks the decision in ten ways and
 requires this file to go red. The close and the reconciler (4.9, 4.9b) are
 not here.
 """
@@ -634,3 +634,169 @@ def test_no_platform_call_on_the_barriers_path_with_vehicle_id_live_on_loopback(
             f"  {plate:8} {to_vend * 1000:7.1f} ms to the vend;  {after * 1000:7.1f} ms after it, "
             "the outbox on a dead platform"
         )
+
+
+# ---------------------------------------------------------------------------
+# O and I: the reader never outputs them, so they fold to 0 and 1 on both sides
+# ---------------------------------------------------------------------------
+
+#: The plate vectors the O/0, I/1 folding is held to: what a registrar typed,
+#: what the reader -- whose alphabet has no I and no O -- reads, and the one
+#: key both fold to.
+FOLD_VECTORS = [
+    ("GO4IT", "G041T", "G041T"),
+    ("go-4it", "G04 1T", "G041T"),
+    ("OIL 101", "01L101", "01L101"),
+    ("IO-OI", "10 01", "1001"),
+    ("AB-123", "ab 123", "AB123"),
+]
+
+
+@pytest.mark.parametrize(("typed", "read", "key"), FOLD_VECTORS)
+def test_o_and_i_fold_to_0_and_1_on_both_sides(typed, read, key):
+    assert normalise_identity(typed) == normalise_identity(read) == key
+
+
+def test_the_fold_is_o_and_i_only():
+    """The control: a letter the reader does output stays itself, so plates
+    that differ in one keep differing."""
+    assert normalise_identity("B123") != normalise_identity("8123")
+    assert normalise_identity("S123") != normalise_identity("5123")
+    assert normalise_identity("Z123") != normalise_identity("2123")
+    assert normalise_identity("GO4IT") != normalise_identity("GO4ET")
+
+
+def test_a_holder_whose_plate_has_an_i_or_an_o_is_covered_as_the_reader_reads_it():
+    cache = a_cache(a_platform(
+        gp=gp_register(gp_row("GO4IT")),
+        mb=mb_register({"identity_normalised": "oil101", "agreement": "ag-1"}),
+    ))
+    assert price_exit("G041T", cache, now=NOW).covered_by == ("garage_pass",)
+    assert price_exit("01L101", cache, now=NOW).covered_by == ("monthly_billing",)
+    # the control: another plate is not
+    assert price_exit("G041X", cache, now=NOW).status == NO_CACHED_ENTRY
+
+
+def test_a_stay_opened_under_an_o_is_found_under_the_0_the_exit_reads():
+    cache = a_cache(a_platform(stays=[("s-7", "TOOL-1", ENTRY)]))
+    answer = price_exit("T00L-1", cache, now=NOW)
+    assert answer.status == PRICED and answer.session_id == "s-7"
+
+
+# ---------------------------------------------------------------------------
+# the monthly register's own days (G63): start, pauses, the owner's block, and
+# the first day unpaid past grace
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("facts", "covers", "why"),
+    [
+        ({}, True, "a register without the days reads as it always did"),
+        ({"start_day": "2026-06-11"}, False, "starts tomorrow: not started"),
+        ({"start_day": "2026-06-10"}, True, "starts today"),
+        ({"pauses": [{"from_day": "2026-06-01", "until_day": "2026-06-30"}]}, False, "paused"),
+        ({"pauses": [{"from_day": "2026-06-10", "until_day": "2026-06-11"}]}, False,
+         "paused today: from_day is paused"),
+        ({"pauses": [{"from_day": "2026-06-01", "until_day": "2026-06-10"}]}, True,
+         "the pause ended today: until_day is not paused"),
+        ({"pauses": [{"from_day": "2026-06-11", "until_day": "2026-06-20"}]}, True,
+         "paused from tomorrow"),
+        ({"blocked": True}, False, "blocked by the owner"),
+        ({"blocked": False}, True, "not blocked"),
+        ({"not_covered_from": "2026-06-10"}, False, "unpaid past grace from today"),
+        ({"not_covered_from": "2026-06-01"}, False, "unpaid past grace since the 1st"),
+        ({"not_covered_from": "2026-06-11"}, True, "past grace only from tomorrow"),
+        ({"not_covered_from": None}, True, "nothing unpaid"),
+        ({"start_day": "2026-01-01", "pauses": [], "blocked": False, "not_covered_from": None},
+         True, "every day stated, and every one covers"),
+        ({"pauses": [{"from_day": "2026-06-01"}]}, False, "a pause it cannot read"),
+        ({"not_covered_from": "soon"}, False, "a day it cannot read"),
+        ({"blocked": "yes"}, False, "a block it cannot read"),
+    ],
+)
+def test_a_monthly_row_covers_only_on_the_agreements_own_days(facts, covers, why):
+    row = {"identity_normalised": "x", "agreement": "ag-1"}
+    assert row_covers("monthly_billing", row, {**MB_HEAD, **facts}, TODAY) is covers, why
+
+
+def test_a_cancelled_agreement_unpaid_past_grace_does_not_cover_before_its_last_day():
+    head = {**MB_HEAD, "status": "cancelled", "cancelled_effective_day": "2026-06-30",
+            "not_covered_from": "2026-06-05"}
+    row = {"identity_normalised": "x", "agreement": "ag-1"}
+    assert row_covers("monthly_billing", row, head, TODAY) is False
+    # the control: paid up, the paid period runs to its end
+    assert row_covers("monthly_billing", row, {**head, "not_covered_from": None}, TODAY) is True
+
+
+def test_the_garage_pass_row_is_read_as_it_always_was():
+    """The days are monthly-billing's: a pass row is not read by them."""
+    head = {**GP_HEAD, "not_covered_from": "2026-06-01", "blocked": True}
+    assert row_covers("garage_pass", gp_row("X"), head, TODAY) is True
+
+
+def unpaid_register(not_covered_from):
+    return mb_register(
+        {"identity_normalised": "mnth7", "agreement": "ag-1"},
+        agreements=[{"agreement": "ag-1", "version": 1, "registrar": "this_module",
+                     "status": "active", "cancelled_effective_day": None,
+                     "start_day": "2026-01-01", "pauses": [], "blocked": False,
+                     "not_covered_from": not_covered_from}],
+    )
+
+
+def test_a_monthly_parker_unpaid_past_grace_is_priced_at_the_exit_not_let_out_free():
+    cache = a_cache(a_platform(mb=unpaid_register("2026-06-05"), stays=[("s-7", "MNTH-7", ENTRY)]))
+    answer = price_exit("MNTH-7", cache, now=NOW)
+    assert answer.status == PRICED and answer.covered_by == (), answer
+    assert answer.fee_minor == 900
+    # the control: the same parker, paid up, leaves covered
+    cache = a_cache(a_platform(mb=unpaid_register(None), stays=[("s-7", "MNTH-7", ENTRY)]))
+    assert price_exit("MNTH-7", cache, now=NOW).covered_by == ("monthly_billing",)
+
+
+def test_a_full_entry_turns_away_a_monthly_parker_unpaid_past_grace():
+    from lane_controller.decision import Fallback, Outcome, decide
+
+    full = {"state": "closed", "reason": "full", "message": "Full.", "closed_at": None}
+    seen = VehicleIdentity(plate="MNTH-7", confidence=0.99)
+    cache = a_cache(a_platform(mb=unpaid_register("2026-06-05")))
+    cache._take_lane({"lane": full})
+    decision = decide(seen, cache, confidence_threshold=0.85, direction="entry", day_at=NOW)
+    assert decision.outcome is Outcome.FALLBACK and decision.fallback is Fallback.LANE_CLOSED
+    # the control: paid up, the same parker gets in
+    cache = a_cache(a_platform(mb=unpaid_register(None)))
+    cache._take_lane({"lane": full})
+    decision = decide(seen, cache, confidence_threshold=0.85, direction="entry", day_at=NOW)
+    assert decision.outcome is Outcome.ALLOW
+
+
+# ---------------------------------------------------------------------------
+# the garage's default "deny" is an entry rule: an exit still lets cars out
+# ---------------------------------------------------------------------------
+
+
+def a_deny_platform(**kwargs):
+    platform = a_platform(**kwargs)
+    platform.default_action = "deny"
+    return platform
+
+
+def test_a_deny_garage_lets_its_pass_holders_and_payers_out_at_the_exit():
+    cache = a_cache(a_deny_platform(gp=gp_register(gp_row("PASS-1")),
+                                    stays=[("s-7", "TRNS-7", ENTRY)]))
+    assert cache.default_action == "deny", "the premise: the garage's default is deny"
+    for plate, expected in (("PASS-1", COVERED), ("TRNS-7", PRICED), ("NEW-1", NO_CACHED_ENTRY)):
+        controller, vend = lane(cache, plate)
+        decision = controller.run_once()
+        assert decision.should_vend and vend.vends, (plate, decision)
+        assert decision.exit_pricing.status == expected, plate
+        closes = [e for e in controller.events._queue if e.kind == "session_close"]
+        assert len(closes) == 1, f"{plate}: the stay is closed, and billed"
+
+
+def test_the_control_a_deny_garage_still_turns_strangers_away_at_the_entry():
+    cache = a_cache(a_deny_platform(gp=gp_register(gp_row("PASS-1"))))
+    controller, vend = lane(cache, "NEW-1", direction="entry")
+    decision = controller.run_once()
+    assert decision.outcome.value == "deny" and not vend.vends

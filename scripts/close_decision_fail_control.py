@@ -14,6 +14,10 @@ decision is not known to carry the right one.
   client_drops_it        the client never puts it on the wire.
   null_not_absent        a close with no decision says `null` instead of
                          nothing.
+  close_on_its_own_clock the close is stamped from a second reading of the
+                         clock, not with the price's exit time.
+  closed_stay_kept       recording a close leaves the stay in the lane's list,
+                         so a car that pulls forward again is priced again.
 """
 
 from __future__ import annotations
@@ -30,6 +34,8 @@ BREAKAGES = [
     ("fee_edited_in_transit", "the lane sends a fee other than the one it showed"),
     ("client_drops_it", "the client never puts the decision on the wire"),
     ("null_not_absent", "a close with no decision says null instead of nothing"),
+    ("close_on_its_own_clock", "the close is stamped from a second clock reading"),
+    ("closed_stay_kept", "a closed stay stays in the lane's list"),
 ]
 
 

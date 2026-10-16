@@ -143,29 +143,29 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
     hardware seams always, and a table saying which is which.
 
     The platform is REAL when a client is handed in: the outbox drains to it
-    through `PlatformTransport`, and at an exit lane the close names its
-    session through `find_open_session`, which is best effort by its own
-    contract (offline, the close goes out without an id). The identifier is
-    REAL when `[lane] vehicle_id_url` is set: this lane is then an ordinary
-    client of Vehicle ID at that address, and `LaneService` reads the wiring
-    to publish `has_identity_service`. Everything the package ships no driver
-    for is simulated, and named as such.
+    through `PlatformTransport`, and at an exit lane the transport names a
+    close's session through `find_open_session` as it delivers it, which is
+    best effort by its own contract (offline, the close goes out without an
+    id). The identifier is REAL when `[lane] vehicle_id_url` is set: this
+    lane is then an ordinary client of Vehicle ID at that address, and
+    `LaneService` reads the wiring to publish `has_identity_service`.
+    Everything the package ships no driver for is simulated, and named as
+    such.
     """
     seams: dict[str, str] = {}
     if platform is not None:
-        events = EventQueue(PlatformTransport(platform))
-        seams["platform"] = (
-            f"REAL {platform.base_url} (outbox drains to it; refresh on two cadences)"
-        )
         lookup = (
             (lambda plate: platform.find_open_session(plate=plate))
             if config.direction == "exit"
             else None
         )
+        events = EventQueue(PlatformTransport(platform, session_lookup=lookup))
+        seams["platform"] = (
+            f"REAL {platform.base_url} (outbox drains to it; refresh on two cadences)"
+        )
     else:
         events = EventQueue()
         seams["platform"] = "NONE (standalone: nothing is reported, nothing is refreshed)"
-        lookup = None
     if config.vehicle_id_url:
         identifier = VehicleIdClient(config.vehicle_id_url)
         seams["identifier"] = f"REAL Vehicle ID at {config.vehicle_id_url}"
@@ -218,7 +218,6 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
         deactivate_loop=OccupancyLoopInput() if config.loops.has_deactivate_loop else None,
         cache=cache,
         events=events,
-        session_lookup=lookup,
         banned_matcher=banned_matcher,
     )
     return WiredLane(controller, platform, seams)

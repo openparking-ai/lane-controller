@@ -14,6 +14,8 @@ recomputed or a stale fee is not known to show the stored one.
   reader_on_the_lane_thread    the barrier waits on the reader under the runner.
   clear_erases_an_unshown_fee  a clear replaces a fee the reader never showed.
   a_raising_reader_stops_the_lane  a reader that raises takes the arrival with it.
+  engine_units_on_the_cart     the engine's minor units go on the cart as they are,
+                               so an ISK or UGX fee shows a hundredth of itself.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ BREAKAGES = [
     ("reader_on_the_lane_thread", "the barrier waits on the reader under the runner"),
     ("clear_erases_an_unshown_fee", "a clear replaces a fee the reader never showed"),
     ("a_raising_reader_stops_the_lane", "a reader that raises takes the arrival with it"),
+    ("engine_units_on_the_cart", "the engine's units go on the cart as they are"),
 ]
 
 

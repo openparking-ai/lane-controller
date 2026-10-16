@@ -12,6 +12,10 @@ is not known to decide rightly.
   plate_in_the_record   the decision event names the plate.
   no_folding            the camera's spelling must match the registrar's.
   slow_identifier       the identification service answers over the second.
+  o_and_i_not_folded    O and I are not read as 0 and 1, so GO4IT never meets G041T.
+  monthly_days_ignored  the monthly register's days are not read: an unpaid,
+                        paused, unstarted or blocked parker leaves covered.
+  deny_at_the_exit      the garage's default "deny" refuses every car at the exit.
 """
 
 from __future__ import annotations
@@ -29,6 +33,9 @@ BREAKAGES = [
     ("plate_in_the_record", "the decision event names the plate"),
     ("no_folding", "the camera's spelling must match the registrar's"),
     ("slow_identifier", "the identification service answers over the second"),
+    ("o_and_i_not_folded", "O and I are not read as 0 and 1"),
+    ("monthly_days_ignored", "the monthly register's days are not read"),
+    ("deny_at_the_exit", "the garage default deny refuses every car at the exit"),
 ]
 
 

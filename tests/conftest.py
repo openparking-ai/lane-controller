@@ -1704,6 +1704,42 @@ def _break_the_exit_decision(monkeypatch):
         # Applied by the stand-in service in tests/test_exit_decision.py itself.
         pass
 
+    elif mode == "o_and_i_not_folded":
+        # Case and punctuation folded, O and I not: a registered GO4IT never
+        # meets the G041T the reader reads.
+        monkeypatch.setattr(
+            decision_module,
+            "normalise_identity",
+            lambda text: "".join(ch for ch in text.upper() if ch.isalnum()),
+        )
+
+    elif mode == "monthly_days_ignored":
+        # The register's days are not read: a monthly parker unpaid past
+        # grace, paused, not started or blocked leaves covered.
+        monkeypatch.setattr(pricing_module, "monthly_days_cover", lambda head, day: True)
+
+    elif mode == "deny_at_the_exit":
+        # The garage's default "deny" is applied at the exit too: every car
+        # with no rule is refused there, pass holders and payers alike.
+        original_decide = controller_module.decide
+
+        def denying(identity, cache, **kwargs):
+            decision = original_decide(identity, cache, **kwargs)
+            if (
+                kwargs.get("direction") == "exit"
+                and cache.default_action == "deny"
+                and decision.should_vend
+                and cache.lookup(identity.plate or "") is None
+            ):
+                return decision_module.Decision(
+                    outcome=decision_module.Outcome.DENY,
+                    reason="no rule for plate; garage default is deny",
+                    identity=identity,
+                )
+            return decision
+
+        monkeypatch.setattr(controller_module, "decide", denying)
+
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_DECISION mode: {mode}")
 
@@ -1807,6 +1843,27 @@ def _break_the_close_decision(monkeypatch):
 
         monkeypatch.setattr(client_module.PlatformClient, "close_session", nulled)
 
+    elif mode == "close_on_its_own_clock":
+        # The close is stamped from a second reading of the clock, taken
+        # after the reader and the relay, not with the price's exit time.
+        from lane_controller.sync import to_iso
+
+        original = controller_module.LaneController._settle_transit
+
+        def own_clock(self, identity, at, *, exit_pricing=None):
+            return original(self, identity, to_iso(self._clock()), exit_pricing=exit_pricing)
+
+        monkeypatch.setattr(controller_module.LaneController, "_settle_transit", own_clock)
+
+    elif mode == "closed_stay_kept":
+        # Recording a close leaves the stay in the lane's list: a car that
+        # pulls forward again is priced again for it.
+        from lane_controller import decision as decision_module
+
+        monkeypatch.setattr(
+            decision_module.DecisionCache, "drop_stay", lambda self, session_id: False
+        )
+
     else:
         raise RuntimeError(f"unknown BREAK_CLOSE_DECISION mode: {mode}")
 
@@ -1864,6 +1921,20 @@ def _break_the_outbox_drain(monkeypatch):
                 return len(batch)
 
         monkeypatch.setattr(EventQueue, "flush", clearing)
+
+    elif mode == "close_lookup_on_the_lane_thread":
+        # The exit asks the platform which session it is closing while it
+        # records the close -- on the lane thread, after the vend, with the
+        # client's timeout behind it.
+        original = LaneController._record_session
+
+        def asking(self, identity, at, **kwargs):
+            lookup = getattr(self.events.transport, "session_lookup", None)
+            if self.config.direction == "exit" and lookup is not None and identity.plate:
+                lookup(identity.plate)
+            return original(self, identity, at, **kwargs)
+
+        monkeypatch.setattr(LaneController, "_record_session", asking)
 
     else:
         raise RuntimeError(f"unknown BREAK_OUTBOX_DRAIN mode: {mode}")
@@ -1986,6 +2057,13 @@ def _break_the_reader_fee(monkeypatch):
             return self.reader.present_exit(record)
 
         monkeypatch.setattr(LaneController, "show_reader", unguarded)
+
+    elif mode == "engine_units_on_the_cart":
+        # The engine's minor units handed to the reader as they are: an ISK
+        # or UGX fee goes up as a hundredth of itself.
+        monkeypatch.setattr(
+            reader_module, "stripe_amount", lambda amount_minor, currency: amount_minor
+        )
 
     else:
         raise RuntimeError(f"unknown BREAK_READER_FEE mode: {mode}")
@@ -2512,6 +2590,36 @@ def _break_the_closing(monkeypatch):
                 cache.plans = held
 
         monkeypatch.setattr(board_module, "charge", newest_plan)
+
+    elif mode == "pass_only_ignored":
+        # 15: the owner's "pass holders only" is not read: the garage's
+        # default admits every car it reads.
+        original_decide = controller_module.decide
+
+        def taking_anyone(identity, cache, **kwargs):
+            said, cache.transient_available = cache.transient_available, None
+            try:
+                return original_decide(identity, cache, **kwargs)
+            finally:
+                cache.transient_available = said
+
+        monkeypatch.setattr(controller_module, "decide", taking_anyone)
+
+    elif mode == "pass_only_beyond_allow":
+        # 15: "pass holders only" read at every garage: one whose default is
+        # deny, or that has none, decides as if its default were allow.
+        original_decide = controller_module.decide
+
+        def narrowing_any_default(identity, cache, **kwargs):
+            if cache.transient_available is not False or cache.default_action == "allow":
+                return original_decide(identity, cache, **kwargs)
+            held, cache.default_action = cache.default_action, "allow"
+            try:
+                return original_decide(identity, cache, **kwargs)
+            finally:
+                cache.default_action = held
+
+        monkeypatch.setattr(controller_module, "decide", narrowing_any_default)
 
     else:
         raise RuntimeError(f"unknown BREAK_CLOSING mode: {mode}")
