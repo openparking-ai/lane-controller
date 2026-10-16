@@ -2605,6 +2605,22 @@ def _break_the_closing(monkeypatch):
 
         monkeypatch.setattr(controller_module, "decide", taking_anyone)
 
+    elif mode == "pass_only_beyond_allow":
+        # 15: "pass holders only" read at every garage: one whose default is
+        # deny, or that has none, decides as if its default were allow.
+        original_decide = controller_module.decide
+
+        def narrowing_any_default(identity, cache, **kwargs):
+            if cache.transient_available is not False or cache.default_action == "allow":
+                return original_decide(identity, cache, **kwargs)
+            held, cache.default_action = cache.default_action, "allow"
+            try:
+                return original_decide(identity, cache, **kwargs)
+            finally:
+                cache.default_action = held
+
+        monkeypatch.setattr(controller_module, "decide", narrowing_any_default)
+
     else:
         raise RuntimeError(f"unknown BREAK_CLOSING mode: {mode}")
 

@@ -20,7 +20,9 @@ requires this file to go red:
      moment, tax and an event window included
   15 pass holders only, at an entry: a car a register covers today gets in;
      every other car takes the fallback path; the exit still lets cars out;
-     a garage that has not said so is the lane as it was
+     a garage that has not said so is the lane as it was; and it narrows an
+     `allow` default only -- a garage whose default is deny, or that has
+     none, decides at the entry as it did
 """
 
 from __future__ import annotations
@@ -572,6 +574,28 @@ def test_the_control_a_garage_that_takes_any_driver_lets_the_same_car_in():
         controller = pass_only_lane([SEEN], transient=transient)
         assert controller.run_once().outcome is Outcome.ALLOW, transient
         assert controller.vend.vend_count == 1
+
+
+def test_pass_holders_only_changes_nothing_where_the_default_is_not_allow():
+    # The README and the change's own description say "pass holders only" for
+    # a garage whose default is allow. Where the default is deny, the entry
+    # still refuses every car without a rule -- a covered holder included --
+    # and where there is none it still sends that car to the fallback path.
+    for default, outcome, fallback in (
+        ("deny", Outcome.DENY, None),
+        (None, Outcome.FALLBACK, Fallback.UNKNOWN_VEHICLE),
+    ):
+        for seen in (HOLDER_SEEN, SEEN):
+            told = closed_lane(OPEN, [seen], register=a_register(), default_action=default)
+            told.cache.transient_available = False
+            decision = told.run_once()
+            assert (decision.outcome, decision.fallback) == (outcome, fallback), (
+                default, seen.plate)
+            assert told.vend.vend_count == 0, (default, seen.plate)
+            # the control: the same garage, with the flag unsaid, decides the same
+            unsaid = closed_lane(OPEN, [seen], register=a_register(), default_action=default)
+            before = unsaid.run_once()
+            assert (before.outcome, before.fallback) == (decision.outcome, decision.fallback)
 
 
 def test_pass_holders_only_still_lets_every_car_out_at_the_exit():
