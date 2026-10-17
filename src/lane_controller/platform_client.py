@@ -64,14 +64,36 @@ class PlatformRejected(Exception):
         self.code = code
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuses to build the redirected request, so a 3xx arrives as the
+    `HTTPError` it is instead of being followed.
+
+    `urllib.request.urlopen` follows redirects, and CPython's handler rebuilds
+    the new request from the old one's headers minus only the content headers
+    -- so this lane's DEVICE TOKEN, in `Authorization`, went to whatever host
+    a `Location` named. The same handler gate-agent builds every opener with
+    (`gate_agent/redirects.py`): subclassing it means `build_opener` uses this
+    one in place of the default, and there is no second to fall back to.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+#: The opener every `PlatformClient` uses unless a test hands it another: it
+#: follows nothing.
+_OPENER = urllib.request.build_opener(_NoRedirects)
+
+
 class PlatformClient:
     def __init__(self, base_url: str, token: str, *, timeout: float = 5.0, opener=None) -> None:
         self.base_url = base_url.rstrip("/")
         self._token = token
         self._timeout = timeout
         # Injectable so tests can simulate an unreachable platform without
-        # binding a socket or waiting for a real timeout.
-        self._opener = opener or urllib.request.urlopen
+        # binding a socket or waiting for a real timeout. The default follows
+        # no redirect: see `_NoRedirects`.
+        self._opener = opener or _OPENER.open
 
     # -- plumbing ----------------------------------------------------------
 
@@ -88,6 +110,16 @@ class PlatformClient:
                 body = response.read().decode("utf-8")
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as err:
+            if 300 <= err.code < 400:
+                # A REDIRECT, NOT FOLLOWED: it would carry the device token to
+                # the host it names. Not a refusal either -- the platform said
+                # nothing about the work -- so nothing is dropped: it stays
+                # queued, as it does for an unreachable platform, until
+                # `[lane] server_url` names the platform itself.
+                raise PlatformUnreachable(
+                    f"HTTP {err.code}: a redirect, which this lane does not follow (its device "
+                    "token would go with it); [lane] server_url should name the platform itself"
+                ) from err
             body = err.read().decode("utf-8", "replace")
             if err.code >= 500:
                 # The platform is having a bad time. That is the same situation

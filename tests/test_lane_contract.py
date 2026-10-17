@@ -12,8 +12,10 @@ import io
 import json
 import re
 import socket
+import threading
 import time
 import urllib.error
+from collections import deque
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -989,6 +991,42 @@ def test_a_cursor_behind_the_window_says_reset():
     # cursor is 50 has event 51 next, and 51 is still held. Nothing was missed.
     assert service.events(50).to_dict()["reset"] is False
     assert service.events(49).to_dict()["reset"] is True
+
+
+def test_reading_the_window_while_the_lane_records_never_raises():
+    """`GET /v1/lane/events` while the lane thread records.
+
+    The window was iterated in place, without the lock `record` takes, and a
+    record between two items of the read raised "deque mutated during
+    iteration" at the consumer -- 358 times in 733,790 reads with one writer.
+    Here the record is made to land exactly there: the history's iterator
+    yields one item, lets another thread record, and gives it a moment. Read
+    under the lock, the recorder waits and the page is the window as it was.
+    """
+    queue = EventQueue(history=8)
+    for index in range(4):
+        queue.record("noise", "lane-1", index=index)
+    recorders: list[threading.Thread] = []
+
+    class RecordedMidRead(deque):
+        def __iter__(self):
+            inner = super().__iter__()
+            yield next(inner)
+            if not recorders:
+                recorder = threading.Thread(target=queue.record, args=("noise", "lane-1"))
+                recorders.append(recorder)
+                recorder.start()
+                recorder.join(0.2)
+            yield from inner
+
+    queue._history = RecordedMidRead(queue._history, maxlen=queue._history.maxlen)
+    page = LaneService(full_lane(events=queue)).events(0).to_dict()
+    recorders[0].join(5)
+
+    assert [item["cursor"] for item in page["events"]] == [1, 2, 3, 4]
+    assert [seq for seq, _ in queue.since(0)] == [1, 2, 3, 4, 5], (
+        "the record made during the read was lost"
+    )
 
 
 def test_an_unevicted_window_never_claims_a_reset():

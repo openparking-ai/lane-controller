@@ -46,6 +46,10 @@ than something next to it.
                   -- instead of the depth its name promises. The HealthEntry
                   guard cannot catch it: the entry genuinely IS `measured`, of
                   something else.
+  history_read_unlocked
+                  the read window is iterated without the lock `record`
+                  takes, so a poll while the lane records raises "deque
+                  mutated during iteration".
   doc_values      the document publishes the opposite of what the code
                   enforces: `can_vend: true`, `contract_version: 99`, and a
                   rewritten `reference_not_recognised` row. The shape check
@@ -90,6 +94,7 @@ CONTRACT_BREAKS = [
     ("evicted_reset", "an evicted cursor is not told it missed anything"),
     ("depth_blind", "the outbox depth code reads the drop count instead"),
     ("doc_values", "the document publishes values the code contradicts"),
+    ("history_read_unlocked", "the read window is read without the recording lock"),
 ]
 
 SEAT_BREAKS = [

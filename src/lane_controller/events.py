@@ -6,12 +6,15 @@ that drains when it can and holds when it cannot.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +65,14 @@ class EventTransport(Protocol):
 #: Kinds that move money. These are never dropped to make room.
 SESSION_KINDS = frozenset({"session_open", "session_close"})
 
+#: How many LOG events go to the platform in one send, at most. The platform
+#: refuses a body over 1 MB with a 413, and an outage's worth of log events
+#: used to go in ONE request: about 490 cars of outage was enough for the
+#: whole backlog to be refused and dropped. A chunk leaves the queue as soon
+#: as the platform has taken it; the transport splits one further when its
+#: body is larger than the platform takes (`sync.LOG_CHUNK_BYTES`, and a 413).
+LOG_CHUNK = 200
+
 #: How many recent LOG events the read contract's cursor can still serve. A
 #: consumer that falls further behind than this is told so -- `reset` -- rather
 #: than served a short answer. Same shape and same size as the Vehicle ID
@@ -92,6 +103,7 @@ class EventQueue:
         max_events: int = 10_000,
         history: int = DEFAULT_HISTORY,
         max_pictures: int = 200,
+        store=None,
     ) -> None:
         self._log: deque[LaneEvent] = deque(maxlen=max_events)
         # The pictures kept with an entry (U7f), bounded like the log: a lane
@@ -100,6 +112,18 @@ class EventQueue:
         self.pictures_dropped = 0
         self._sessions: deque[LaneEvent] = deque()
         self._transport = transport
+        # WHERE THE SESSION ACTIONS ARE KEPT ON DISK (`durable.OutboxStore`),
+        # or None: memory only, as a standalone lane and the tests have it.
+        # Kept as each is recorded and removed once the platform has taken it
+        # or refused it, so a restart during an outage -- a power cut, a
+        # watchdog, an update -- loses none of the stays it was holding. In
+        # memory only, every queued open and close went with the process: the
+        # cars it opened left free (their close found no stay) and the stays
+        # it closed stayed open for ever. What the store held when the process
+        # stopped is queued again here, in the order it happened.
+        self._store = store
+        if store is not None:
+            self._sessions.extend(store.held())
         # TWO THREADS MEET HERE. The lane thread records; the outbox drains on
         # a thread of its own (`LaneRunner`), or on the assisted vend's settle
         # worker. `_state` guards the deques for the microseconds an append
@@ -142,6 +166,8 @@ class EventQueue:
 
     def record(self, kind: str, lane_id: str, **detail: Any) -> LaneEvent:
         event = LaneEvent(kind=kind, lane_id=lane_id, at=time.time(), detail=detail)
+        if kind in SESSION_KINDS:
+            self._keep(event)
         with self._state:
             if kind in SESSION_KINDS:
                 # Outbox only. Not the read window -- see `_history`.
@@ -160,34 +186,73 @@ class EventQueue:
             return len(self._sessions)
 
     def flush(self) -> int:
-        """Try to deliver everything queued. Returns how many were delivered.
+        """Try to deliver everything queued. Returns how many items left the
+        queue: delivered, or refused by the platform and dropped (which the
+        transport counts and logs).
 
-        All or nothing on purpose. A partial flush would need per-item
-        bookkeeping to avoid re-sending; re-sending is free here because every
-        platform endpoint the transport calls is idempotent, so the simple
-        thing is also the correct thing.
+        PART BY PART, AND A PART LEAVES AS SOON AS IT IS DONE: each session
+        action on its own, in the order they happened, then the log events in
+        chunks of `LOG_CHUNK` -- the order the transport always called them
+        in. The first part the platform cannot be reached for stops the flush
+        there; it and everything after it wait for the next try, and the next
+        try starts from it. It used to be all or nothing: the whole queue in
+        one send, and the first unreachable call kept everything, including
+        what the platform had already taken. On a poor link a long backlog
+        then never emptied (800 items never got through in 500 tries at 1 %
+        of calls lost), and an item already refused and counted was sent and
+        counted again on every try. Re-sending stays harmless -- every
+        platform endpoint the transport calls is idempotent -- it is just no
+        longer the only way through.
 
-        WHAT IS REMOVED IS THE BATCH, NOT THE QUEUE. The send waits on a
+        WHAT IS REMOVED IS THE PART, NOT THE QUEUE. The send waits on a
         network, and the lane thread goes on recording while it does: a
         `clear()` afterwards would throw away every event recorded during the
         send -- a car served while the platform was slow, gone from the
-        record. Only the events that were delivered leave the deques.
+        record. Only the events that were sent leave the deques.
         """
         with self._flushing:
             batch = self._queue
             if self._transport is None or not batch:
                 return 0
-            if not self._transport.send(batch):
-                return 0  # keep everything; try again next time
-            delivered = {id(event) for event in batch}
-            with self._state:
-                for kept, queue in (
-                    ([e for e in self._sessions if id(e) not in delivered], self._sessions),
-                    ([e for e in self._log if id(e) not in delivered], self._log),
-                ):
-                    queue.clear()
-                    queue.extend(kept)
-            return len(batch)
+            settled = 0
+            for part in _parts(batch):
+                if not self._transport.send(part):
+                    break  # keep this part and everything after it; try again next time
+                self._remove(part)
+                settled += len(part)
+            return settled
+
+    def _remove(self, part: list[LaneEvent]) -> None:
+        """Take one sent part out of its deque, and a session action out of the
+        store too. A part is all session actions or all log events."""
+        sent = {id(event) for event in part}
+        queue = self._sessions if part[0].kind in SESSION_KINDS else self._log
+        with self._state:
+            kept = [e for e in queue if id(e) not in sent]
+            queue.clear()
+            queue.extend(kept)
+        if self._store is not None and queue is self._sessions:
+            try:
+                self._store.remove([event.event_id for event in part])
+            except Exception:  # noqa: BLE001 -- a disk that fails never costs the record
+                # Left on disk, it is sent again after a restart, and the
+                # platform deduplicates on its event id.
+                log.exception(
+                    "a delivered session action could not be removed from the outbox file"
+                )
+
+    def _keep(self, event: LaneEvent) -> None:
+        """Write a session action to the store, when there is one. A write that
+        fails is logged and the action stays queued in memory, as it always was."""
+        if self._store is None:
+            return
+        try:
+            self._store.add(event)
+        except Exception:  # noqa: BLE001 -- a disk that fails never costs the record
+            log.exception(
+                "a %s could not be kept in the outbox file; it is queued in memory only",
+                event.kind,
+            )
 
     def queue_pictures(self, event_id: str, frames) -> int:
         """Keep these frames as pictures of the entry record `event_id`.
@@ -281,5 +346,25 @@ class EventQueue:
         return self._history[0][0] if self._history else None
 
     def since(self, cursor: int) -> list[tuple[int, LaneEvent]]:
-        """Everything still held whose cursor is greater than `cursor`."""
-        return [(seq, event) for seq, event in self._history if seq > cursor]
+        """Everything still held whose cursor is greater than `cursor`.
+
+        COPIED UNDER THE LOCK `record` TAKES, then filtered. Iterated in place
+        while the lane thread recorded, the read raised "deque mutated during
+        iteration" -- 358 times in 733,790 reads with one writer -- and the
+        consumer of `GET /v1/lane/events` got an error for an ordinary poll.
+        """
+        with self._state:
+            held = list(self._history)
+        return [(seq, event) for seq, event in held if seq > cursor]
+
+
+def _parts(batch: list[LaneEvent]):
+    """What one flush sends, part by part: each session action alone, in the
+    order they happened -- each is its own platform call -- then the log
+    events, in that order, in chunks of `LOG_CHUNK`."""
+    for event in batch:
+        if event.kind in SESSION_KINDS:
+            yield [event]
+    plain = [event for event in batch if event.kind not in SESSION_KINDS]
+    for start in range(0, len(plain), LOG_CHUNK):
+        yield plain[start : start + LOG_CHUNK]

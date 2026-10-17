@@ -44,6 +44,13 @@ that matters), a relative path refused outright, the file itself 0600 and
 narrowed on every write. Refused at construction, before the port opens: a
 lane that starts and then vends on a forged row is worse than one that does
 not start.
+
+THE OUTBOX'S SESSION ACTIONS ARE KEPT BESIDE IT (`OutboxStore`), in a file of
+their own in the same directory, under the same rule. A stay's open and close
+wait in the outbox until the platform takes them, and that outbox lived in
+memory only: a restart during an outage lost every one it held. They are not
+cache and not bounded by `rules_max_age_seconds`: each is held until the
+platform has taken it or refused it, and not after.
 """
 
 from __future__ import annotations
@@ -54,6 +61,8 @@ import sqlite3
 import stat
 import threading
 from pathlib import Path
+
+from .events import LaneEvent
 
 #: The file's mode, applied on every write and not only at creation: SQLite
 #: may recreate the file, and a mode set once is a mode that can be undone.
@@ -161,15 +170,7 @@ class DurableStore:
             ))
 
     def _with_connection(self, action):
-        connection = sqlite3.connect(self.path)
-        try:
-            with connection:
-                result = action(connection)
-        finally:
-            connection.close()
-        # Narrowed AFTER every touch, not only at creation.
-        os.chmod(self.path, CACHE_FILE_MODE)
-        return result
+        return _touch(self.path, action)
 
     def write(self, state: dict) -> None:
         text = json.dumps(state, sort_keys=True)
@@ -195,3 +196,86 @@ class DurableStore:
     def wipe(self) -> None:
         with self._lock:
             self._with_connection(lambda c: c.execute("DELETE FROM cache WHERE key = ?", (_KEY,)))
+
+
+def _touch(path: Path, action):
+    """One connection, one transaction, `action` run inside it -- and the file
+    narrowed AFTER every touch, not only at creation. The one way both stores
+    here open their file."""
+    connection = sqlite3.connect(path)
+    try:
+        with connection:
+            result = action(connection)
+    finally:
+        connection.close()
+    os.chmod(path, CACHE_FILE_MODE)
+    return result
+
+
+def outbox_path(cache_path: str | Path) -> Path:
+    """Where a lane whose cache is at `cache_path` keeps its outbox: the same
+    directory, and the cache file's name with `.outbox` before its suffix --
+    `decision-cache.sqlite` beside `decision-cache.outbox.sqlite` -- so two
+    lanes sharing a directory keep two outboxes."""
+    path = Path(cache_path)
+    return path.with_name(f"{path.stem}.outbox{path.suffix}")
+
+
+class OutboxStore:
+    """The outbox's session actions on disk: every stay open and close the
+    platform has not taken yet.
+
+    `EventQueue` calls `add` as it records one, `remove` once the platform has
+    taken it or refused it (counted and logged, as every refusal is), and
+    `held` once, at start: what the file held when the process stopped is
+    queued again, in the order it happened. A row is one action, keyed on its
+    event id -- the id the platform deduplicates on -- so an action that was
+    delivered and not yet removed when the process stopped is sent again and
+    absorbed.
+
+    LOG EVENTS ARE NOT KEPT HERE. They are bounded and dropped first by design
+    (`EventQueue`); the money is in the session actions.
+
+    The directory rule and the file mode are the cache's, because it is the
+    cache's directory: what a row holds is a plate or a ticket, and a row
+    written by hand would be a stay this lane never saw.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        path = Path(path)
+        self.directory = ensure_cache_directory(path.parent)
+        self.path = self.directory / path.name
+        self._lock = threading.Lock()
+        with self._lock:
+            _touch(self.path, lambda c: c.execute(
+                "CREATE TABLE IF NOT EXISTS outbox (event_id TEXT PRIMARY KEY, at REAL NOT NULL, "
+                "kind TEXT NOT NULL, lane_id TEXT NOT NULL, detail TEXT NOT NULL)"
+            ))
+
+    def add(self, event: LaneEvent) -> None:
+        detail = json.dumps(event.detail, sort_keys=True)
+        with self._lock:
+            _touch(self.path, lambda c: c.execute(
+                "INSERT OR REPLACE INTO outbox (event_id, at, kind, lane_id, detail) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event.event_id, event.at, event.kind, event.lane_id, detail),
+            ))
+
+    def remove(self, event_ids: list[str]) -> None:
+        if not event_ids:
+            return
+        with self._lock:
+            _touch(self.path, lambda c: c.executemany(
+                "DELETE FROM outbox WHERE event_id = ?", [(event_id,) for event_id in event_ids]
+            ))
+
+    def held(self) -> list[LaneEvent]:
+        with self._lock:
+            rows = _touch(self.path, lambda c: c.execute(
+                "SELECT kind, lane_id, at, detail, event_id FROM outbox ORDER BY at, rowid"
+            ).fetchall())
+        return [
+            LaneEvent(kind=kind, lane_id=lane_id, at=at, detail=json.loads(detail),
+                      event_id=event_id)
+            for kind, lane_id, at, detail, event_id in rows
+        ]

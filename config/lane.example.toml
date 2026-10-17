@@ -25,7 +25,10 @@ rules_max_age_seconds = 86400
 # token the platform issued for this lane, in the file `--platform-token-file`
 # names -- a file, never a value here, for the reason the act token gives
 # below. Unset, the lane is standalone: nothing is reported and nothing is
-# refreshed, and `serve` says so.
+# refreshed, and `serve` says so. HTTPS: the device token goes with every
+# request, so plain http is refused except to a platform on this box
+# (127.0.0.1, ::1, localhost). The token file must be readable by its owner
+# only (chmod 600), and the lane follows no redirect.
 server_url = "https://platform.example/api/lane-events"
 
 # THE TWO REFRESH CADENCES of the production loop. Both are PER-SITE SETTINGS
@@ -85,6 +88,12 @@ stays_refresh_seconds = 5
 # write: a row in this file is `plate -> allow`, and a line somebody wrote by
 # hand opens the barrier for that plate. A path that fails that test refuses
 # to start, before the port opens. The file is 0600, the directory 0700.
+#
+# THE OUTBOX IS KEPT BESIDE IT, with a platform configured: every stay open
+# and close the platform has not taken yet, in decision-cache.outbox.sqlite
+# for the path below, so a restart during an outage loses none of them. Each
+# row is a plate or a ticket, held until the platform has it -- not bounded by
+# rules_max_age_seconds, because it is the money record on its way out.
 # cache_path = "/var/lib/lane-controller/decision-cache.sqlite"
 
 # How many UNDELIVERED events the outbox may hold before the health surface
