@@ -15,18 +15,20 @@ from __future__ import annotations
 
 import logging
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
 from fake_platform import FakePlatform
-from lane_controller import CameraConfig, DecisionCache, GateConfig, LaneConfig, cli
-from lane_controller.config import DEFAULT_RULES_REFRESH_S, DEFAULT_STAYS_REFRESH_S
-from lane_controller.platform_client import PlatformClient
+from lane_controller import CameraConfig, DecisionCache, EventQueue, GateConfig, LaneConfig, cli
+from lane_controller.config import DEFAULT_RULES_REFRESH_S, DEFAULT_STAYS_REFRESH_S, LOOP_KEYS
+from lane_controller.platform_client import PlatformClient, PlatformUnreachable
 from lane_controller.runner import LaneRunner
 from lane_controller.simulated import StubVehicleIdentifier
 from lane_controller.sync import PlatformTransport, sync_rules, sync_stays
 from lane_controller.vehicle_id_client import VehicleIdClient
+from serving import serving
 
 A_REGISTER = {"garage": "gp-1", "registrations": [{"vehicle_identity": "PASS-1", "pass": "p-1"}]}
 
@@ -441,9 +443,10 @@ def test_wire_lane_with_a_platform_drains_the_outbox_to_it_and_names_the_session
 def test_the_platform_is_configured_whole_or_not_at_all(tmp_path, capsys):
     token = tmp_path / "device.token"
     token.write_text("device-token\n")
+    token.chmod(0o600)
     # server_url and no token: refused, naming both
     with pytest.raises(SystemExit) as refused:
-        cli.platform_client_for(a_config(server_url="http://platform.test"), None)
+        cli.platform_client_for(a_config(server_url="https://platform.test"), None)
     assert refused.value.code == 2 and "--platform-token-file" in capsys.readouterr().err
     # a token and no server_url: refused
     with pytest.raises(SystemExit) as refused:
@@ -452,9 +455,9 @@ def test_the_platform_is_configured_whole_or_not_at_all(tmp_path, capsys):
     # neither: standalone
     assert cli.platform_client_for(a_config(), None) is None
     # both: a client at that address with that token
-    client = cli.platform_client_for(a_config(server_url="http://platform.test/"), token)
+    client = cli.platform_client_for(a_config(server_url="https://platform.test/"), token)
     assert isinstance(client, PlatformClient)
-    assert client.base_url == "http://platform.test" and client._token == "device-token"
+    assert client.base_url == "https://platform.test" and client._token == "device-token"
 
 
 def test_serve_refuses_a_half_configured_platform_before_binding(tmp_path, capsys, monkeypatch):
@@ -491,6 +494,7 @@ def test_serve_starts_the_loop_beside_the_contract_and_stops_it(tmp_path, monkey
         'server_url = "https://platform.example/api/lane-events"', 'server_url = "http://127.0.0.1:9"'))
     token = tmp_path / "device.token"
     token.write_text("device-token")
+    token.chmod(0o600)
     started: dict = {}
 
     class FakeServer:
@@ -514,6 +518,165 @@ def test_serve_starts_the_loop_beside_the_contract_and_stops_it(tmp_path, monkey
     assert started["runner"].running is False, "the loop was not stopped when the server closed"
     assert started["closed"] is True
     assert started["runner"]._threads == [] and started["runner"].client is not None
+
+
+# ---------------------------------------------------------------------------
+# the device token: never through a redirect, never over plain http off this
+# box, and every token file readable by its owner only
+# ---------------------------------------------------------------------------
+
+
+class _Elsewhere(BaseHTTPRequestHandler):
+    """A host the platform's answer could point at. It keeps the
+    `Authorization` header of every request that reaches it."""
+
+    seen: list = []
+
+    def do_GET(self):  # noqa: N802
+        type(self).seen.append(self.headers.get("Authorization"))
+        body = b'{"elsewhere": true}'
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_POST = do_GET  # noqa: N815
+
+    def log_message(self, *args):
+        return None
+
+
+def _redirecting_to(target: str):
+    class Redirect(BaseHTTPRequestHandler):
+        def _answer(self):
+            self.send_response(302)
+            self.send_header("location", f"{target}{self.path}")
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        do_GET = _answer  # noqa: N815
+        do_POST = _answer  # noqa: N815
+
+        def log_message(self, *args):
+            return None
+
+    return Redirect
+
+
+def test_the_platform_client_follows_no_redirect_and_the_token_stays_home():
+    _Elsewhere.seen = []
+    elsewhere = ThreadingHTTPServer(("127.0.0.1", 0), _Elsewhere)
+    with serving(elsewhere) as other:
+        # THE CONTROL: the other host does keep a token that reaches it.
+        assert PlatformClient(other, "control-token").get_rules() == {"elsewhere": True}
+        assert _Elsewhere.seen == ["Bearer control-token"]
+        _Elsewhere.seen = []
+        with serving(ThreadingHTTPServer(("127.0.0.1", 0), _redirecting_to(other))) as platform:
+            client = PlatformClient(platform, "device-token-xyz")
+            with pytest.raises(PlatformUnreachable, match="redirect"):
+                client.get_rules()
+            # A session open that meets one is not lost: it stays queued.
+            transport = PlatformTransport(client)
+            queue = EventQueue(transport)
+            queue.record("session_open", "lane-loop", plate="CAR-1",
+                         at="2026-10-16T09:00:00+00:00", entry_confirmation="confirmed")
+            assert queue.flush() == 0
+            assert queue.pending_sessions == 1 and transport.rejected == 0
+    assert _Elsewhere.seen == [], "the device token went to the host the redirect named"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://platform.example/api",
+        "http://127.0.0.1:8080",
+        "http://127.0.0.2:8080",
+        "http://localhost:3000",
+        "http://[::1]:3000",
+    ],
+)
+def test_a_server_url_is_https_or_on_this_box(url):
+    assert a_config(server_url=url).server_url == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://platform.example/api",
+        "http://10.0.0.5:8080",
+        "http://localhost.example.com",
+        "ftp://platform.example",
+        "https://",
+        "platform.example",
+    ],
+)
+def test_a_server_url_that_would_carry_the_token_in_the_clear_is_refused(url):
+    raw = {"lane": {"id": "lane-1", "site_id": "site-1", "server_url": url},
+           "loops": {key: 0 for key in LOOP_KEYS} | {"arming_loops": 1}}
+    with pytest.raises(ValueError, match="https://"):
+        LaneConfig.from_dict(raw)
+
+
+TOKEN_FLAGS = ("--auth-token-file", "--act-token-file", "--platform-token-file")
+
+
+def _serve_with_tokens(tmp_path, monkeypatch, modes: dict[str, int]):
+    example = Path(__file__).resolve().parent.parent / "config" / "lane.example.toml"
+    config = tmp_path / "lane.toml"
+    config.write_text(example.read_text().replace(
+        'server_url = "https://platform.example/api/lane-events"', 'server_url = "http://127.0.0.1:9"'))
+    argv = ["serve", "--config", str(config)]
+    for flag in TOKEN_FLAGS:
+        path = tmp_path / flag.strip("-")
+        path.write_text(f"a-token-for-{flag}\n")
+        path.chmod(modes.get(flag, 0o600))
+        argv += [flag, str(path)]
+    bound = []
+    monkeypatch.setattr(cli, "make_server", lambda *a, **k: bound.append(True) or NeverServes())
+    return argv, bound
+
+
+@pytest.mark.parametrize("flag", TOKEN_FLAGS)
+def test_a_token_file_readable_by_more_than_its_owner_is_refused_before_serve_binds(
+    flag, tmp_path, monkeypatch, capsys
+):
+    argv, bound = _serve_with_tokens(tmp_path, monkeypatch, {flag: 0o644})
+    with pytest.raises(SystemExit) as refused:
+        cli.main(argv)
+    message = capsys.readouterr().err
+    assert refused.value.code == 2
+    assert flag in message and "readable by more than its owner (0644)" in message, message
+    assert cli.SECRET_FILE_IS[flag] in message, "the refusal must say what the file holds"
+    assert bound == [], "serve bound a port before refusing the token file"
+
+
+def test_the_same_token_files_at_0600_are_served(tmp_path, monkeypatch):
+    """THE CONTROL: a refusal that fires on everything is not a check."""
+    argv, bound = _serve_with_tokens(tmp_path, monkeypatch, {})
+    assert cli.main(argv) == 0
+    assert bound == [True]
+
+
+def test_the_token_guard_reads_the_mode_bits(tmp_path):
+    verdicts = {}
+    for mode in (0o600, 0o400, 0o640, 0o604, 0o644, 0o660):
+        path = tmp_path / f"token-{mode:o}"
+        path.write_text("a-token\n")
+        path.chmod(mode)
+        try:
+            cli._token(path, "--act-token-file")
+            verdicts[f"{mode:04o}"] = "accepted"
+        except SystemExit:
+            verdicts[f"{mode:04o}"] = "refused"
+    assert verdicts == {
+        "0600": "accepted",
+        "0400": "accepted",
+        "0640": "refused",
+        "0604": "refused",
+        "0644": "refused",
+        "0660": "refused",
+    }, verdicts
 
 
 # ---------------------------------------------------------------------------

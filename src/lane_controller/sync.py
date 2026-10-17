@@ -6,6 +6,7 @@ module only changes what it has, and never blocks a barrier.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -23,6 +24,12 @@ log = logging.getLogger(__name__)
 
 SESSION_OPEN = "session_open"
 SESSION_CLOSE = "session_close"
+
+#: The largest log post this lane makes, in bytes of its body. The platform
+#: refuses a body over 1 MB with a 413; a quarter of that leaves room for
+#: what one event's detail can grow to. A chunk of `events.LOG_CHUNK` events
+#: larger than this goes in halves, and so does one the platform answers 413.
+LOG_CHUNK_BYTES = 256 * 1024
 
 # ---------------------------------------------------------------------------
 # The transit events: a vend creates a PENDING entry, and the loops after the
@@ -129,6 +136,15 @@ UNCONFIRMABLE = "unconfirmable"
 #: for a human. An entry is the opposite -- nothing confirmed it, so there is no
 #: session at all -- and this value is never sent on an open.
 HELD = "held"
+
+
+class _TooLarge(Exception):
+    """A log post the platform answered 413: posted again in halves, not dropped."""
+
+
+def _body_bytes(plain: list[dict]) -> int:
+    """The size of the body `PlatformClient.post_events` sends for `plain`."""
+    return len(json.dumps({"events": plain}).encode("utf-8"))
 
 
 def to_iso(epoch_seconds: float) -> str:
@@ -293,7 +309,9 @@ class PlatformTransport(EventTransport):
 
     Every endpoint this calls is idempotent, which is what lets `send` be all
     or nothing: on any unreachable error the whole batch is retried, duplicates
-    and all, and the platform absorbs them.
+    and all, and the platform absorbs them. The queue hands it one part at a
+    time (`EventQueue.flush`) -- a session action, or a chunk of log events --
+    so what is retried is that part, not everything queued.
     """
 
     def __init__(
@@ -361,11 +379,43 @@ class PlatformTransport(EventTransport):
                 # A batched log post is one lost batch, counted and logged with
                 # the status and the kind the platform named, and the queue
                 # keeps draining behind it.
-                self._guarded(lambda: self._client.post_events(plain))
+                self._post_log(plain)
         except PlatformUnreachable as err:
             log.info("platform unreachable, %d item(s) stay queued: %s", len(events), err)
             return False
         return True
+
+    def _post_log(self, plain: list[dict]) -> None:
+        """Post log events, in halves while the body is larger than the
+        platform takes: over `LOG_CHUNK_BYTES` before it is sent, or answered
+        413 after. A 413 is not a refusal of these events -- the platform did
+        not read them -- so it is not counted; the halves are posted, and one
+        refused on its own is one lost post, counted and logged as any other.
+        Only a single event too large to post alone is refused for its size.
+        """
+        if len(plain) > 1 and _body_bytes(plain) > LOG_CHUNK_BYTES:
+            self._post_halves(plain)
+            return
+
+        def post():
+            try:
+                return self._client.post_events(plain)
+            except PlatformRejected as err:
+                if err.status == 413 and len(plain) > 1:
+                    raise _TooLarge from err
+                raise
+
+        try:
+            self._guarded(post)
+        except _TooLarge:
+            log.info("the platform answered 413 (too large) for %d log events; posting them "
+                     "in halves", len(plain))
+            self._post_halves(plain)
+
+    def _post_halves(self, plain: list[dict]) -> None:
+        half = len(plain) // 2
+        self._post_log(plain[:half])
+        self._post_log(plain[half:])
 
     def send_pictures(self, pictures) -> bool:
         """The pictures kept with an entry (U7f), one request each. True only if

@@ -28,14 +28,17 @@ simulated hardware says so and a lane serving a real platform says that too.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
+import signal
 import sys
+import threading
 from pathlib import Path
 
 from .config import LaneConfig
 from .controller import LaneController
 from .decision import DecisionCache
-from .durable import CacheDirectoryUnsafe, DurableStore
+from .durable import CacheDirectoryUnsafe, DurableStore, OutboxStore, outbox_path
 from .events import EventQueue
 from .platform_client import PlatformClient
 from .runner import LaneRunner
@@ -93,11 +96,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _token(path: Path | None) -> str | None:
+#: The permission bits a file holding a credential this lane reads may not
+#: have: group and other, so `0600` or `0400`. gate-agent's rule for every
+#: credential file it reads (`read_secret_file`), copied: a credential every
+#: account on the box can read is a credential every account on the box holds.
+SECRET_FORBIDDEN_MODE = 0o077
+
+#: What each credential file is, said in the refusal, so `chmod 600` comes
+#: with what it protects.
+SECRET_FILE_IS = {
+    "--auth-token-file": "the token every read route of this lane requires.",
+    "--act-token-file": "the act token: it opens the barrier, through POST /v1/lane/vend.",
+    "--platform-token-file": (
+        "this lane's device token: the platform takes stay opens and closes from whoever "
+        "presents it."
+    ),
+}
+
+
+def _token(path: Path | None, flag: str) -> str | None:
     """A token, read from the file that holds it.
 
-    ONE function for both credentials, because two copies of this rule would be
+    ONE function for every credential, because two copies of this rule would be
     two rules, and the copy is the one that stops refusing.
+
+    A file readable by more than its owner is refused before it is read, with
+    the mode and what the file holds in the message: the device token, the read
+    token and the act token were all read at any mode.
 
     An empty or whitespace-only file is not a token and is refused rather than
     read as "no token configured" -- which would be a truncated file silently
@@ -106,6 +131,14 @@ def _token(path: Path | None) -> str | None:
     if not path:
         return None
     try:
+        mode = path.stat().st_mode
+        if mode & SECRET_FORBIDDEN_MODE:
+            print(
+                f"{flag}: {path} is readable by more than its owner ({mode & 0o777:04o}). "
+                f"This file holds {SECRET_FILE_IS[flag]} `chmod 600` it.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
         print(f"could not read {path}: {exc}", file=sys.stderr)
@@ -153,13 +186,23 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
     such.
     """
     seams: dict[str, str] = {}
+    # THE OUTBOX IS KEPT ON DISK BESIDE THE CACHE, when the cache is and there
+    # is a platform to drain to: every stay open and close is written as it is
+    # recorded and removed once the platform has taken it, so a restart during
+    # an outage loses none of them (`durable.OutboxStore`). Same directory,
+    # same rule; refused by the same exception if the directory is not ours.
+    outbox = (
+        OutboxStore(outbox_path(config.cache_path))
+        if platform is not None and config.cache_path
+        else None
+    )
     if platform is not None:
         lookup = (
             (lambda plate: platform.find_open_session(plate=plate))
             if config.direction == "exit"
             else None
         )
-        events = EventQueue(PlatformTransport(platform, session_lookup=lookup))
+        events = EventQueue(PlatformTransport(platform, session_lookup=lookup), store=outbox)
         seams["platform"] = (
             f"REAL {platform.base_url} (outbox drains to it; refresh on two cadences)"
         )
@@ -202,6 +245,13 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
     else:
         cache = DecisionCache(max_age_seconds=config.rules_max_age_seconds)
         seams["cache"] = "MEMORY ONLY (no [lane] cache_path): a restart holds nothing"
+    if platform is not None:
+        seams["outbox"] = (
+            f"DURABLE {outbox.path} ({events.pending_sessions} stay open(s) and close(s) "
+            "held from before this start; each is kept until the platform takes it)"
+            if outbox is not None
+            else "MEMORY ONLY (no [lane] cache_path): a restart loses what is queued"
+        )
     seams["loops"] = "SIMULATED (this package ships no loop driver)"
     seams["camera"] = "SIMULATED (this package ships no camera driver)"
     seams["barrier"] = (
@@ -233,7 +283,7 @@ def platform_client_for(config: LaneConfig, token_file: Path | None) -> Platform
     credential read into memory with nowhere to present it. Neither is a
     configuration somebody meant, and both are said here.
     """
-    token = _token(token_file)
+    token = _token(token_file, "--platform-token-file")
     if config.server_url and token is None:
         print(
             f"\n[lane] server_url is set ({config.server_url}) but no --platform-token-file was "
@@ -257,8 +307,8 @@ def platform_client_for(config: LaneConfig, token_file: Path | None) -> Platform
 def cmd_serve(args) -> int:
     # The refusal BEFORE anything is built, so a configuration no file would
     # fix is reported in the moment rather than after a lane has been wired.
-    token = _token(args.auth_token_file)
-    act_token = _token(args.act_token_file)
+    token = _token(args.auth_token_file, "--auth-token-file")
+    act_token = _token(args.act_token_file, "--act-token-file")
     if token is not None and act_token is not None and token == act_token:
         # ONE file used twice is one credential, and the whole point of the
         # second one is that holding the reads does not buy the barrier. It
@@ -326,13 +376,47 @@ def cmd_serve(args) -> int:
     # the refresh thread keeps the cache fresh, and this thread serves HTTP.
     runner.start()
     try:
-        server.serve_forever()
+        with _terminate_is_an_interrupt():
+            server.serve_forever()
     except KeyboardInterrupt:
         print()
     finally:
         runner.stop()
+        _last_send(runner)
         server.server_close()
     return 0
+
+
+@contextlib.contextmanager
+def _terminate_is_an_interrupt():
+    """SIGTERM -- what a service manager sends to stop a process -- stops
+    `serve` the way Ctrl-C does: through the `finally` above, which stops the
+    runner and makes one last send. Its default action ended the process on
+    the spot, with whatever the outbox held. The handler is put back on the
+    way out, so a second SIGTERM during the stop ends the process as before.
+    Only the main thread may set one, and `serve` is run from it."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, interrupt)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _last_send(runner: LaneRunner) -> None:
+    """ONE LAST SEND as `serve` stops, after the drain thread has: what is
+    still queued goes now if the platform takes it. Unsent, it stays queued,
+    in the outbox file when there is one. Guarded like every drain turn, and a
+    platform it cannot reach costs one client timeout, not one per item: the
+    flush stops at the first part it cannot deliver."""
+    if runner.controller.events.transport is not None:
+        runner.drain_turn()
 
 
 def main(argv: list[str] | None = None) -> int:

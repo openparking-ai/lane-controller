@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import math
 import tomllib
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -386,6 +388,39 @@ def positive_finite(value, name: str) -> None:
         )
 
 
+def server_url_fault(url) -> str | None:
+    """Why this `[lane] server_url` would put the device token at risk, or None.
+
+    The lane presents its device token on every platform call, so the address
+    it calls is where the token goes. Plain http carries it readable across
+    every network between the box and the platform, and anything that can
+    read it can report and settle stays in this lane's name. So it is https,
+    or http to a platform on this box itself -- loopback, where nothing
+    crosses a network: a platform run locally, for a test or the demo.
+    """
+    parts = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+    if parts is not None and parts.scheme == "https" and parts.hostname:
+        return None
+    if parts is not None and parts.scheme == "http" and _is_loopback(parts.hostname):
+        return None
+    return (
+        "must be an https:// address: the device token goes with every request, and plain "
+        "http carries it readable across the network. Plain http is accepted only for a "
+        "platform on this box (127.0.0.1, ::1, localhost)"
+    )
+
+
+def _is_loopback(host: str | None) -> bool:
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class LaneConfig:
     lane_id: str
@@ -452,6 +487,10 @@ class LaneConfig:
     def __post_init__(self) -> None:
         if self.direction not in ("entry", "exit"):
             raise ValueError(f"direction must be 'entry' or 'exit', got {self.direction!r}")
+        if self.server_url:
+            fault = server_url_fault(self.server_url)
+            if fault:
+                raise ValueError(f"[lane] server_url {self.server_url!r} {fault}")
         if (self.banned_match_structure is None) != (self.banned_match_colour is None):
             raise ValueError(
                 "banned_match_structure and banned_match_colour are stated together or not at all"
