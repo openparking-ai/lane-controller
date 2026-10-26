@@ -130,6 +130,96 @@ def _break_the_queue(monkeypatch):
 
         monkeypatch.setattr(PlatformTransport, "send", duplicating_send)
 
+    elif mode == "outbox_not_kept":
+        # The session actions are queued in memory only, as they were: a
+        # restart during an outage loses every stay the outbox held.
+        from lane_controller import durable as durable_module
+
+        monkeypatch.setattr(durable_module.OutboxStore, "add", lambda self, event: None)
+
+    elif mode == "outbox_not_replayed":
+        # The file is written and never read back: the restart starts empty.
+        from lane_controller import durable as durable_module
+
+        monkeypatch.setattr(durable_module.OutboxStore, "held", lambda self: [])
+
+    elif mode == "outbox_not_wired":
+        # `serve` keeps the outbox in memory whatever the cache does.
+        from lane_controller import cli as cli_module
+
+        monkeypatch.setattr(cli_module, "OutboxStore", lambda path: None)
+
+    elif mode == "all_or_nothing":
+        # The old flush: the whole queue in one send, everything kept on the
+        # first call that does not get through, including what was taken.
+        def whole(self):
+            with self._flushing:
+                batch = self._queue
+                if self._transport is None or not batch:
+                    return 0
+                if not self._transport.send(batch):
+                    return 0
+                for part in (
+                    [e for e in batch if e.kind in ("session_open", "session_close")],
+                    [e for e in batch if e.kind not in ("session_open", "session_close")],
+                ):
+                    if part:
+                        self._remove(part)
+                return len(batch)
+
+        monkeypatch.setattr(EventQueue, "flush", whole)
+
+    elif mode == "skips_a_failed_part":
+        # The flush goes on past a part that did not get through and sends the
+        # rest: a close queued behind its lost open reaches the platform first,
+        # finds no stay and is refused and dropped, and the open that arrives
+        # on the next flush is a stay left open for good.
+        from lane_controller.events import _parts
+
+        def skipping(self):
+            with self._flushing:
+                batch = self._queue
+                if self._transport is None or not batch:
+                    return 0
+                settled = 0
+                for part in _parts(batch):
+                    if not self._transport.send(part):
+                        continue
+                    self._remove(part)
+                    settled += len(part)
+                return settled
+
+        monkeypatch.setattr(EventQueue, "flush", skipping)
+
+    elif mode == "one_log_post":
+        # Every log event queued goes in one request, however large.
+        from lane_controller import events as events_module
+        from lane_controller import sync as sync_module
+
+        monkeypatch.setattr(events_module, "LOG_CHUNK", 10**9)
+        monkeypatch.setattr(sync_module, "LOG_CHUNK_BYTES", 10**12)
+
+    elif mode == "no_split_on_413":
+        # A 413 is an ordinary refusal: the chunk is dropped and counted.
+        def unsplit(self, plain):
+            self._guarded(lambda: self._client.post_events(plain))
+
+        monkeypatch.setattr(PlatformTransport, "_post_log", unsplit)
+
+    elif mode == "no_last_send":
+        # `serve` stops without one last send.
+        from lane_controller import cli as cli_module
+
+        monkeypatch.setattr(cli_module, "_last_send", lambda runner: None)
+
+    elif mode == "terminate_kills":
+        # SIGTERM keeps its default action: the process ends on the spot.
+        import contextlib
+
+        from lane_controller import cli as cli_module
+
+        monkeypatch.setattr(cli_module, "_terminate_is_an_interrupt", contextlib.nullcontext)
+
     else:
         raise RuntimeError(f"unknown BREAK_OFFLINE_QUEUE mode: {mode}")
 
@@ -842,6 +932,16 @@ def _break_the_lane_contract(monkeypatch):
 
         monkeypatch.setattr(test_module, "doc_payloads", doctored)
 
+    elif mode == "history_read_unlocked":
+        # The read window iterated in place, without the lock `record` takes:
+        # a record between two items raises "deque mutated during iteration".
+        from lane_controller.events import EventQueue
+
+        def unlocked(self, cursor):
+            return [(seq, event) for seq, event in self._history if seq > cursor]
+
+        monkeypatch.setattr(EventQueue, "since", unlocked)
+
     else:
         raise RuntimeError(f"unknown BREAK_LANE_CONTRACT mode: {mode}")
 
@@ -1546,6 +1646,24 @@ def _break_the_refresh(monkeypatch):
             return original_for(config, token_file)
 
         monkeypatch.setattr(cli_module, "platform_client_for", lenient)
+
+    elif mode == "redirect_followed":
+        # The client's opener follows a redirect, the device token with it.
+        import urllib.request
+
+        from lane_controller import platform_client as platform_client_module
+
+        monkeypatch.setattr(platform_client_module, "_OPENER", urllib.request.build_opener())
+
+    elif mode == "http_accepted":
+        # Any server_url will do, plain http to another host included.
+        from lane_controller import config as config_module
+
+        monkeypatch.setattr(config_module, "server_url_fault", lambda url: None)
+
+    elif mode == "token_file_any_mode":
+        # A token file is read whoever else can read it.
+        monkeypatch.setattr(cli_module, "SECRET_FORBIDDEN_MODE", 0)
 
     else:
         raise RuntimeError(f"unknown BREAK_REFRESH mode: {mode}")

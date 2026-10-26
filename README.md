@@ -147,7 +147,15 @@ refresh that changes it (`durable.py`) and read back at start, **as old as its
 last refresh, not as old as the restart**. A lane that comes back after a power
 cut with the platform still unreachable decides from what it last held, and a
 lane that comes back after two days holds a cache it does not trust and says
-so. Without a path the cache is memory only, as it always was.
+so. Without a path the cache is memory only, as it always was. **The
+outbox's stay opens and closes are kept beside it** (`decision-cache.outbox.sqlite`
+beside `decision-cache.sqlite`, same directory rule, 0600), written as each is
+recorded and removed once the platform has taken or refused it, so a restart
+during an outage loses none of them; the lane sends them first thing, in the
+order they happened. They are not cache: each is held until the platform has
+it, not for `rules_max_age_seconds`. Log events are not kept there; they are
+bounded and dropped first, as before. `serve` stopped by Ctrl-C or SIGTERM
+makes one last send on the way out.
 
 **What the cache holds at rest is personal data, and its bound is one number.**
 Every pass holder's and monthly vehicle's identity at the garage, and every
@@ -184,7 +192,11 @@ lane-controller serve --config lane.toml --platform-token-file /etc/lane/device.
 
 Loopback by default; off loopback it refuses to start without **both** tokens.
 The second form is a lane with a platform behind it: `[lane] server_url` names
-it and the device token it issued is in the file. `serve` refuses the two
+it and the device token it issued is in the file. `server_url` is `https://`
+(plain `http://` only to a platform on this box: 127.0.0.1, ::1, localhost),
+the platform client follows no redirect, and a token file readable by more
+than its owner (anything but 0600 or 0400) is refused before the port opens:
+each would hand the token to someone else. `serve` refuses the two
 half-configured states by name — a `server_url` with no token, a token with no
 `server_url`. **The production loop runs beside the contract** (`runner.py`):
 one thread serves cars (`run_once`, for ever), one keeps the cache fresh on two
@@ -230,8 +242,8 @@ neither on the path between a car arriving and a barrier opening.
 | `board_items()` | the board on `GET /v1/lane/state`: the owner's messages in force on this lane's clock, then — when switched on — the price for 1, 2, 3 and 24 hours entering now, from `charge`, the same quote-and-tax call the exit charges with. |
 | `price_exit()` | the exit's local decision, from the cache alone: `covered`, `priced` (the engine in-process), `no_cached_entry`, or the engine's own refusal verbatim. Reads the registers with the garage's local day, and a monthly agreement's own days when its register carries them (start, pauses, the owner's block, the first day unpaid past grace); folds the plate and the registrar's identity to letters and digits, with O read as 0 and I as 1 because the plate reader outputs neither letter (an assumption, stated in `normalise_identity`). A stay whose close the lane records leaves its list, so a car that pulls forward again is not priced twice. |
 | `LaneRunner` | the production loop. The lane thread calls `run_once` for ever; the refresh thread runs the two cadences (`[lane] rules_refresh_seconds`, `stays_refresh_seconds`), the slow one first at start. A refresh that could not run is counted and said on `RunnerState`, never hidden; a turn that raises is logged and the loop goes round again. **The fast interval is the size of the class of cars that entered too recently to be priced at the barrier** — `config/lane.example.toml` says so where the number is set. **The outbox drains on a third thread**: the controller's `deliver()` is a signal under the runner, so the lane thread never waits on the network after the vend either — against a platform that black-holes, the client's timeout per queued action is the drain thread's cost, not the next car's; an outbox the platform refused is retried every `DRAIN_RETRY_S` without waiting for a car. A bare controller (the tests, the demo) drains inline, and `run_once` returns delivered. |
-| `EventQueue` | one outbox holding both the activity log and the session actions, so a lane that was offline replays what happened in the order it happened. Safe to record into from the lane thread while a drain is mid-send on another: a flush removes the batch it delivered, never what was recorded meanwhile. **Session actions are never dropped**; only log events are, and a drop is counted. |
-| `PlatformTransport` | delivers the outbox. All-or-nothing, because every platform endpoint it calls is idempotent. |
+| `EventQueue` | one outbox holding both the activity log and the session actions, so a lane that was offline replays what happened in the order it happened. Safe to record into from the lane thread while a drain is mid-send on another: a flush removes what it sent, never what was recorded meanwhile. **Session actions are never dropped**; only log events are, and a drop is counted. With `[lane] cache_path` the session actions are also kept on disk until the platform has them (`durable.OutboxStore`). A flush goes part by part -- each session action, then the log in chunks of 200 -- and each part leaves as soon as it is delivered or refused; the first part the platform cannot be reached for stops the flush, and the next one starts there. |
+| `PlatformTransport` | delivers one part at a time. A part is all or nothing, because every platform endpoint it calls is idempotent. A log post over 256 KB, or one the platform answers 413, goes again in halves; only one event too large to post alone is refused for its size. |
 
 **Session times come from the lane, never the server.** A car arrives when it
 arrives, whatever time the platform eventually hears about it; pricing a stay by

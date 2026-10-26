@@ -14,6 +14,10 @@ fresh is not known to keep it fresh.
   thread_dies      a turn that raises kills the lane thread, health route
                    still answering.
   half_configured  `serve` accepts a server_url with no device token.
+  redirect_followed  the platform client follows a redirect, its device
+                   token with it.
+  http_accepted    a plain-http server_url to another host is accepted.
+  token_file_any_mode  a token file readable by others is read.
 """
 
 from __future__ import annotations
@@ -30,6 +34,9 @@ BREAKAGES = [
     ("silent_failure", "a failed refresh is neither counted nor said"),
     ("thread_dies", "a raising turn kills the lane thread"),
     ("half_configured", "serve accepts a platform with no token"),
+    ("redirect_followed", "the client follows a redirect with its token"),
+    ("http_accepted", "a plain-http server_url off this box is accepted"),
+    ("token_file_any_mode", "a token file others can read is read"),
 ]
 
 

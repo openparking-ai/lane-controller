@@ -10,7 +10,15 @@ never been seen to fail is not known to be measuring anything.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import signal
+import stat
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -27,12 +35,16 @@ from lane_controller import (
     VehicleIdentity,
     sync_rules,
 )
+from lane_controller.durable import OutboxStore
+from lane_controller.events import LOG_CHUNK
+from lane_controller.platform_client import PlatformRejected, PlatformUnreachable
 from lane_controller.simulated import (
     CannedCameraFeed,
     RecordingVendOutput,
     SimulatedLoopInput,
     StubVehicleIdentifier,
 )
+from lane_controller.sync import LOG_CHUNK_BYTES
 
 
 def lane_config(direction="entry"):
@@ -622,3 +634,456 @@ def test_an_offline_exit_still_closes_without_a_session_id():
     queued = [e for e in exit_lane.events._queue if e.kind == "session_close"]
     assert len(queued) == 1
     assert queued[0].detail["session_id"] is None, "no id available offline, and that is fine"
+
+
+# ---------------------------------------------------------------------------
+# The outbox survives a restart.
+#
+# The stay opens and closes waiting for the platform lived in memory only, so
+# a restart during an outage -- a power cut, a watchdog, an update -- lost every
+# one the outbox held: the cars it opened left free (their close found no
+# stay) and the stays it closed stayed open for ever. With a `[lane]
+# cache_path`, they are kept in a file beside the cache as they are recorded
+# and removed once the platform has taken them.
+# ---------------------------------------------------------------------------
+
+
+def a_narrow_directory(tmp_path):
+    """A directory this process owns, mode 0700: what the store requires."""
+    directory = tmp_path / "lane-state"
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o700)
+    return directory
+
+
+def queue_an_outage(queue, plates, *, close=None):
+    """Session opens (and one close) recorded with the platform away."""
+    for n, plate in enumerate(plates):
+        queue.record("session_open", "lane-entry", plate=plate,
+                     at=f"2026-10-16T09:0{n}:00+00:00", entry_confirmation="confirmed")
+    if close is not None:
+        queue.record("session_close", "lane-entry", plate=close,
+                     at="2026-10-16T12:30:00+00:00", exit_confirmation="confirmed",
+                     session_id=None)
+
+
+def test_queued_stays_survive_the_process_being_killed_mid_outage(tmp_path):
+    """The process is KILLED -- no stop, no flush, nothing run on the way out
+    -- with three opens and a close queued and the platform unreachable. The
+    next process, on the same file, delivers all four."""
+    path = a_narrow_directory(tmp_path) / "lane.outbox.sqlite"
+    child = textwrap.dedent(
+        f"""
+        import os, signal
+        from lane_controller.durable import OutboxStore
+        from lane_controller.events import EventQueue
+        queue = EventQueue(store=OutboxStore({str(path)!r}))
+        for n, plate in enumerate(["KILL-0", "KILL-1", "KILL-2"]):
+            queue.record("session_open", "lane-entry", plate=plate,
+                         at=f"2026-10-16T09:0{{n}}:00+00:00", entry_confirmation="confirmed")
+        queue.record("session_close", "lane-entry", plate="KILL-0",
+                     at="2026-10-16T12:30:00+00:00", exit_confirmation="confirmed",
+                     session_id=None)
+        queue.record("armed", "lane-entry")
+        print(queue.pending_sessions, flush=True)
+        os.kill(os.getpid(), signal.SIGKILL)
+        """
+    )
+    src = Path(__file__).resolve().parent.parent / "src"
+    killed = subprocess.run(
+        [sys.executable, "-c", child], env={**os.environ, "PYTHONPATH": str(src)},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert killed.returncode == -signal.SIGKILL, killed.stderr
+    assert killed.stdout.strip() == "4"
+
+    platform = FakePlatform()
+    queue = EventQueue(PlatformTransport(platform), store=OutboxStore(path))
+    assert queue.pending_sessions == 4, "the stays the outbox held died with the process"
+    assert queue.pending == 4, "log events are not kept: they are bounded and dropped first"
+    assert queue.flush() == 4
+    assert platform.unique_opens == 3
+    assert [c["plate"] for c in platform.closed] == ["KILL-0"]
+    assert platform.open_sessions.keys() == {"KILL-1", "KILL-2"}
+    assert EventQueue(store=OutboxStore(path)).pending_sessions == 0, (
+        "what the platform took is still in the file"
+    )
+
+
+def test_a_restarted_queue_replays_what_it_held_in_the_order_it_happened(tmp_path):
+    path = a_narrow_directory(tmp_path) / "lane.outbox.sqlite"
+    down = FakePlatform(online=False)
+    before = EventQueue(PlatformTransport(down), store=OutboxStore(path))
+    queue_an_outage(before, ["CAR-A", "CAR-B", "CAR-C"], close="CAR-A")
+    assert before.flush() == 0
+
+    platform = FakePlatform()
+    after = EventQueue(PlatformTransport(platform), store=OutboxStore(path))
+    held = after._queue
+    assert [(e.kind, e.detail["plate"]) for e in held] == [
+        ("session_open", "CAR-A"), ("session_open", "CAR-B"), ("session_open", "CAR-C"),
+        ("session_close", "CAR-A"),
+    ]
+    assert [e.event_id for e in held] == [e.event_id for e in before._queue], (
+        "the replay must carry the ids the platform deduplicates on"
+    )
+    assert after.flush() == 4
+    assert platform.unique_opens == 3 and len(platform.closed) == 1
+    assert after.pending == 0
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_serve_keeps_the_outbox_beside_the_cache_and_says_so(tmp_path):
+    from lane_controller import cli
+
+    directory = a_narrow_directory(tmp_path)
+    config = LaneConfig(
+        lane_id="lane-entry", site_id="site-1",
+        camera=CameraConfig(camera_id="cam", rtsp_url="", frames_per_read=1),
+        gate=GateConfig(), cache_path=str(directory / "cache.sqlite"),
+    )
+    platform = FakePlatform(online=False)
+    platform.base_url = "https://platform.test"
+    first = cli.wire_lane(config, platform=platform)
+    outbox = directory.resolve() / "cache.outbox.sqlite"
+    assert first.seams["outbox"].startswith(f"DURABLE {outbox} (0 ")
+    queue_an_outage(first.controller.events, ["SERVE-1", "SERVE-2"])
+    assert first.controller.events.flush() == 0
+
+    # The restart: a new process, the same configuration, the platform back.
+    platform.online = True
+    second = cli.wire_lane(config, platform=platform)
+    assert second.controller.events.pending_sessions == 2
+    assert second.seams["outbox"].startswith(f"DURABLE {outbox} (2 ")
+    assert second.controller.events.flush() == 2
+    assert platform.unique_opens == 2
+
+
+def test_a_lane_without_a_cache_path_keeps_its_outbox_in_memory_and_says_so():
+    """THE CONTROL: no path, no file, and the seam table says what a restart costs."""
+    from lane_controller import cli
+
+    config = lane_config()
+    platform = FakePlatform()
+    platform.base_url = "https://platform.test"
+    wired = cli.wire_lane(config, platform=platform)
+    assert wired.controller.events._store is None
+    assert wired.seams["outbox"].startswith("MEMORY ONLY")
+    assert "outbox" not in cli.wire_lane(config, platform=None).seams, (
+        "a standalone lane has no outbox to drain"
+    )
+
+
+def test_a_stay_the_disk_cannot_take_stays_queued_in_memory(tmp_path, caplog):
+    class FullDisk(OutboxStore):
+        def add(self, event):
+            raise OSError(28, "No space left on device")
+
+    platform = FakePlatform(online=False)
+    queue = EventQueue(
+        PlatformTransport(platform),
+        store=FullDisk(a_narrow_directory(tmp_path) / "lane.outbox.sqlite"),
+    )
+    with caplog.at_level(logging.ERROR):
+        queue_an_outage(queue, ["DISK-1"])
+    assert queue.pending_sessions == 1, "a failed write must not cost the record"
+    assert any("outbox file" in r.getMessage() for r in caplog.records)
+    platform.online = True
+    assert queue.flush() == 1 and platform.unique_opens == 1
+
+
+# ---------------------------------------------------------------------------
+# A failed send resumes where it stopped.
+# ---------------------------------------------------------------------------
+
+
+class PoorLink(FakePlatform):
+    """Every `every`-th call does not get through, as on a lossy link."""
+
+    def __init__(self, every: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.every = every
+        self.calls = 0
+
+    def _check(self):
+        super()._check()
+        self.calls += 1
+        if self.calls % self.every == 0:
+            raise PlatformUnreachable("simulated loss")
+
+
+def test_on_a_link_that_loses_every_third_call_the_backlog_still_empties():
+    """Ten stays queued. Each flush gets two calls through before one is lost.
+    All or nothing, that flush kept all ten -- the two the platform took
+    included -- and every later flush did the same, for ever. Resumed, two
+    leave per flush, and each is delivered once."""
+    platform = PoorLink(every=3, online=False)
+    queue = EventQueue(PlatformTransport(platform))
+    queue_an_outage(queue, [f"POOR-{n}" for n in range(10)])
+    platform.online = True
+
+    for _ in range(10):
+        queue.flush()
+    assert queue.pending == 0, f"{queue.pending} item(s) never got through"
+    assert platform.unique_opens == 10
+    assert platform.open_deliveries == 10, "a stay the platform took was sent again"
+
+
+def test_a_refused_item_is_counted_once_however_often_the_flush_is_retried():
+    """A close with no stay is refused and dropped; the open behind it cannot
+    be delivered yet. The refusal was counted again on every retry."""
+    platform = FakePlatform()
+    transport = PlatformTransport(platform)
+    queue = EventQueue(transport)
+    queue.record("session_close", "lane-exit", plate="NO-STAY",
+                 at="2026-10-16T09:00:00+00:00", exit_confirmation="confirmed", session_id=None)
+    queue.record("session_open", "lane-exit", plate="LATER-1",
+                 at="2026-10-16T09:01:00+00:00", entry_confirmation="confirmed")
+
+    def unreachable(**kwargs):
+        raise PlatformUnreachable("simulated outage, opens only")
+
+    real_open = platform.open_session
+    platform.open_session = unreachable
+    for _ in range(3):
+        assert queue.flush() <= 1
+    assert transport.rejected == 1, f"one refusal counted {transport.rejected} times"
+    platform.open_session = real_open
+    assert queue.flush() == 1
+    assert transport.rejected == 1 and platform.unique_opens == 1 and queue.pending == 0
+
+
+def test_a_close_waits_behind_its_open_when_the_opens_call_is_lost():
+    """The flush stops at the first part that does not get through and keeps
+    everything behind it, in order. Two things rest on that: the platform
+    receives a lane's events in the order the lane recorded them, and
+    `cli._last_send` promises one client timeout on stop, not one per queued
+    item. All or nothing kept the order by construction; part by part, stopping
+    at the first failure is what keeps it.
+
+    In production an entry lane queues only opens and an exit lane only closes,
+    so one outbox never holds both halves of a stay. This test puts both in one
+    queue only because a close sent ahead of its lost open makes a reordering
+    visible: the platform refuses a close with no stay."""
+    platform = FakePlatform()
+    transport = PlatformTransport(platform)
+    queue = EventQueue(transport)
+    queue_an_outage(queue, ["ORDER-1"], close="ORDER-1")
+
+    calls = []
+    real_open, real_close = platform.open_session, platform.close_session
+
+    def open_lost_once(**kwargs):
+        if not calls:
+            calls.append(("lost", kwargs["plate"]))
+            raise PlatformUnreachable("simulated loss, the open's call only")
+        calls.append(("open", kwargs["plate"]))
+        return real_open(**kwargs)
+
+    def close(**kwargs):
+        calls.append(("close", kwargs["plate"]))
+        return real_close(**kwargs)
+
+    platform.open_session, platform.close_session = open_lost_once, close
+
+    settled = queue.flush()
+    assert calls == [("lost", "ORDER-1")], f"the close was sent past its lost open: {calls}"
+    assert settled == 0 and queue.pending_sessions == 2, "the close left ahead of its open"
+    assert transport.rejected == 0
+    assert platform.closed == []
+
+    assert queue.flush() == 2
+    assert calls == [("lost", "ORDER-1"), ("open", "ORDER-1"), ("close", "ORDER-1")]
+    assert transport.rejected == 0, "the close was refused: it reached the platform before its open"
+    assert platform.unique_opens == 1
+    assert [c["plate"] for c in platform.closed] == ["ORDER-1"]
+    assert platform.open_sessions == {}, "the stay was left open"
+    assert queue.pending == 0
+
+
+# ---------------------------------------------------------------------------
+# An outage's log events arrive in chunks the platform takes.
+# ---------------------------------------------------------------------------
+
+#: The platform's body limit: express.json({ limit: '1mb' }), 1 MiB.
+PLATFORM_BODY_LIMIT = 1024 * 1024
+
+
+class PlatformWithABodyLimit(FakePlatform):
+    """Answers a log post whose body is over `limit` bytes 413, as the real
+    platform's body parser does, and keeps the size of every post it took."""
+
+    def __init__(self, limit: int = PLATFORM_BODY_LIMIT, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.limit = limit
+        self.posts: list[tuple[int, int]] = []
+        self.too_large = 0
+
+    def post_events(self, events):
+        self._check()
+        size = len(json.dumps({"events": events}).encode("utf-8"))
+        if size > self.limit:
+            self.too_large += 1
+            raise PlatformRejected(413, '{"error": "The request body is too large.", '
+                                        '"code": "body_too_large"}', "body_too_large")
+        self.posts.append((len(events), size))
+        return super().post_events(events)
+
+
+def an_outages_log(queue, count, *, padding=300):
+    for n in range(count):
+        queue.record("arming_rejected", "lane-entry", reason="x" * padding, n=n)
+
+
+def test_an_outages_worth_of_log_events_arrives_in_chunks_the_platform_takes():
+    """6,000 log events, about 2 MB: one request was refused 413 and the lane
+    dropped the whole backlog. Now every post is at most `LOG_CHUNK` events
+    and `LOG_CHUNK_BYTES`, and all 6,000 arrive."""
+    platform = PlatformWithABodyLimit(online=False)
+    transport = PlatformTransport(platform)
+    queue = EventQueue(transport)
+    an_outages_log(queue, 6_000)
+    assert len(json.dumps([e.as_dict() for e in queue._queue])) > 2 * PLATFORM_BODY_LIMIT
+    platform.online = True
+
+    assert queue.flush() == 6_000
+    assert platform.unique_events == 6_000
+    assert transport.rejected == 0 and platform.too_large == 0
+    assert queue.pending == 0
+    assert len(platform.posts) >= 6_000 // LOG_CHUNK
+    assert max(n for n, _ in platform.posts) <= LOG_CHUNK
+    assert max(size for _, size in platform.posts) <= LOG_CHUNK_BYTES
+
+
+def test_a_chunk_over_the_byte_cap_goes_in_halves_before_it_is_sent():
+    """200 events of 2 KB each: a 400 KB chunk the platform would take, but
+    over `LOG_CHUNK_BYTES`. It goes in halves without a 413 round trip."""
+    platform = PlatformWithABodyLimit()
+    transport = PlatformTransport(platform)
+    queue = EventQueue(transport)
+    an_outages_log(queue, 200, padding=2_000)
+
+    assert queue.flush() == 200
+    assert platform.unique_events == 200 and transport.rejected == 0
+    assert platform.too_large == 0
+    assert len(platform.posts) > 1
+    assert max(size for _, size in platform.posts) <= LOG_CHUNK_BYTES
+
+
+def test_a_chunk_the_platform_answers_413_is_posted_again_in_halves():
+    """A platform whose limit is below one chunk: the 413 is not a refusal of
+    the events, so the halves go and none is lost or counted."""
+    platform = PlatformWithABodyLimit(limit=20_000)
+    transport = PlatformTransport(platform)
+    queue = EventQueue(transport)
+    an_outages_log(queue, 200)
+
+    assert queue.flush() == 200
+    assert platform.too_large > 0, "control: the chunk really was too large"
+    assert platform.unique_events == 200
+    assert transport.rejected == 0
+    assert queue.pending == 0
+
+
+def test_one_event_too_large_to_post_alone_is_the_only_one_lost(caplog):
+    platform = PlatformWithABodyLimit(limit=20_000)
+    transport = PlatformTransport(platform)
+    queue = EventQueue(transport)
+    an_outages_log(queue, 100)
+    queue.record("arming_rejected", "lane-entry", reason="y" * 30_000)
+    an_outages_log(queue, 99)
+
+    with caplog.at_level(logging.ERROR):
+        assert queue.flush() == 200
+    assert platform.unique_events == 199
+    assert transport.rejected == 1
+    assert any("413" in r.getMessage() for r in caplog.records), "the drop must name the status"
+
+
+def test_a_chunk_refused_for_its_content_is_one_lost_chunk_and_the_rest_arrive():
+    """As the design says of a batch: a 400 drops that chunk, counted once.
+    The other chunks of the backlog are not taken down with it."""
+    platform = FakePlatform()
+    platform.reject_event_kinds = {"totally_invented_kind"}
+    transport = PlatformTransport(platform)
+    queue = EventQueue(transport)
+    an_outages_log(queue, 450, padding=10)
+    queue.record("totally_invented_kind", "lane-entry")
+    an_outages_log(queue, 549, padding=10)
+
+    assert queue.flush() == 1_000
+    assert transport.rejected == 1
+    assert platform.unique_events == 1_000 - LOG_CHUNK
+    assert queue.pending == 0
+
+
+# ---------------------------------------------------------------------------
+# `serve` makes one last send as it stops, and SIGTERM stops it.
+# ---------------------------------------------------------------------------
+
+
+def _serve_with(tmp_path, monkeypatch, serve_forever):
+    """`lane-controller serve` against a fake platform, the HTTP server
+    replaced by one whose `serve_forever` is `serve_forever(controller)`. The
+    drain thread's retry is a minute, so nothing it sends is mistaken for the
+    last send."""
+    from lane_controller import cli
+    from lane_controller import runner as runner_module
+
+    example = Path(__file__).resolve().parent.parent / "config" / "lane.example.toml"
+    config = tmp_path / "lane.toml"
+    config.write_text(example.read_text().replace(
+        'server_url = "https://platform.example/api/lane-events"',
+        'server_url = "http://127.0.0.1:9"'))
+    platform = FakePlatform()
+    platform.base_url = "http://127.0.0.1:9"
+    monkeypatch.setattr(cli, "platform_client_for", lambda config, token_file: platform)
+    monkeypatch.setattr(runner_module, "DRAIN_RETRY_S", 60.0)
+
+    class FakeServer:
+        def __init__(self, service):
+            self.service = service
+
+        def serve_forever(self):
+            serve_forever(self.service.controller)
+
+        def server_close(self):
+            return None
+
+    monkeypatch.setattr(cli, "make_server", lambda service, **kwargs: FakeServer(service))
+    code = cli.main(["serve", "--config", str(config)])
+    return code, platform
+
+
+def test_serve_makes_one_last_send_as_it_stops(tmp_path, monkeypatch):
+    def a_stay_then_ctrl_c(controller):
+        controller.events.record("session_open", controller.config.lane_id, plate="LAST-1",
+                                 at="2026-10-16T09:00:00+00:00", entry_confirmation="confirmed")
+        raise KeyboardInterrupt
+
+    code, platform = _serve_with(tmp_path, monkeypatch, a_stay_then_ctrl_c)
+    assert code == 0
+    assert platform.unique_opens == 1, "the stay recorded before the stop never left the box"
+
+
+def test_sigterm_stops_serve_the_way_ctrl_c_does_and_its_handler_is_put_back(
+    tmp_path, monkeypatch
+):
+    before = signal.getsignal(signal.SIGTERM)
+    seen = []
+
+    def a_stay_then_sigterm(controller):
+        controller.events.record("session_open", controller.config.lane_id, plate="TERM-1",
+                                 at="2026-10-16T09:00:00+00:00", entry_confirmation="confirmed")
+        handler = signal.getsignal(signal.SIGTERM)
+        seen.append(handler)
+        if handler is not before and callable(handler):
+            handler(signal.SIGTERM, None)
+        seen.append("served on")
+
+    code, platform = _serve_with(tmp_path, monkeypatch, a_stay_then_sigterm)
+    assert code == 0
+    assert seen[0] is not before, "serve left SIGTERM's default: the process ends on the spot"
+    assert seen[1:] == [], "SIGTERM did not stop serve"
+    assert platform.unique_opens == 1
+    assert signal.getsignal(signal.SIGTERM) is before, "serve did not put the handler back"

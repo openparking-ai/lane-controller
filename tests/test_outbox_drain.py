@@ -312,7 +312,7 @@ def test_an_event_recorded_during_a_send_is_not_thrown_away_with_the_batch():
     """The old `flush()` cleared the deques after the send returned. With
     the send on another thread that is every event the lane recorded while
     the platform was slow -- a car served during the outage, gone from the
-    record. What leaves the queue is the batch, and only the batch."""
+    record. What leaves the queue is what was sent, and only that."""
     transport = SendThatWaits()
     queue = EventQueue(transport)
     queue.record("session_open", "lane-drain", plate="CAR-1")
@@ -325,12 +325,15 @@ def test_an_event_recorded_during_a_send_is_not_thrown_away_with_the_batch():
     queue.record("vended", "lane-drain")
     transport.release.set()
     drain.join(timeout=5)
-    assert len(transport.batches[0]) == 2
+    assert [e.kind for batch in transport.batches for e in batch] == ["session_open", "armed"]
     assert queue.pending == 2, "the events recorded during the send were cleared with the batch"
     assert queue.pending_sessions == 1
     transport.release.set()
+    sent = len(transport.batches)
     assert queue.flush() == 2
-    assert [e.detail.get("plate") for e in transport.batches[1]] == ["CAR-2", None]
+    assert [e.detail.get("plate") for batch in transport.batches[sent:] for e in batch] == [
+        "CAR-2", None,
+    ]
     assert queue.pending == 0
 
 
