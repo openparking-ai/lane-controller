@@ -12,6 +12,9 @@ thread is not known to leave it alone.
                             next car instead of the next tick.
   clear_after_send          the deques are cleared after the send, so what
                             was recorded during it is thrown away.
+  close_lookup_on_the_lane_thread
+                            the exit asks the platform which session it is
+                            closing on the lane thread, as it records the close.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ BREAKAGES = [
     ("signal_never_flushes", "the signal is taken and nothing is sent"),
     ("no_retry", "a refused outbox waits for the next car"),
     ("clear_after_send", "what was recorded during the send is thrown away"),
+    ("close_lookup_on_the_lane_thread", "the close's session is asked for on the lane thread"),
 ]
 
 

@@ -7,6 +7,7 @@ module only changes what it has, and never blocks a barrier.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from .decision import DecisionCache
@@ -295,8 +296,18 @@ class PlatformTransport(EventTransport):
     and all, and the platform absorbs them.
     """
 
-    def __init__(self, client: PlatformClient) -> None:
+    def __init__(
+        self,
+        client: PlatformClient,
+        *,
+        session_lookup: Callable[[str], dict | None] | None = None,
+    ) -> None:
         self._client = client
+        #: At an exit, how a close that carries no session id has its session
+        #: named: the platform's open stay for the plate, asked as the close is
+        #: DELIVERED -- on the drain's thread, never the lane's. None (an entry
+        #: lane, a test) sends a close as it was recorded.
+        self.session_lookup = session_lookup
         self.rejected = 0
         #: Every platform call this transport has ATTEMPTED. Without it, a lane
         #: that has never sent anything and a lane whose every send was accepted
@@ -419,15 +430,18 @@ class PlatformTransport(EventTransport):
         """
         declared = event.detail["exit_confirmation"]
         descriptor = event.detail.get("descriptor")
+        session_id = event.detail.get("session_id") or self._open_session_id(event)
         result = self._client.close_session(
             event_id=event.event_id,
             plate=event.detail.get("plate"),
             ticket_ref=event.detail.get("ticket_ref"),
             exit_at=event.detail.get("at") or to_iso(event.at),
-            # Recorded at the moment of the exit, when it was still unambiguous
-            # which session was open. By the time a queued close is delivered it
-            # may not be.
-            session_id=event.detail.get("session_id"),
+            # The session the platform has open for this car, asked as the
+            # close goes out (`_open_session_id`). A close delivered late is
+            # matched as one sent on the plate alone would be: the platform's
+            # own order check refuses an exit that precedes the open stay's
+            # entry, so a car that came back meanwhile keeps its later visit.
+            session_id=session_id,
             exit_confirmation=declared,
             descriptor=descriptor,
             # The barrier's decision, as recorded at the exit. The platform
@@ -440,6 +454,24 @@ class PlatformTransport(EventTransport):
         require_confirmation_echo(result, declared, end="exit", action="close")
         require_descriptor_echo(result, descriptor, end="exit", action="close")
         return result
+
+    def _open_session_id(self, event: LaneEvent) -> str | None:
+        """The id of the session the platform has open for this close's
+        plate, or None: no lookup wired, a ticket (the lookup takes a plate),
+        nothing open, or a platform that could not be asked -- the close then
+        goes out without one and the platform matches it on the identity.
+
+        HERE, AND NOT WHERE THE CLOSE IS RECORDED. This runs on whichever
+        thread drains the outbox -- under `LaneRunner` its own -- so a
+        platform that does not answer costs the drain its timeout, and the
+        car behind at the barrier nothing."""
+        plate = event.detail.get("plate")
+        if self.session_lookup is None or not plate:
+            return None
+        found = self.session_lookup(plate)
+        if not found:
+            return None
+        return (found.get("session") or {}).get("id")
 
     def _guarded(self, call):
         """Run one platform call, dropping it if the platform refused it outright.

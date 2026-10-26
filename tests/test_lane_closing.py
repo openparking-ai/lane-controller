@@ -18,6 +18,11 @@ requires this file to go red:
   13 a board message shows only inside its times, offline too
   14 a price on the board is what the lane would charge for that stay at that
      moment, tax and an event window included
+  15 pass holders only, at an entry: a car a register covers today gets in;
+     every other car takes the fallback path; the exit still lets cars out;
+     a garage that has not said so is the lane as it was; and it narrows an
+     `allow` default only -- a garage whose default is deny, or that has
+     none, decides at the entry as it did
 """
 
 from __future__ import annotations
@@ -529,3 +534,87 @@ def test_a_closed_lane_raises_no_malfunction_by_being_closed_and_hides_none():
     assert states[MalfunctionCode.IDENTITY_SERVICE_DOWN] is HealthState.ACTIVE, (
         "the closing hid a dead identification engine"
     )
+
+
+# ---------------------------------------------------------------------------
+# 15 -- pass holders only: the owner's `transient_available = false`
+# ---------------------------------------------------------------------------
+
+
+def pass_only_lane(identities, *, direction="entry", transient=False):
+    """An open lane at a garage whose owner said who it takes: `transient`
+    as the payload states it, with a pass register naming HOLDER."""
+    controller = closed_lane(OPEN, identities, direction=direction, register=a_register())
+    controller.cache.transient_available = transient
+    return controller
+
+
+def test_pass_holders_only_lets_in_a_car_a_register_covers_today():
+    controller = pass_only_lane([HOLDER_SEEN])
+    decision = controller.run_once()
+    assert decision.outcome is Outcome.ALLOW
+    assert controller.vend.vend_count == 1
+
+
+def test_pass_holders_only_sends_every_other_car_to_the_fallback_path():
+    controller = pass_only_lane([SEEN])
+    decision = controller.run_once()
+    assert decision.outcome is Outcome.FALLBACK
+    assert decision.fallback is Fallback.UNKNOWN_VEHICLE
+    assert controller.vend.vend_count == 0
+    assert details(controller, "fallback_needs_human")[0]["fallback"] == "unknown_vehicle"
+    # and a holder whose registration has ended is every other car
+    ended = closed_lane(OPEN, [HOLDER_SEEN], register=gp_register(gp_row(HOLDER, end="2026-06-01")))
+    ended.cache.transient_available = False
+    assert ended.run_once().fallback is Fallback.UNKNOWN_VEHICLE
+
+
+def test_the_control_a_garage_that_takes_any_driver_lets_the_same_car_in():
+    for transient in (True, None):
+        controller = pass_only_lane([SEEN], transient=transient)
+        assert controller.run_once().outcome is Outcome.ALLOW, transient
+        assert controller.vend.vend_count == 1
+
+
+def test_pass_holders_only_changes_nothing_where_the_default_is_not_allow():
+    # The README and the change's own description say "pass holders only" for
+    # a garage whose default is allow. Where the default is deny, the entry
+    # still refuses every car without a rule -- a covered holder included --
+    # and where there is none it still sends that car to the fallback path.
+    for default, outcome, fallback in (
+        ("deny", Outcome.DENY, None),
+        (None, Outcome.FALLBACK, Fallback.UNKNOWN_VEHICLE),
+    ):
+        for seen in (HOLDER_SEEN, SEEN):
+            told = closed_lane(OPEN, [seen], register=a_register(), default_action=default)
+            told.cache.transient_available = False
+            decision = told.run_once()
+            assert (decision.outcome, decision.fallback) == (outcome, fallback), (
+                default, seen.plate)
+            assert told.vend.vend_count == 0, (default, seen.plate)
+            # the control: the same garage, with the flag unsaid, decides the same
+            unsaid = closed_lane(OPEN, [seen], register=a_register(), default_action=default)
+            before = unsaid.run_once()
+            assert (before.outcome, before.fallback) == (decision.outcome, decision.fallback)
+
+
+def test_pass_holders_only_still_lets_every_car_out_at_the_exit():
+    controller = pass_only_lane([SEEN], direction="exit")
+    decision = controller.run_once()
+    assert decision.outcome is Outcome.ALLOW and controller.vend.vend_count == 1
+
+
+def test_pass_holders_only_arrives_with_the_rules_and_survives_a_restart(cache_dir):  # noqa: F811
+    path = cache_dir / "cache.sqlite"
+    platform = FakePlatform()
+    rules = platform.get_rules
+    platform.get_rules = lambda: {**rules(), "transient_available": False}
+    first = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    sync_rules(platform, first)
+    assert first.transient_available is False
+    second = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    assert second.transient_available is False, "the restart forgot pass holders only"
+    # the control: a platform that does not send the field leaves the lane as it was
+    platform.get_rules = rules
+    sync_rules(platform, second)
+    assert second.transient_available is None

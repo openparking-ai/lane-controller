@@ -13,7 +13,11 @@ Each claim is paired with the case that falsifies it:
   * the settle takes the decision IT IS HANDED, never `last_decision` -- a
     settle on its own thread would otherwise carry the next car's;
   * an exit that decided nothing carries no key, and an entry never does;
-  * on the wire the client sends it exactly, and only when there is one.
+  * on the wire the client sends it exactly, and only when there is one;
+  * the close carries the exit time the lane priced at -- one reading of the
+    clock, not a second one after the reader and the relay;
+  * a stay whose close is recorded leaves the lane's list, so a car that
+    backs up and pulls forward is not priced again for it.
 
 `scripts/close_decision_fail_control.py` breaks each in turn and requires this
 file to go red. The fee + 1 lane is the PLATFORM's control (its reconciler
@@ -24,6 +28,8 @@ what the lane sends must be what it showed.
 from __future__ import annotations
 
 import json
+import threading
+from datetime import datetime
 from pathlib import Path
 
 from lane_controller import CameraConfig, DecisionCache, GateConfig, LaneConfig, LoopConfig
@@ -41,6 +47,7 @@ from lane_controller.simulated import (
 )
 from lane_controller.sync import SESSION_CLOSE, SESSION_OPEN, PlatformTransport
 from test_exit_decision import ENTRY, NOW, a_platform, gp_register, gp_row
+from test_reader_fee import RecordingReader
 
 PLAN = json.loads((Path(__file__).resolve().parent / "documents" / "flat_plan.json").read_text())
 WINDOW = 10.0
@@ -267,3 +274,129 @@ def test_the_transport_hands_the_close_route_what_the_event_carries():
     event = recorded(controller, SESSION_CLOSE)[0].detail["local_decision"]
     assert platform.closed[-1]["local_decision"] == event
     assert platform.closed[-1]["local_decision"]["fee_minor"] == 900
+
+
+# ---------------------------------------------------------------------------
+# one exit time for the fee and the close
+# ---------------------------------------------------------------------------
+
+
+def a_moving_clock(step=0.25):
+    """The lane's clock, a quarter of a second further on at every reading --
+    the time a reader and a relay take between the price and the close."""
+    ticks = iter(NOW + step * i for i in range(10_000))
+    return lambda: next(ticks)
+
+
+def test_the_close_carries_the_exit_time_the_lane_priced_at():
+    platform = with_open_stay(a_platform(stays=[("s-7", "TRNS-7", ENTRY)]), "TRNS-7")
+    controller = lane(platform, "TRNS-7", clock=a_moving_clock())
+    decision = controller.run_once()
+    assert decision.exit_pricing.status == PRICED
+    priced_at = decision.exit_pricing.exit_at
+    close = recorded(controller, SESSION_CLOSE)[0].detail
+    assert close["at"] == close["local_decision"]["exit_at"] == priced_at
+    assert platform.closed[-1]["exit_at"] == priced_at, "the platform got another time"
+    # the premise: the lane's clock did move on between the price and the close
+    assert controller.now() > datetime.fromisoformat(priced_at).timestamp()
+
+
+def test_the_same_under_closing_loops_where_the_close_waits_for_the_crossing():
+    platform = with_open_stay(a_platform(stays=[("s-7", "TRNS-7", ENTRY)]), "TRNS-7")
+    controller = lane(platform, "TRNS-7", clock=a_moving_clock(),
+                      crossings=[(ClosingSequence.FORWARD, 3.0)])
+    decision = controller.run_once()
+    close = recorded(controller, SESSION_CLOSE)[0].detail
+    assert close["exit_confirmation"] == "confirmed"
+    assert close["at"] == decision.exit_pricing.exit_at
+
+
+def test_the_control_a_close_with_no_priced_exit_time_is_stamped_as_it_always_was():
+    platform = with_open_stay(a_platform(gp=gp_register(gp_row("PASS-1"))), "PASS-1")
+    controller = lane(platform, "PASS-1", clock=a_moving_clock())
+    decision = controller.run_once()
+    assert decision.exit_pricing.status == COVERED and decision.exit_pricing.exit_at is None
+    close = recorded(controller, SESSION_CLOSE)[0].detail
+    assert close["at"] and datetime.fromisoformat(close["at"]).timestamp() > NOW
+
+
+# ---------------------------------------------------------------------------
+# a closed stay leaves the lane's list
+# ---------------------------------------------------------------------------
+
+
+def test_a_car_that_pulls_forward_again_is_not_priced_twice_for_the_same_stay():
+    platform = with_open_stay(a_platform(stays=[("s-7", "TRNS-7", ENTRY)]), "TRNS-7")
+    controller = lane(platform, "TRNS-7")
+    controller.reader = RecordingReader()
+    controller.loop = SimulatedLoopInput(arrivals=2)
+    first = controller.run_once()
+    assert first.exit_pricing.status == PRICED and first.exit_pricing.session_id == "s-7"
+    assert "s-7" not in controller.cache.stays, "the closed stay is still listed"
+    assert controller.cache.open_stays_for("TRNS-7") == []
+    second = controller.run_once()
+    assert second.should_vend, "an exit always works"
+    assert second.exit_pricing.status == NO_CACHED_ENTRY, "priced again for the same stay"
+    fees = [r for r in controller.reader.shown if r and r.get("status") == PRICED]
+    assert len(fees) == 1, "the reader put the fee up again"
+
+
+def test_the_control_a_car_that_backed_out_before_leaving_keeps_its_stay():
+    platform = with_open_stay(a_platform(stays=[("s-7", "TRNS-7", ENTRY)]), "TRNS-7")
+    controller = lane(platform, "TRNS-7", crossings=[(ClosingSequence.REVERSE, 1.0),
+                                                     (ClosingSequence.FORWARD, 1.0)])
+    controller.loop = SimulatedLoopInput(arrivals=2)
+    first = controller.run_once()
+    assert first.exit_pricing.status == PRICED
+    assert not recorded(controller, SESSION_CLOSE), "the premise: nothing was closed"
+    assert "s-7" in controller.cache.stays, "a stay nobody closed was dropped"
+    second = controller.run_once()
+    assert second.exit_pricing.status == PRICED and second.exit_pricing.session_id == "s-7"
+    assert "s-7" not in controller.cache.stays
+
+
+def test_dropping_a_stay_names_only_a_stay_the_lane_holds():
+    cache = DecisionCache(max_age_seconds=3600)
+    cache.replace_stays([{"session_id": "s-1", "open": True, "plate": "A-1"}], "5")
+    assert cache.drop_stay("s-9") is False and cache.drop_stay(None) is False
+    assert cache.drop_stay("s-1") is True and cache.stays == {}
+    assert cache.stays_cursor == "5", "a drop is not a read of the feed"
+
+
+def test_a_drop_on_the_lane_thread_and_a_delta_on_the_refresh_thread_lose_neither():
+    """The lane thread drops the stays it closes while the refresh thread
+    applies the platform's deltas. Neither may lose the other's change, and
+    neither may fail on the other's."""
+    cache = DecisionCache(max_age_seconds=3600)
+    held = 400
+    cache.replace_stays(
+        [{"session_id": f"s-{i}", "open": True, "plate": f"OLD-{i}"} for i in range(held)], "0"
+    )
+    failures: list = []
+
+    def guarded(work):
+        def run():
+            try:
+                work()
+            except Exception as err:  # noqa: BLE001 -- the failure is the finding
+                failures.append(err)
+        return threading.Thread(target=run)
+
+    def refresh():
+        for i in range(held):
+            cache.apply_stay_changes(
+                [{"session_id": f"n-{i}", "open": True, "plate": f"NEW-{i}"}], str(i + 1)
+            )
+
+    def lane_thread():
+        for i in range(held):
+            cache.drop_stay(f"s-{i}")
+
+    threads = [guarded(refresh), guarded(lane_thread)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert failures == []
+    assert not [sid for sid in cache.stays if sid.startswith("s-")], "a drop was lost"
+    assert len([sid for sid in cache.stays if sid.startswith("n-")]) == held, "a delta was lost"
