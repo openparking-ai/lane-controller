@@ -853,6 +853,50 @@ def test_a_refused_item_is_counted_once_however_often_the_flush_is_retried():
     assert transport.rejected == 1 and platform.unique_opens == 1 and queue.pending == 0
 
 
+def test_a_close_waits_behind_its_open_when_the_opens_call_is_lost():
+    """One stay's open and its close are queued; the open's call is lost once,
+    and the close would be accepted. The flush stops at the open. Sent past
+    it, the close reached the platform first, found no stay, was refused and
+    dropped; the open arrived on the next flush, and the stay stayed open for
+    good -- the car left without paying. All or nothing kept this order by
+    construction; part by part, stopping at the first part that does not get
+    through is what keeps it."""
+    platform = FakePlatform()
+    transport = PlatformTransport(platform)
+    queue = EventQueue(transport)
+    queue_an_outage(queue, ["ORDER-1"], close="ORDER-1")
+
+    calls = []
+    real_open, real_close = platform.open_session, platform.close_session
+
+    def open_lost_once(**kwargs):
+        if not calls:
+            calls.append(("lost", kwargs["plate"]))
+            raise PlatformUnreachable("simulated loss, the open's call only")
+        calls.append(("open", kwargs["plate"]))
+        return real_open(**kwargs)
+
+    def close(**kwargs):
+        calls.append(("close", kwargs["plate"]))
+        return real_close(**kwargs)
+
+    platform.open_session, platform.close_session = open_lost_once, close
+
+    settled = queue.flush()
+    assert calls == [("lost", "ORDER-1")], f"the close was sent past its lost open: {calls}"
+    assert settled == 0 and queue.pending_sessions == 2, "the close left ahead of its open"
+    assert transport.rejected == 0
+    assert platform.closed == []
+
+    assert queue.flush() == 2
+    assert calls == [("lost", "ORDER-1"), ("open", "ORDER-1"), ("close", "ORDER-1")]
+    assert transport.rejected == 0, "the close was refused: it reached the platform before its open"
+    assert platform.unique_opens == 1
+    assert [c["plate"] for c in platform.closed] == ["ORDER-1"]
+    assert platform.open_sessions == {}, "the stay was left open: the car left without paying"
+    assert queue.pending == 0
+
+
 # ---------------------------------------------------------------------------
 # An outage's log events arrive in chunks the platform takes.
 # ---------------------------------------------------------------------------
