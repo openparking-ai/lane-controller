@@ -169,6 +169,28 @@ def _break_the_queue(monkeypatch):
 
         monkeypatch.setattr(EventQueue, "flush", whole)
 
+    elif mode == "skips_a_failed_part":
+        # The flush goes on past a part that did not get through and sends the
+        # rest: a close queued behind its lost open reaches the platform first,
+        # finds no stay and is refused and dropped, and the open that arrives
+        # on the next flush is a stay left open for good.
+        from lane_controller.events import _parts
+
+        def skipping(self):
+            with self._flushing:
+                batch = self._queue
+                if self._transport is None or not batch:
+                    return 0
+                settled = 0
+                for part in _parts(batch):
+                    if not self._transport.send(part):
+                        continue
+                    self._remove(part)
+                    settled += len(part)
+                return settled
+
+        monkeypatch.setattr(EventQueue, "flush", skipping)
+
     elif mode == "one_log_post":
         # Every log event queued goes in one request, however large.
         from lane_controller import events as events_module

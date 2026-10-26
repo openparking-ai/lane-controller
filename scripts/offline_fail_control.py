@@ -16,6 +16,8 @@ never been seen to fail is not known to be a guarantee.
                           cache does.
   all_or_nothing       -- the whole queue in one send, and everything kept on
                           the first call that does not get through.
+  skips_a_failed_part  -- the flush goes on past a part that did not get
+                          through, so a close goes ahead of its lost open.
   one_log_post         -- every queued log event in one request, however large.
   no_split_on_413      -- a chunk the platform answers 413 is dropped.
   no_last_send         -- `serve` stops without one last send.
@@ -36,6 +38,7 @@ BREAKAGES = [
     ("outbox_not_replayed", "the outbox file is never read back"),
     ("outbox_not_wired", "serve keeps the outbox in memory"),
     ("all_or_nothing", "a failed send keeps what was already taken"),
+    ("skips_a_failed_part", "the flush sends past a part that did not get through"),
     ("one_log_post", "an outage's log events go in one request"),
     ("no_split_on_413", "a chunk answered 413 is dropped"),
     ("no_last_send", "serve stops without a last send"),
