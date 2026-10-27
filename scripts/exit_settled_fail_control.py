@@ -33,6 +33,15 @@ not known to stay down for one.
   other_case_answer          a settled answer for another case opens this gate.
   receipt_before_vend        the text receipt is sent before the barrier opens.
   loop_flicker_drops         one clear sample of the loop drops the waiting car's case.
+  rolled_on_car_let_out      a car that rolls on unarmed leaves on the backed-off car's case.
+  flicker_ends_case          any clear sample ends the case's right to open.
+  loop_sampled_slowly        the loop is sampled too seldom to tell a flicker from a car gone.
+  busy_reader_never_told     a reader stuck on `reader_busy` alerts nobody.
+  unpriced_case_reader_driven  the lane drives its reader for a case car it could not price.
+  pay_answer_not_owned       a /pay answer for another case is taken for this one.
+  first_answer_not_owned     the case's first answer is not checked against the car's event.
+  route_busy_after_already_completed  the vend route stays busy after `already_completed`.
+  cancel_before_next_frames  the last car's cancel holds up the next car's frames.
 """
 
 from __future__ import annotations
@@ -74,6 +83,21 @@ BREAKAGES = [
     ("other_case_answer", "a settled answer naming another case opens this gate"),
     ("receipt_before_vend", "the text receipt is sent before the barrier opens"),
     ("loop_flicker_drops", "one clear sample of the arming loop drops the waiting car's case"),
+    ("rolled_on_car_let_out",
+     "a car that rolls on unarmed after the paid car backed off leaves on that car's case"),
+    ("flicker_ends_case", "any clear sample of the loop ends the case's right to open"),
+    ("loop_sampled_slowly",
+     "the loop is sampled too seldom, while a car waits, to tell a flicker from a car gone"),
+    ("busy_reader_never_told", "a reader that answers reader_busy for good alerts nobody"),
+    ("unpriced_case_reader_driven",
+     "the lane drives its reader screen for a case car it could not price"),
+    ("pay_answer_not_owned", "a settled /pay answer for another case opens this gate"),
+    ("first_answer_not_owned",
+     "the case's first answer is taken without checking the car's own event"),
+    ("route_busy_after_already_completed",
+     "the vend route stays busy for good after refusing already_completed"),
+    ("cancel_before_next_frames",
+     "the last car's payment comes off the reader before the next car's frames are taken"),
 ]
 
 

@@ -64,11 +64,14 @@ class SettlesEveryExit:
     holds the exit side still. Handed only to a tree whose lane takes one, so
     the script still runs against a `main` that has no exit case."""
 
-    def open_exit(self, **_):
-        return {"id": "exit-matrix", "settled": True, "why": "paid"}
+    event_id = None
+
+    def open_exit(self, *, event_id, **_):
+        self.event_id = event_id
+        return {"id": "exit-matrix", "event_id": event_id, "settled": True, "why": "paid"}
 
     def get_exit(self, exit_id):
-        return {"id": exit_id, "settled": True, "why": "paid"}
+        return {"id": exit_id, "event_id": self.event_id, "settled": True, "why": "paid"}
 
 
 def build(*, direction="entry", closing_loops=2, crossings=(), identities=(), arrivals=1):

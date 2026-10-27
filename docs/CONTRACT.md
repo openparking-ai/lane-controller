@@ -434,17 +434,25 @@ driver's word for when they came in, or let out by a person.
   two local times it was. `fallback_needs_human` is recorded once each time
   the case needs a person (`needs`: `person`, `unanswered` when the platform
   could not be reached, `refused` when it would not act or answered for
-  another case (`another_exit_case`), `payment_attempts` with `attempts` once
-  the fee has reached the reader three times unpaid, `left` when the car left
-  the loop unsettled). A car counts as gone when the arming loop has read
+  another case or another event (`another_exit_case`: every answer must name
+  the case's id and the car's own `event_id`), `payment_attempts` with
+  `attempts` once the fee has reached the reader three times unpaid,
+  `reader_busy` after five `reader_busy` answers in a row, `left` when the car
+  left the loop unsettled). A car counts as gone when the arming loop has read
   clear for two seconds; while it reads clear the case is not moved on, and a
-  car that left is let out by nobody here.
+  car that left is let out by nobody here. A clear of half a second or more
+  that ends with the loop occupied again also drops the case (`left`): the car
+  on the loop may be another one that rolled on without arming, and it is read
+  when it arms. While a car waits the loop is sampled every quarter second, so
+  a flicker reads as one clear sample.
 - **The reader is the platform's** once it has handed the case's PaymentIntent
   to it: the lane does not drive its own reader screen for that car, before or
   after the vend. A case the lane lets go of without opening for it (the car
   left, the next car arrived, a person opened at the lane) has its payment
   taken off the reader through the platform (`POST
-  /api/v1/lane/exits/:id/pay/cancel`), best effort.
+  /api/v1/lane/exits/:id/pay/cancel`), best effort. When the next car arrived,
+  that call is made after the next car's frames are taken: before its case can
+  hand a fee to the reader, and after the barrier for a car with no case.
 - **When it is settled**, the barrier opens, `vended` names the case, and the
   stay's close names it too. Then a text receipt goes to the phone the driver
   gave, once, best effort: after the barrier, never before it.
@@ -465,7 +473,7 @@ cannot stand behind opens a case with no ID fields: that excludes no stay, and
 the platform's picker or the driver's word decides. The positioned characters
 are passed on unchecked until the identity service's contract for them lands.
 `tests/test_exit_case.py` holds this, and `scripts/exit_settled_fail_control.py`
-breaks it twenty-eight ways.
+breaks it thirty-seven ways.
 
 ### The transit
 

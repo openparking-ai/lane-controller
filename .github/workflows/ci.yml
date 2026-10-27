@@ -318,7 +318,13 @@ jobs:
           # offset, a refusal or a truthy `settled` or another case's answer
           # taken as settled, the case opening after a person took it, the
           # receipt before the barrier, one clear loop sample dropping the
-          # case -- and requires the exit-case suite to fail each time.
+          # case; a car rolled on unarmed let out on the backed-off car's
+          # case, any clear ending the case, the loop sampled too seldom, a
+          # stuck busy reader alerting nobody, the reader driven for an
+          # unpriced case car, a /pay or first answer for another case or
+          # event taken, the vend route left busy, the last car's cancel
+          # before the next car's frames -- and requires the exit-case suite
+          # to fail each time.
           - exit_settled
     steps:
       - uses: actions/checkout@v4

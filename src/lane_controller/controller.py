@@ -242,6 +242,8 @@ class LaneController:
         #: The case whose fee the platform handed to this lane's reader: until
         #: its car's close the lane does not drive the reader for it.
         self._reader_case: str | None = None
+        #: A dropped case whose payment is still to come off the reader.
+        self._left_on_reader: exit_case.ExitCase | None = None
         # The banned-car comparison (U7f). None: this lane refuses no car as
         # banned, whatever list it holds.
         self.banned_matcher = banned_matcher
@@ -554,8 +556,10 @@ class LaneController:
         """One vehicle, from arming to vend. Assumes the loop has already armed."""
         lane = self.config.lane_id
         # A loop reports one arrival per vehicle: a new one is a new car, and
-        # the one before it left with its case unsettled.
-        self._leave_exit_case("a new car arrived before the exit was settled")
+        # the one before it left with its case unsettled. Its payment comes
+        # off the reader after this car's frames are taken and before this
+        # car's own fee can reach the reader (`_free_reader`).
+        self._drop_exit_case("a new car arrived before the exit was settled")
 
         frames = self.camera.grab(self.config.camera.frames_per_read)
         self.events.record("frames_captured", lane, count=len(frames), camera=self.camera.camera_id)
@@ -785,8 +789,10 @@ class LaneController:
             )
 
         # Best effort, and after the barrier has already been told what to do.
-        # Nothing above this line waits on the network.
+        # Nothing above this line waits on the network. A car with no case of
+        # its own takes the last car's payment off the reader only now.
         self.deliver()
+        self._free_reader()
         return decision
 
     # ------------------------------------------------------------------
@@ -931,6 +937,8 @@ class LaneController:
         # under the case's own event and sent before the case is opened.
         self.events.queue_pictures(case.event_id, frames)
         self.deliver()
+        # The last car's payment off the reader before this car's can go on.
+        self._free_reader()
         if self._step(case) == exit_case.SETTLED:
             if not decision.should_vend:
                 decision = replace(
@@ -980,12 +988,18 @@ class LaneController:
             need = "refused"
         elif (
             case.needs == exit_case.NEEDS_PAYMENT
+            and case.busy >= exit_case.EXIT_READER_BUSY
+        ):
+            need = exit_case.NEEDS_READER_BUSY
+        elif (
+            case.needs == exit_case.NEEDS_PAYMENT
             and case.attempts >= exit_case.EXIT_PAY_ATTEMPTS
         ):
             need = exit_case.NEEDS_PAY_ATTEMPTS
         else:
             need = case.needs
-        told = ("unanswered", "refused", exit_case.NEEDS_PERSON, exit_case.NEEDS_PAY_ATTEMPTS)
+        told = ("unanswered", "refused", exit_case.NEEDS_PERSON, exit_case.NEEDS_PAY_ATTEMPTS,
+                exit_case.NEEDS_READER_BUSY)
         if need in told and need != case.told:
             case.told = need
             self.events.record(
@@ -1031,23 +1045,47 @@ class LaneController:
         loop. A car that has left -- the loop clear for `EXIT_LEFT_SECONDS`
         -- leaves its case to a person. While the loop reads clear and that
         time has not passed, the case is not moved on: nothing opens for a
-        car the loop does not see."""
+        car the loop does not see.
+
+        A CLEAR LONGER THAN A FLICKER ENDS THE CASE'S RIGHT TO OPEN. The loop
+        occupied again after reading clear for `EXIT_FLICKER_SECONDS` or more
+        may be another car that rolled on without arming, and a case settled
+        for the car that backed off would open the barrier for it. The case is
+        dropped and left to a person; the car on the loop is read when it
+        arms. A clear shorter than that is a flicker, and the case goes on."""
+        self._free_reader()
         case = self._exit_case
         if case is None:
             return
+        now = self._clock()
         if not self.loop.is_occupied():
-            now = self._clock()
             if case.clear_since is None:
                 case.clear_since = now
             if now - case.clear_since >= exit_case.EXIT_LEFT_SECONDS:
                 self._leave_exit_case("the car left the exit before it was settled")
             return
-        case.clear_since = None
+        if case.clear_since is not None:
+            cleared_for, case.clear_since = now - case.clear_since, None
+            if cleared_for >= exit_case.EXIT_FLICKER_SECONDS:
+                self._leave_exit_case(
+                    "the arming loop read clear under the waiting car for longer than a "
+                    "flicker; the car on it now was not read"
+                )
+                return
         self._advance_exit_case(case)
 
     def _leave_exit_case(self, reason: str) -> None:
+        """Drop the waiting case, if any, and take its payment off the reader."""
+        self._drop_exit_case(reason)
+        self._free_reader()
+        self.deliver()
+
+    def _drop_exit_case(self, reason: str) -> None:
         """Drop the waiting case, if any, and say so: the platform keeps it for
-        a person, and nothing opens for it here."""
+        a person, and nothing opens for it here. A case that handed its fee to
+        the reader is held for `_free_reader`, which takes its payment off
+        through the platform; the lane drives the reader only when it never
+        did."""
         with self._exit_lock:
             case, self._exit_case = self._exit_case, None
         if case is None:
@@ -1062,17 +1100,23 @@ class LaneController:
         )
         if self.exit_display is not None:
             self.exit_display.show_exit(None)
-        # A case that handed its fee to the reader has its payment taken off
-        # through the platform, before the next car's case can be sent to it;
-        # the lane drives the reader only when it never did.
         if case.sent_at is None:
             self.show_reader(None)
-        else:
-            self._note_exit_screen(None)
-            exit_case.cancel_on_reader(case, self.exits)
-            if self._reader_case == case.exit_id:
-                self._reader_case = None
-        self.deliver()
+            return
+        self._note_exit_screen(None)
+        self._free_reader()
+        self._left_on_reader = case
+
+    def _free_reader(self) -> None:
+        """Take a dropped case's payment off the reader (`cancel_on_reader`):
+        before the next car's fee can reach the reader, and after that car's
+        frames are taken, so a slow platform does not hold up the read."""
+        case, self._left_on_reader = self._left_on_reader, None
+        if case is None:
+            return
+        exit_case.cancel_on_reader(case, self.exits)
+        if self._reader_case == case.exit_id:
+            self._reader_case = None
 
     # ------------------------------------------------------------------
     # From the vend to the session, or to one of the three other answers.
@@ -2249,7 +2293,17 @@ class LaneController:
         them. One loop alone arms nothing, and it is RECORDED -- a lane being
         worked by somebody laying metal on a loop shows up as a pattern in the
         log rather than as silence.
+
+        While a car waits on its exit case the turn is no longer than
+        `EXIT_SAMPLE_SECONDS`, so a loop flicker under it reads as one clear
+        sample and a car that backed off reads as more (`observe_exit_case`).
         """
+        if self._exit_case is not None:
+            timeout = (
+                exit_case.EXIT_SAMPLE_SECONDS
+                if timeout is None
+                else min(timeout, exit_case.EXIT_SAMPLE_SECONDS)
+            )
         if not self.loop.wait_for_vehicle(timeout=timeout):
             # SAMPLED ON EVERY POLL, arrival or not. A loop that is reading
             # occupied with nothing on it never produces an arrival, so the

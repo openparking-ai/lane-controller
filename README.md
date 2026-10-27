@@ -193,21 +193,27 @@ the barrier stays down, the lane hands the fee to its card reader or passes on
 the driver's entry time from the exit display, and the barrier opens when the
 platform says the case is settled — paid, priced on the driver's word, or let
 out by a person. A car that leaves the loop unsettled (clear for two seconds),
-and every case with the platform down, is a person's (`fallback_needs_human`).
+a loop that reads clear for longer than a flicker (half a second) and then
+occupied again — perhaps another car, rolled on without arming — and every case
+with the platform down, is a person's (`fallback_needs_human`); while a car
+waits the loop is sampled every quarter second.
 Once the platform has put the case's PaymentIntent on the reader the lane does
 not drive the reader for that car, and a case the lane lets go of — the car
 left, the next car arrived, a person opened at the lane — has its payment taken
 off the reader through the platform (`/exits/:id/pay/cancel`); a person's
-close names the case. The fee is offered to the reader again while it waits
-for a card, and a person is told after three attempts. The driver's entry time
-must carry a timezone offset or the lane refuses it.
+close names the case. The last car's payment comes off the reader after the
+next car's frames are taken, and before the next car's fee goes on it. The fee
+is offered to the reader again while it waits for a card, and a person is told
+after three attempts, or after five `reader_busy` answers in a row. An answer
+opens nothing unless it names the case and the car's own event. The driver's
+entry time must carry a timezone offset or the lane refuses it.
 **The car's ID is empty in practice today:** the identity service does not yet
 fill the positioned plate characters, colour code or size, so a plate the lane
 cannot stand behind opens a case with no ID fields, every open stay of the
 garage is a candidate, and the case goes to the picker (ten or fewer) or to
 the driver's word. Checking `plate_characters` at this seam waits for the
 identity service's contract for it. `tests/test_exit_case.py` holds all of it
-and `scripts/exit_settled_fail_control.py` breaks it twenty-eight ways.
+and `scripts/exit_settled_fail_control.py` breaks it thirty-seven ways.
 **And the close carries that
 decision** (`local_decision` on the session close, the whole of the `decision`
 event's `exit_pricing`, unedited, handed down from the car's own decision and

@@ -3817,5 +3817,80 @@ def _break_the_settled_exit(monkeypatch):
         # The text receipt the driver asked for is never sent.
         monkeypatch.setattr(case_module, "send_receipt", lambda case, platform, display: False)
 
+    elif mode == "rolled_on_car_let_out":
+        # A clear of any length under the two seconds is taken for a flicker:
+        # a car that rolls on unarmed after the paid car backed off leaves on
+        # that car's case.
+        monkeypatch.setattr(case_module, "EXIT_FLICKER_SECONDS", float("inf"))
+
+    elif mode == "flicker_ends_case":
+        # Any clear sample ends the case's right to open, flicker or not.
+        monkeypatch.setattr(case_module, "EXIT_FLICKER_SECONDS", 0.0)
+
+    elif mode == "loop_sampled_slowly":
+        # The loop is sampled at the caller's turn while a car waits, too
+        # seldom to tell a flicker from a car that backed off.
+        monkeypatch.setattr(case_module, "EXIT_SAMPLE_SECONDS", float("inf"))
+
+    elif mode == "busy_reader_never_told":
+        # A reader that answers `reader_busy` for good keeps the car waiting
+        # and nobody is told.
+        monkeypatch.setattr(case_module, "EXIT_READER_BUSY", 10**9)
+
+    elif mode == "unpriced_case_reader_driven":
+        # The lane drives its reader screen for a case car it could not
+        # price, taking the platform's PaymentIntent off the reader.
+        original = LaneController._note_exit_screen
+
+        def drives_unpriced(self, record):
+            original(self, record)
+            case = self._exit_case
+            if case is not None and case.session_id is None and self.reader is not None:
+                self.reader.present_exit(record)
+
+        monkeypatch.setattr(LaneController, "_note_exit_screen", drives_unpriced)
+
+    elif mode == "pay_answer_not_owned" or mode == "first_answer_not_owned":
+        # The answer to the /pay (or to the case's opening) is taken without
+        # checking it is this case's, under this car's own event.
+        import sys
+
+        original = case_module._own
+        unchecked = "_act" if mode == "pay_answer_not_owned" else "advance"
+
+        def owned_elsewhere(case, answer):
+            if sys._getframe(1).f_code.co_name == unchecked:
+                return answer
+            return original(case, answer)
+
+        monkeypatch.setattr(case_module, "_own", owned_elsewhere)
+
+    elif mode == "route_busy_after_already_completed":
+        # The vend route stays `busy` for good after it refused
+        # `already_completed`: no person can open for the next car.
+        from lane_controller.contract import VendRefusal
+        from lane_controller.vend import AssistedVend
+
+        original = AssistedVend._accept
+
+        def stays_taken(self, request):
+            status, body = original(self, request)
+            if body.get("code") == VendRefusal.ALREADY_COMPLETED.value:
+                self._in_progress = True
+            return status, body
+
+        monkeypatch.setattr(AssistedVend, "_accept", stays_taken)
+
+    elif mode == "cancel_before_next_frames":
+        # The last car's payment comes off the reader before the next car's
+        # frames are taken, so a slow platform holds up the read.
+        original = LaneController._drop_exit_case
+
+        def at_once(self, reason):
+            original(self, reason)
+            self._free_reader()
+
+        monkeypatch.setattr(LaneController, "_drop_exit_case", at_once)
+
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_SETTLED mode: {mode}")

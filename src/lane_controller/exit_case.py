@@ -29,7 +29,10 @@ the lane (`POST /v1/lane/vend`) or on the platform (the case's let-out).
 ONE CAR AT A TIME. A case is advanced on the lane's idle turns while the car
 is still on the arming loop, the platform asked at most every
 `EXIT_POLL_SECONDS` (the platform reads Stripe at most that often). A car
-that leaves the loop leaves its case to a person; nothing opens for it.
+that leaves the loop leaves its case to a person; nothing opens for it. Nor
+for a car that rolled on after it: a loop that read clear for longer than a
+flicker and is occupied again drops the case, since the car on it was not
+read.
 
 WHAT TRAVELS. The case carries the car's ID fields (`id_fields`) and nothing
 of the plate text. A low-confidence plate gives no characters at all: an ID
@@ -49,7 +52,7 @@ or a clear it put up would take the intent off the reader. A case the lane
 lets go of without opening for it -- the car left, a new car arrived, a
 person opened at the lane -- has its payment taken off the reader through
 the platform (`cancel_on_reader`), so the next car is never shown this
-car's fee.
+car's fee: after the next car's frames are taken, before its fee goes on.
 """
 
 from __future__ import annotations
@@ -84,6 +87,20 @@ EXIT_PAY_ATTEMPTS = 3
 #: and a paid car whose case is dropped needs a person to get out.
 EXIT_LEFT_SECONDS = 2.0
 
+#: The longest clear a loop flicker is taken to be. A clear at least this
+#: long that ends with the loop occupied again may be another car rolled on
+#: unarmed, so the case is dropped rather than opened for whoever is there.
+EXIT_FLICKER_SECONDS = 0.5
+
+#: How often the arming loop is sampled while a car waits on its case: short
+#: enough that a flicker reads as one clear sample, under `EXIT_FLICKER_SECONDS`.
+EXIT_SAMPLE_SECONDS = 0.25
+
+#: How many `reader_busy` answers in a row before a person is told the reader
+#: is stuck: at `EXIT_RESEND_SECONDS` apart, half a minute of a reader that
+#: never frees up.
+EXIT_READER_BUSY = 5
+
 #: The platform's refusals of a `/pay` that are not refusals of the case: the
 #: reader still has the intent (`reader_busy`), or it was paid since the case
 #: was last asked about (`exit_settled`).
@@ -103,6 +120,10 @@ NEEDS_PERSON = "person"
 #: What a person is told when the fee reached the reader `EXIT_PAY_ATTEMPTS`
 #: times and the case is still not paid.
 NEEDS_PAY_ATTEMPTS = "payment_attempts"
+
+#: What a person is told when the reader answered `reader_busy`
+#: `EXIT_READER_BUSY` times in a row.
+NEEDS_READER_BUSY = "reader_busy"
 
 #: What `advance` answers.
 SETTLED = "settled"
@@ -178,6 +199,8 @@ class ExitCase:
     paid_after: str | None = None
     #: How many times the reader took the fee (`sent` true or unknown).
     attempts: int = 0
+    #: How many `reader_busy` answers in a row the last sends got.
+    busy: int = 0
     #: When the arming loop first read clear under the waiting car, or None.
     clear_since: float | None = None
     word_given: bool = False
@@ -213,9 +236,12 @@ class ExitCase:
 
 
 def _own(case: ExitCase, answer: dict) -> dict:
-    """The answer, when it is about this case. An answer naming another case
+    """The answer, when it is about this case: its id, and the car's own event
+    the case was opened under. An answer naming another case or another event
     -- settled or not -- says nothing about this car, and opens nothing."""
-    if answer.get("id") != case.exit_id:
+    if answer.get("event_id") != case.event_id or (
+        case.exit_id is not None and answer.get("id") != case.exit_id
+    ):
         raise PlatformRejected(None, "the platform answered another exit case", OTHER_CASE)
     return answer
 
@@ -241,12 +267,12 @@ def advance(case: ExitCase, platform, display: ExitDisplay | None, *, now: float
     """
     try:
         if case.exit_id is None:
-            case.answer = platform.open_exit(
+            case.answer = _own(case, platform.open_exit(
                 event_id=case.event_id,
                 exit_at=case.exit_at,
                 session_id=case.session_id,
                 id_fields=case.fields,
-            )
+            ))
             case.exit_id = case.answer["id"]
         elif case.asked_at is not None and now - case.asked_at < EXIT_POLL_SECONDS:
             return SETTLED if case.settled else WAITING
@@ -297,10 +323,13 @@ def _act(case: ExitCase, platform, display: ExitDisplay | None, *, now: float) -
         except PlatformRejected as err:
             if err.code not in _PAY_NOT_REFUSED:
                 raise
+            if err.code == "reader_busy":
+                case.busy += 1
             case.sent_at = now
             return
         case.answer = _own(case, answer)
         case.sent_at = now
+        case.busy = 0
         case.paid_after = failure
         if sent is True or sent == "unknown":
             case.attempts += 1
