@@ -70,6 +70,11 @@ class FakePlatform:
         #: When True, `get_stays` leaves both out: a platform that carries them
         #: on the slow read only. The fail-control's plant, and a test's.
         self.lane_on_slow_read_only = False
+        #: What `redeem_enrolment` answers, and how many QRs were presented.
+        self.qr_answer: dict = {"open": False, "outcome": "not_covered",
+                                "enrolment": {"refused": "REFUSAL_CREDENTIAL_UNKNOWN"},
+                                "answer": {"outcome": "not_covered"}}
+        self.qr_presentations = 0
 
     def _lane_fields(self, *, fast: bool) -> dict:
         if fast and self.lane_on_slow_read_only:
@@ -147,6 +152,13 @@ class FakePlatform:
                 self.stays[i] = {**s, "open": False, "change_seq": str(self.cursor)}
                 return self.stays[i]
         raise KeyError(session_id)
+
+    def redeem_enrolment(self, token: str, vehicle: str | None, presented_at: str) -> dict:
+        """`POST /lane/redeem-enrolment`: the answer a test set in
+        `qr_answer`, or the gate shut on an unknown QR. The token is not kept."""
+        self._check()
+        self.qr_presentations += 1
+        return dict(self.qr_answer)
 
     def post_events(self, events: list[dict]) -> dict:
         self._check()

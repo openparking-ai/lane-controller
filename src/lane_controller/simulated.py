@@ -214,3 +214,17 @@ class ExactBannedMatcher:
     def match(self, descriptor: str, banned) -> str | None:
         self.asked += 1
         return next((b["id"] for b in banned if b["descriptor"] == descriptor), None)
+
+
+class SimulatedQrScanner:
+    """A `QrScanner` a test or the demo scans into: `scan(text)` is a driver
+    holding a QR up; `poll()` hands it to the lane once."""
+
+    def __init__(self) -> None:
+        self._scanned: list[str] = []
+
+    def scan(self, text: str) -> None:
+        self._scanned.append(text)
+
+    def poll(self) -> str | None:
+        return self._scanned.pop(0) if self._scanned else None

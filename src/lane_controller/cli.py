@@ -49,6 +49,7 @@ from .simulated import (
     RecordingVendOutput,
     ScriptedClosingLoops,
     SimulatedLoopInput,
+    SimulatedQrScanner,
     StubVehicleIdentifier,
 )
 from .sync import PlatformTransport
@@ -264,6 +265,18 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
     seams["barrier"] = (
         "SIMULATED (this package ships no relay driver: nothing here vends a barrier)"
     )
+    # THE QR SCANNER: presented through the platform, so a standalone lane
+    # reads none. This package ships no scanner driver.
+    if platform is not None:
+        qr_scanner = SimulatedQrScanner()
+        qr_presenter = platform.redeem_enrolment
+        seams["qr"] = (
+            "SIMULATED (this package ships no scanner driver); a scan is presented to "
+            f"{platform.base_url}"
+        )
+    else:
+        qr_scanner = qr_presenter = None
+        seams["qr"] = "NONE (standalone: a QR can only be checked through the platform)"
     controller = LaneController(
         config,
         loop=SimulatedLoopInput(arrivals=0),
@@ -276,6 +289,8 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
         cache=cache,
         events=events,
         banned_matcher=banned_matcher,
+        qr_scanner=qr_scanner,
+        qr_presenter=qr_presenter,
     )
     return WiredLane(controller, platform, seams)
 

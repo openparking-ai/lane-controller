@@ -233,6 +233,16 @@ jobs:
           # car no register covers; no disk on the car's path. Each broken, and
           # requires tests/test_entry_always_a_stay.py to fail each time.
           - entry_stay
+          # QR fail-control (Phase 1b)
+          # A registration QR scanned for the car the lane just refused: the
+          # gate opening on anything but covered, a QR overruling the owner or
+          # letting in a banned car, presented for an empty lane or twice, the
+          # unsure read withheld, an unchecked QR unrecorded or recorded twice,
+          # the token or the plate on the event or in the log, the exit's case
+          # lost or a closed exit opened, the client's route and the 503's
+          # name, the wiring. Each broken in a copy of the tree, and requires
+          # tests/test_qr_scanner.py to fail each time.
+          - qr
           # Deactivate-loop fail-control
           # Breaks the third loop's guarantees on purpose -- the level (an edge
           # deadlocks two queued cars), each end of the held interval, its

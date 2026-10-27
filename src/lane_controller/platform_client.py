@@ -21,7 +21,16 @@ from typing import Any
 
 
 class PlatformUnreachable(Exception):
-    """Network failure, timeout, or a 5xx. Retryable -- keep the work queued."""
+    """Network failure, timeout, or a 5xx. Retryable -- keep the work queued.
+
+    `status` and `code` are set for a 5xx that carried them, and None for
+    everything else: the QR presentation tells the pass module's own
+    could-not-answer (`503 qr_unanswered`) from a platform that is down."""
+
+    def __init__(self, message: str, *, status: int | None = None, code: str | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
 
 
 #: The name the platform's clock-skew refusal carries in its error body.
@@ -124,7 +133,9 @@ class PlatformClient:
             if err.code >= 500:
                 # The platform is having a bad time. That is the same situation
                 # as it being unreachable, from the lane's point of view.
-                raise PlatformUnreachable(f"HTTP {err.code}: {body}") from err
+                raise PlatformUnreachable(
+                    f"HTTP {err.code}: {body}", status=err.code, code=_refusal_code(body)
+                ) from err
             raise PlatformRejected(err.code, body, _refusal_code(body)) from err
         except (urllib.error.URLError, TimeoutError, OSError) as err:
             raise PlatformUnreachable(str(err)) from err
@@ -323,6 +334,23 @@ class PlatformClient:
             {"phone": phone, "local_decision": local_decision},
         )
         return answer.get("validation") if isinstance(answer, dict) else None
+
+    def redeem_enrolment(self, token: str, vehicle: str | None, presented_at: str) -> dict:
+        """A registration QR scanned at this lane, presented with the identity
+        the camera read (None when it read none) and when. The platform asks
+        the pass module and answers `{open, outcome, enrolment, answer}`:
+        `open` on covered and on nothing else.
+
+        THE TOKEN IS IN THIS REQUEST BODY AND NOWHERE ELSE: nothing here keeps
+        it or logs it, and the platform names no token in a refusal. Raises as
+        every call does: `PlatformUnreachable` (offline, or `503
+        qr_unanswered` when the module could not answer), `PlatformRejected`
+        (`409 qr_not_linked`, `409 qr_stale`, `429`)."""
+        return self._request(
+            "POST",
+            "/api/v1/lane/redeem-enrolment",
+            {"token": token, "vehicle": vehicle, "presented_at": presented_at},
+        )
 
 
 def _refusal_code(body: str) -> str | None:

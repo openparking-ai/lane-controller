@@ -387,6 +387,23 @@ class VehicleIdentifier(Protocol):
     def identify(self, frames: Sequence[Frame]) -> VehicleIdentity: ...
 
 
+class QrScanner(Protocol):
+    """The lane's QR scanner: what a driver holds up to it, as text.
+
+    A registration QR the pass module issued (garage-pass `issue-enrolment`).
+    This package does not read what the text means -- it is a credential the
+    platform presents to the module for this lane -- and KEEPS IT NOWHERE: not
+    in an event, not in a log line, not on disk. A driver, real or simulated,
+    hands it over once and forgets it.
+    """
+
+    def poll(self) -> str | None:
+        """The text of a QR scanned since the last poll, or None. Never blocks,
+        and consumes what it returns: a scan is handed over once. Called on the
+        lane's idle turns, the thread the barrier's own reads run on."""
+        ...
+
+
 class BannedMatcher(Protocol):
     """Whether an arriving car is one the garage banned (U7f).
 

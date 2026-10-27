@@ -90,6 +90,22 @@ EXIT_BACKED_IN = "exit_backed_in"
 EXIT_HELD = "exit_held"
 EXIT_UNCONFIRMABLE = "exit_unconfirmable"
 
+#: A registration QR this lane could NOT present: the platform out of reach,
+#: or refusing the presentation itself. Detail: `answered: false`, `reason`,
+#: `direction`, `read_identity` -- the platform refuses any other key, and
+#: never the token or a plate. A QR the platform answered is recorded by the
+#: platform. AHEAD OF THE PLATFORM, like `entry_unadmitted`: the platform's
+#: `LANE_EVENT_KINDS` carries it from the same release.
+QR_PRESENTED = "qr_presented"
+#: The platform's names for a presentation it could not take (`POST
+#: /lane/redeem-enrolment`): the pass module could not answer (503), the
+#: garage names no pass-module garage, the scan is older than the car.
+QR_UNANSWERED = "qr_unanswered"
+QR_NOT_LINKED = "qr_not_linked"
+QR_STALE = "qr_stale"
+#: The relay's reason, and the `vended` event's, for a gate a QR opened.
+REASON_QR_OPENED = "registration_qr_covered"
+
 #: Why an entry or an exit ended the way it did. One reason per outcome, and
 #: the reason travels to the platform with the session so the money record can
 #: say what confirmed it.

@@ -385,15 +385,19 @@ not change; how often each member appears does.
 - **A monthly/pass-only garage** decides `allow` for a car its registers cover
   today and `deny` for every other car whose plate it read with confidence,
   full or not. `human_open_now` overrides that `deny` exactly as it overrides
-  any (see `not_completable` below); a display code does not. Where a scanned
-  registration QR will be presented is that `deny`; this version has no scanner.
-  Until there is one, a car whose pass this lane cannot confirm -- its plate
-  unread or read below the confidence (`low_confidence`, `no_plate_read`,
-  `engine_unreachable`), or no register held at all (`stale_rules`) -- is
-  decided `fallback`, a person's case, and at such a garage's entry
-  **`display_code_confirmed` is refused `not_completable`**, as at a closed lane:
-  a display code is a driver serving themselves, and this garage takes no
-  stranger.
+  any (see `not_completable` below); a display code does not. A car whose pass
+  this lane cannot confirm -- its plate unread or read below the confidence
+  (`low_confidence`, `no_plate_read`, `engine_unreachable`), or no register held
+  at all (`stale_rules`) -- is decided `fallback`, a person's case, and at such a
+  garage's entry **`display_code_confirmed` is refused `not_completable`**, as at
+  a closed lane: a display code is a driver serving themselves, and this garage
+  takes no stranger. **A registration QR** the driver scans while the car is
+  still at the arming loop may open either refusal, when the garage is not
+  full: the lane presents it through the platform to the pass module and opens
+  on `covered` only. That open is not on this contract as a new decision: the
+  refused decision stays the last one, `decision.completed` becomes its time,
+  and `vended` carries `registration_qr_covered`. A person's completion of the
+  same decision afterwards is refused `already_completed`, as for any.
 - **A garage that has not stated it**, and **every exit**, decide as before.
 
 Whatever was decided, every car the loops see go in -- the one the lane opened

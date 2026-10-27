@@ -8,10 +8,11 @@ THE ENTRY, BY WHAT THE GARAGE TAKES. The owner's rule, 2026-10-26: a garage
 that takes transients opens for every car -- the pictures and what was seen
 are the record, and there is no reason not to open -- and a garage that is
 monthly and pass only opens for the cars its registers cover today and keeps
-the gate shut for every other. Until a registration QR can be scanned at the
-lane, a pass-only garage's car whose pass this lane cannot confirm -- its
-plate unread or read below the confidence, or no register held -- goes to a
-person. So at an entry lane whose garage has STATED which it is
+the gate shut for every other. A pass-only garage's car whose pass this lane
+cannot confirm -- its plate unread or read below the confidence, or no
+register held -- goes to a person, unless the driver scans the car's
+registration QR (`qr_may_open`, which also covers the car no register
+covers). So at an entry lane whose garage has STATED which it is
 (`transient_available`, `garage_admits`), the decision is `_decide_entry`:
 low confidence, no plate read, an unknown vehicle, an engine that did not
 answer and rules past their age are not reasons to call a person at a garage
@@ -27,7 +28,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from .interfaces import VehicleIdentity
@@ -150,10 +151,35 @@ class Decision:
     #: fallback, or on a lane built before this existed. Not part of the read
     #: contract yet: the display round is what publishes it.
     exit_pricing: object | None = None
+    #: A refusal a registration QR may still turn into an open: a pass-only
+    #: garage's car no register covers, or whose pass this lane could not
+    #: confirm (`_decide_entry`). Set where the decision is made and nowhere
+    #: else; `qr_may_open` adds the exit's case.
+    qr_may_open: bool = False
 
     @property
     def should_vend(self) -> bool:
         return self.outcome is Outcome.ALLOW
+
+
+def qr_may_open(decision: Decision, direction: str | None) -> bool:
+    """Whether a QR scanned for this decision's car may be presented.
+
+    At an entry, only the refusals `_decide_entry` marks: a pass-only garage's
+    car that no register covers or whose pass could not be confirmed. Never a
+    banned car, an owner's deny rule, a full garage or a lane closed to
+    everyone -- the QR registers a car, it does not overrule the owner. At an
+    exit, any car the lane did not let out but a closing: the module decides
+    whether this garage enrols there (`set-garage-enrols-at exit`), and at an
+    exit it is never refused, only covered or not.
+    """
+    if decision.should_vend or decision.outcome is Outcome.NO_VEHICLE:
+        return False
+    if direction == "exit":
+        return (
+            decision.outcome is Outcome.FALLBACK and decision.fallback is not Fallback.LANE_CLOSED
+        )
+    return decision.qr_may_open
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,14 +249,13 @@ ADMITS_TRANSIENTS = "transients"
 ADMITS_PASSES_ONLY = "passes_only"
 
 #: THE QR SEAM (Phase 1b). The reason a monthly/pass-only garage keeps the gate
-#: shut for a car: no register covers it today. This is the one entry decision
-#: a scanned registration QR will turn into an open -- the driver scans it at
-#: the lane's scanner, the lane presents it to the pass module's enrolment
-#: (`redeem-enrolment`: valid today, for this garage, spent once, one car), and
-#: a QR it accepts registers this car and opens. Not built: no scanner seam
-#: exists in this package yet, so today this DENY is final at the lane and a
-#: person's `human_open_now` is the one way past it (`vend.py`, as for any
-#: deny). Named here, once, so the scanner path has one place to plug in.
+#: shut for a car: no register covers it today. A decision a scanned
+#: registration QR may turn into an open (`qr_may_open`): the driver scans it
+#: at the lane's scanner, the lane presents it through the platform to the pass
+#: module's enrolment (`redeem-enrolment`: valid today, for this garage, spent
+#: once, one car), and a QR it answers covered for opens
+#: (`LaneController.observe_qr`). With no scanner, or the platform out of
+#: reach, the DENY stands and a person's `human_open_now` is the way past it.
 REASON_NOT_REGISTERED = "pass or monthly only; no pass or monthly register covers this car"
 
 
@@ -1057,8 +1082,9 @@ def registers_held(cache: DecisionCache) -> bool:
 
 def _not_confirmed(identity: VehicleIdentity, confidence_threshold: float) -> Decision:
     """A pass-only garage's car whose pass this lane cannot confirm, because
-    nobody could read its plate: to a person (the interim rule until the
-    registration QR is built). The fallback names why it was not read."""
+    nobody could read its plate: to a person, unless the driver scans the
+    car's registration QR (`qr_may_open`). The fallback names why it was not
+    read."""
     if identity.unavailable is not None:
         fallback = Fallback.ENGINE_UNREACHABLE
     elif not identity.plate:
@@ -1071,6 +1097,7 @@ def _not_confirmed(identity: VehicleIdentity, confidence_threshold: float) -> De
         + _seen(identity, confidence_threshold, stale=False),
         identity=identity,
         fallback=fallback,
+        qr_may_open=True,
     )
 
 
@@ -1101,8 +1128,8 @@ def _decide_entry(
       3. every other car opens. What was seen goes in the reason, and the stay
          the car gets carries it (`LaneController._stay_identity`).
 
-    A MONTHLY / PASS-ONLY GARAGE -- the interim rule until a registration QR
-    can be scanned at the lane (Phase 1b):
+    A MONTHLY / PASS-ONLY GARAGE (1, 4 and 6 are the refusals a registration
+    QR scanned at the lane may still open -- `qr_may_open`):
       1. a plate nobody could read, or read below the confidence: its pass
          cannot be confirmed -- a person, the fallback naming why;
       2. full: a car a register covers today opens; with no register held, a
@@ -1152,7 +1179,7 @@ def _decide_entry(
         if rule is not None:
             return _by_rule(rule, identity)
         if not registers_held(cache):
-            return no_register
+            return replace(no_register, qr_may_open=True)
         if covered:
             return Decision(
                 outcome=Outcome.ALLOW,
@@ -1160,7 +1187,9 @@ def _decide_entry(
                 identity=identity,
             )
         # THE QR SEAM: see `REASON_NOT_REGISTERED`.
-        return Decision(outcome=Outcome.DENY, reason=REASON_NOT_REGISTERED, identity=identity)
+        return Decision(
+            outcome=Outcome.DENY, reason=REASON_NOT_REGISTERED, identity=identity, qr_may_open=True
+        )
 
     if full:
         if covered:

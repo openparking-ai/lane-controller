@@ -312,7 +312,7 @@ neither on the path between a car arriving and a barrier opening.
 | `sync_rules()` | the SLOW cadence: `GET /lane/rules` — the garage's rate plans whole, its space class, each entitlement module's register (verbatim; a module the platform could not read is NOT replaced with nothing) and the full set of open stays with a cursor. On failure it keeps the cache it had — a failed request is not a reason to forget good rules. |
 | `sync_stays()` | the FAST cadence: `GET /lane/stays?since=<cursor>` — every stay opened or closed since, closed rows included so the exit lane drops a car that left, paged and followed at once. A refusal drops the cursor so the next read takes the full set. It also carries this lane's closing and the owner's board, so a closing acts within one fast interval. |
 | `decide()` at a closed lane | closed to everyone: no car opens by itself, `fallback` / `lane_closed`. Closed `full` at an entry: a car a register covers today (the exit's own lookup, `register_cover`) gets in, every other identified car is `lane_closed`. A person's word through `POST /v1/lane/vend` opens it; a display code does not. |
-| `decide()` and the garage's settings | **At an entry, what the garage takes decides** (`garage_admits`). `transient_available: true`: every car opens -- unread, unknown, engine down, rules stale -- except full (a register-covered car still opens), closed to everyone, banned, an owner's rule against the plate, or nothing there. `transient_available: false` (**pass holders only**), at ANY default: a car a register covers today opens, every other car read with confidence is `deny` (`REASON_NOT_REGISTERED`, where a scanned registration QR will be presented, not built), full or not; a car whose pass cannot be confirmed (plate unread or unsure, no register held) is `fallback`, a person's case that a display code does not complete. An owner's rule for a plate comes before the registers, as it always did, and is applied only from a trusted cache. `true` with a default of `deny` is read as pass-only, the stricter reading. A payload without the field is the lane as it was: the default (`allow`, `deny`) and the fallback path. The default is an ENTRY rule: at an exit a car with no rule is let out, and `price_exit()` says covered, priced or not priceable here. Only a plate read at the lane's confidence is ever looked up, in a rule or a register (`plate_read`). |
+| `decide()` and the garage's settings | **At an entry, what the garage takes decides** (`garage_admits`). `transient_available: true`: every car opens -- unread, unknown, engine down, rules stale -- except full (a register-covered car still opens), closed to everyone, banned, an owner's rule against the plate, or nothing there. `transient_available: false` (**pass holders only**), at ANY default: a car a register covers today opens, every other car read with confidence is `deny` (`REASON_NOT_REGISTERED`), full or not; a car whose pass cannot be confirmed (plate unread or unsure, no register held) is `fallback`, a person's case that a display code does not complete. Both, when not full, are refusals a **registration QR** may still open (`qr_may_open`; see below). An owner's rule for a plate comes before the registers, as it always did, and is applied only from a trusted cache. `true` with a default of `deny` is read as pass-only, the stricter reading. A payload without the field is the lane as it was: the default (`allow`, `deny`) and the fallback path. The default is an ENTRY rule: at an exit a car with no rule is let out, and `price_exit()` says covered, priced or not priceable here. Only a plate read at the lane's confidence is ever looked up, in a rule or a register (`plate_read`). |
 | `board_items()` | the board on `GET /v1/lane/state`: the owner's messages in force on this lane's clock, then — when switched on — the price for 1, 2, 3 and 24 hours entering now, from `charge`, the same quote-and-tax call the exit charges with. |
 | `price_exit()` | the exit's local decision, from the cache alone: `covered`, `priced` (the engine in-process), `no_cached_entry`, or the engine's own refusal verbatim. Reads the registers with the garage's local day, and a monthly agreement's own days when its register carries them (start, pauses, the owner's block, the first day unpaid past grace); folds the plate and the registrar's identity to letters and digits, with O read as 0 and I as 1 because the plate reader outputs neither letter (an assumption, stated in `normalise_identity`). A stay whose close the lane records leaves its list, so a car that pulls forward again is not priced twice. |
 | `LaneRunner` | the production loop. The lane thread calls `run_once` for ever; the refresh thread runs the two cadences (`[lane] rules_refresh_seconds`, `stays_refresh_seconds`), the slow one first at start. A refresh that could not run is counted and said on `RunnerState`, never hidden; a turn that raises is logged and the loop goes round again. **The fast interval is the size of the class of cars that entered too recently to be priced at the barrier** — `config/lane.example.toml` says so where the number is set. **The outbox drains on a third thread**: the controller's `deliver()` is a signal under the runner, so the lane thread never waits on the network after the vend either — against a platform that black-holes, the client's timeout per queued action is the drain thread's cost, not the next car's; an outbox the platform refused is retried every `DRAIN_RETRY_S` without waiting for a car. A bare controller (the tests, the demo) drains inline, and `run_once` returns delivered. |
@@ -359,6 +359,29 @@ number on the reader and the number on the row agree in every order. **The numbe
 not the record, not an event, not the outbox, not a log line, not a URL. The
 reader's own input action (`PhonePrompt`) is handed in, as the cart's `post`
 is; this package supplies no reader transport. `scripts/validation_prompt_fail_control.py`
+breaks each property in turn.
+
+**A registration QR at the barrier** (`QrScanner`, `LaneController.observe_qr`).
+A pass-only garage's entry that refused a car no register covers, or whose pass
+it could not confirm, and an exit that did not let a car out (unless it is
+closed to everyone), may be opened by the QR the pass module issued for the car.
+The driver scans it while the car is still at the arming loop; the lane reads
+the scanner on its idle turns and presents the scan, with what the camera read
+(sure or not, or nothing), through `PlatformClient.redeem_enrolment` to the
+platform's `POST /lane/redeem-enrolment`, which asks the pass module. **The gate
+opens on `covered` and on nothing else**: the relay, `vended` with
+`registration_qr_covered`, and the transit as any open -- at an exit with no
+local decision on the close, so the platform asks the modules, which now cover
+the stay. A QR is never presented for a banned car, an owner's deny rule, a full
+garage or a lane closed to everyone; nor with the arming loop clear, nor for a
+refusal already completed. **This is the one lane read that waits on the
+network**, because only the module can check a QR; it runs while the car it is
+for is stopped at the barrier. Offline, or refused by the platform, the gate
+stays shut and `qr_presented` (`answered: false` and a reason) says so; the
+platform records every presentation it answered itself. **The token goes into
+that request body and nowhere else**: not an event, not the outbox, not a log
+line. This package ships no scanner driver: `serve` wires a simulated one when
+there is a platform, and none for a standalone lane. `scripts/qr_fail_control.py`
 breaks each property in turn.
 
 ## Watch a car drive through
