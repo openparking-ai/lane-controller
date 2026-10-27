@@ -56,6 +56,13 @@ not known to stay down for one.
   decide_not_read_now        the lane decides without reading the loop at that moment.
   no_final_sample            the watch stops without reading the loop as the call returns.
   person_checked_before_read a person's vend during the lane's last loop read is opened again.
+  cancel_paid_failure        a cancel answered exit_paid is read as a failed cancel.
+  cancel_paid_opens          a cancel answered exit_paid opens for a car the loop lost.
+  in_progress_lets_out       a cancel answered payment_in_progress lets a car out.
+  cancel_paid_asked_again    a cancel answered exit_paid is asked again.
+  close_unsettled_dropped    a close answered 503 payment_unsettled is dropped, not resent.
+  let_out_by_not_sent        a person's close does not say what they opened on.
+  flagged_let_out_sent       an authority the platform's close refuses is sent as let_out_by.
 """
 
 from __future__ import annotations
@@ -130,6 +137,14 @@ BREAKAGES = [
     ("no_final_sample", "the watch stops without reading the loop as the call returns"),
     ("person_checked_before_read",
      "whether a person took the case is checked before the lane's last loop read, not after"),
+    ("cancel_paid_failure", "a cancel answered exit_paid is read as a failed cancel"),
+    ("cancel_paid_opens", "a cancel answered exit_paid opens for a car the loop lost"),
+    ("in_progress_lets_out", "a cancel answered payment_in_progress lets a car out"),
+    ("cancel_paid_asked_again", "a cancel answered exit_paid is asked again"),
+    ("close_unsettled_dropped",
+     "a close answered 503 payment_unsettled is dropped from the outbox, not sent again"),
+    ("let_out_by_not_sent", "a person's close does not say what authority they opened on"),
+    ("flagged_let_out_sent", "an authority the platform's close refuses is sent as let_out_by"),
 ]
 
 

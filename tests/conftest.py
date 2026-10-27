@@ -4026,5 +4026,71 @@ def _break_the_settled_exit(monkeypatch):
 
         monkeypatch.setattr(LaneController, "_let_out", checks_then_reads)
 
+    elif mode == "cancel_paid_failure":
+        # A cancel answered `exit_paid` is read as a failed cancel.
+        original = case_module.cancel_on_reader
+
+        def failed(case, platform):
+            outcome = original(case, platform)
+            if outcome == case_module.CANCEL_FOUND_PAID:
+                case_module.log.warning("exit case: the payment could not be canceled: exit_paid")
+                return case_module.CANCEL_FAILED
+            return outcome
+
+        monkeypatch.setattr(case_module, "cancel_on_reader", failed)
+
+    elif mode in ("cancel_paid_opens", "in_progress_lets_out", "cancel_paid_asked_again"):
+        # A dropped case's cancel opens the barrier when it finds the card
+        # paid, or one still being authorised; or is asked again until it
+        # answers canceled.
+        cancel = case_module.cancel_on_reader
+        opens_on = {"cancel_paid_opens": case_module.CANCEL_FOUND_PAID,
+                    "in_progress_lets_out": case_module.CANCEL_IN_PROGRESS}.get(mode)
+
+        def free_reader(self):
+            case, self._left_on_reader = self._left_on_reader, None
+            if case is None:
+                return
+            outcome = cancel(case, self.exits)
+            if opens_on is not None and outcome == opens_on:
+                self.vend.vend("the cancel found the card paid")
+            if opens_on is None and outcome != case_module.CANCELED:
+                self._left_on_reader = case
+                return
+            if self._reader_case == case.exit_id:
+                self._reader_case = None
+
+        monkeypatch.setattr(LaneController, "_free_reader", free_reader)
+
+    elif mode == "close_unsettled_dropped":
+        # A close answered 503 `payment_unsettled` is taken as a refusal, and
+        # dropped from the outbox instead of sent again.
+        from lane_controller import platform_client as client_module
+
+        original = client_module.PlatformClient._request
+
+        def refused(self, method, path, payload=None):
+            try:
+                return original(self, method, path, payload)
+            except client_module.PlatformUnreachable as err:
+                if "payment_unsettled" in str(err):
+                    raise client_module.PlatformRejected(
+                        503, str(err), "payment_unsettled") from err
+                raise
+
+        monkeypatch.setattr(client_module.PlatformClient, "_request", refused)
+
+    elif mode == "let_out_by_not_sent":
+        # The close after a person's vend does not say what they opened on.
+        monkeypatch.setattr(LaneController, "_take_let_out_by", lambda self, exit_id: {})
+
+    elif mode == "flagged_let_out_sent":
+        # Every vend authority is sent as `let_out_by`, one the platform
+        # refuses included.
+        from lane_controller.contract import VendAuthority
+
+        monkeypatch.setattr(case_module, "LET_OUT_AUTHORITIES",
+                            frozenset(a.value for a in VendAuthority))
+
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_SETTLED mode: {mode}")

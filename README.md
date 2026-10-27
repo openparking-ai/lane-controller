@@ -201,9 +201,12 @@ is being asked, and a settled case opens only if the car is still on the loop
 when the answer comes back.
 Once the platform has put the case's PaymentIntent on the reader the lane does
 not drive the reader for that car, and a case the lane lets go of — the car
-left, the next car arrived, a person opened at the lane — has its payment taken
-off the reader through the platform (`/exits/:id/pay/cancel`); a person's
-close names the case. The last car's payment comes off the reader after the
+left, the next car arrived, a person opened at the lane — has its payment
+canceled through the platform (`/exits/:id/pay/cancel`). An `exit_paid` answer
+is taken as paid, never as a failure, and opens nothing for a car already gone.
+A person's close names the case and the authority they opened on
+(`let_out_by`), and a close answered 503 `payment_unsettled` is sent again.
+The last car's payment comes off the reader after the
 next car's frames are taken, and before the next car's fee goes on it. The fee
 is offered to the reader again while it waits for a card, and a person is told
 after three attempts, or after five `reader_busy` answers in a row. An answer

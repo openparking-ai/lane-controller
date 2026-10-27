@@ -279,6 +279,7 @@ class PlatformClient:
         local_decision: dict | None = None,
         reader_shown: dict | None = None,
         exit_id: str | None = None,
+        let_out_by: str | None = None,
     ) -> dict:
         # A SETTLED EXIT CASE is named on the close (platform 0037): the case
         # holds the stay it was decided on, or none, the close writes the
@@ -314,6 +315,11 @@ class PlatformClient:
         # is its discounted fee.
         if reader_shown is not None:
             body["reader_shown"] = reader_shown
+        # WHO OPENED for a car with a case (platform 0042): the authority a
+        # person at the lane opened on, ONLY with the case it names. The
+        # platform's change log names this lane computer beside it.
+        if let_out_by is not None and exit_id:
+            body["let_out_by"] = let_out_by
         return self._request("POST", "/api/v1/lane/sessions/close", body)
 
 
@@ -373,9 +379,11 @@ class PlatformClient:
         return self._exit(answer), answer.get("sent") if isinstance(answer, dict) else None
 
     def exit_pay_cancel(self, exit_id: str) -> dict:
-        """The case's payment taken off the reader bound to this lane: the car
-        left, or a person opened for it. The platform keeps the intent; a card
-        already being authorised cannot be stopped (409 `reader_busy`)."""
+        """The case's payment canceled at Stripe, and taken off the reader
+        bound to this lane while it shows it: the car left, or a person opened
+        for it. A card that had already paid is 409 `exit_paid` (the case is
+        settled as paid, nothing canceled); a card being authorised is 409
+        `payment_in_progress`; Stripe not answering is a 5xx."""
         return self._exit(
             self._request("POST", f"{self._exit_path(exit_id)}/pay/cancel", {})
         )

@@ -541,6 +541,9 @@ class LaneController:
         self._completion_arming: tuple[str, list] | None = None
         #: The exit case a person's completion took, as `(at, exit_id)`.
         self._completion_exit: tuple[str, str] | None = None
+        #: The authority that person opened on, for that case's close, as
+        #: `(exit_id, authority)`.
+        self._let_out_by: tuple[str, str] | None = None
 
     def now(self) -> float:
         """This lane's clock, which is the authority for WHEN.
@@ -858,6 +861,15 @@ class LaneController:
         # The case the person took is named on this car's close
         # (`take_completion_exit_id`), and its payment comes off the reader.
         self._completion_exit = (at, case.exit_id) if case is not None and case.exit_id else None
+        # And the authority the person opened on rides that close as
+        # `let_out_by`, when the platform takes it (`LET_OUT_AUTHORITIES`).
+        # The lane holds no name for the person: only this authority.
+        self._let_out_by = (
+            (case.exit_id, str(authorised_by))
+            if self._completion_exit is not None
+            and str(authorised_by) in exit_case.LET_OUT_AUTHORITIES
+            else None
+        )
         self.last_decision_completed_at = at
         self.begin_transit(identity, at)
         if case is not None:
@@ -2270,6 +2282,8 @@ class LaneController:
             # THE SETTLED CASE this car left on (platform 0037): the close
             # names it, and the platform writes the case's own figures.
             **({"exit_id": exit_id} if exit_id else {}),
+            # A person opened for it: on what authority (platform 0042).
+            **self._take_let_out_by(exit_id),
             at=at,
             session_id=session_id,
             exit_confirmation=confirmation,
@@ -2290,6 +2304,15 @@ class LaneController:
             self._note_exit_screen(None)
         else:
             self.show_reader(None)
+
+    def _take_let_out_by(self, exit_id: str | None) -> dict:
+        """`{"let_out_by": ...}` for the close of the case a person opened
+        for, taken once; {} for any other close."""
+        held = self._let_out_by
+        if exit_id is None or held is None or held[0] != exit_id:
+            return {}
+        self._let_out_by = None
+        return {"let_out_by": held[1]}
 
     def _reader_shown(self, exit_pricing) -> dict:
         """`{"reader_shown": ...}` from a screen that keeps what it showed, or {}."""

@@ -11,9 +11,12 @@ lane's reader, priced on the driver's word, or let out by a person.
 from __future__ import annotations
 
 import copy
+import io
 import json
+import logging
 import threading
 import time
+import urllib.error
 
 import pytest
 
@@ -1193,3 +1196,181 @@ def test_the_platform_client_takes_the_payment_off_the_reader_on_the_cases_own_r
     client = PlatformClient("http://platform.test", "tok", opener=opener)
     assert client.exit_pay_cancel("e 1")["id"] == "e 1"
     assert seen == [("POST", "http://platform.test/api/v1/lane/exits/e%201/pay/cancel", b"{}")]
+
+
+# ---------------------------------------------------------------------------
+# The cancel's answers, the close's retry, and who opened (platform 0042).
+# ---------------------------------------------------------------------------
+
+
+def a_case_on_the_reader():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    case = controller._exit_case
+    assert case is not None and case.sent_at is not None
+    return case, exits
+
+
+def test_the_cancel_reads_exit_paid_as_paid_and_payment_in_progress_as_neither():
+    case, exits = a_case_on_the_reader()
+    for refusal, outcome in [
+        (None, exit_case_module.CANCELED),
+        ("exit_paid", exit_case_module.CANCEL_FOUND_PAID),
+        ("payment_in_progress", exit_case_module.CANCEL_IN_PROGRESS),
+        ("no_payment", exit_case_module.CANCEL_FAILED),
+    ]:
+        exits.exit_pay_cancel_refusal = refusal
+        assert exit_case_module.cancel_on_reader(case, exits) == outcome, refusal
+
+
+def cancels(exits):
+    return [r for r in exits.exit_requests if r[0] == "pay_cancel"]
+
+
+def test_a_cancel_answered_exit_paid_is_not_a_failure_and_opens_nothing_for_a_car_gone(caplog):
+    """The answer came back paid as the car backed off the loop: the case is
+    left to a person, and the cancel finds the card had paid. Not a failure,
+    not asked again, and nothing opens for whoever is on the loop next."""
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    exits.exit_pay_cancel_refusal = "exit_paid"
+    slow_answer(controller, exits, clock, backs_off=True)
+    clock.tick()
+    with caplog.at_level(logging.INFO, logger="lane_controller.exit_case"):
+        controller.observe_exit_case()
+        controller.loop._occupied = True
+        for _ in range(3):
+            clock.tick(EXIT_POLL_SECONDS)
+            controller.observe_exit_case()
+    assert vend.vend_count == 0, "a card found paid opened the barrier for a car the loop lost"
+    assert len(cancels(exits)) == 1, "a cancel answered exit_paid was asked again"
+    assert [e["detail"]["exit_id"] for e in told(controller, "left")] == ["exit-1"]
+    cancel_lines = [r for r in caplog.records if r.name == "lane_controller.exit_case"
+                    and "cancel" in r.getMessage()]
+    assert cancel_lines and all(r.levelno < logging.WARNING for r in cancel_lines), (
+        "exit_paid was logged as a failure")
+
+
+def test_a_cancel_answered_payment_in_progress_keeps_the_gate_shut():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    exits.exit_pay_cancel_refusal = "payment_in_progress"
+    controller.loop.clear()
+    controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
+    controller.loop._occupied = True
+    clock.tick(EXIT_POLL_SECONDS)
+    controller.observe_exit_case()
+    assert vend.vend_count == 0, "a card still being authorised let a car out"
+    assert len(cancels(exits)) == 1
+
+
+def test_a_persons_vend_whose_cancel_finds_the_card_paid_opens_once_and_still_closes_the_case():
+    controller, vend, exits, _, _ = an_exit(answer=PAYMENT)
+    service = LaneService(controller)
+    controller.run_once()
+    exits.exit_pay_cancel_refusal = "exit_paid"
+    status, answer = person_opens(service, controller)
+    assert status == 202 and vend.vend_count == 1, answer
+    controller.events.flush()
+    assert len(cancels(exits)) == 1
+    assert exits.closed[-1]["exit_id"] == "exit-1"
+
+
+def test_a_persons_close_names_the_authority_it_opened_on():
+    controller, vend, exits, _, _ = an_exit(answer=PAYMENT)
+    service = LaneService(controller)
+    controller.run_once()
+    person_opens(service, controller)
+    controller.events.flush()
+    assert exits.closed[-1]["exit_id"] == "exit-1"
+    assert exits.closed[-1].get("let_out_by") == VendAuthority.HUMAN_OPEN_NOW.value
+
+
+def test_a_persons_close_on_an_authority_the_platform_does_not_take_goes_without_one():
+    """`human_open_and_flag` is not one the close takes (400): sent, the close
+    would be refused and dropped from the outbox. It goes without it."""
+    controller, vend, exits, _, _ = an_exit(answer=PAYMENT)
+    service = LaneService(controller)
+    controller.run_once()
+    body = {"authorised_by": VendAuthority.HUMAN_OPEN_AND_FLAG.value,
+            "identity": {"kind": "ticket", "ticket_ref": "TKT-4RS9WQ2M"},
+            "decision_at": controller.last_decision_at}
+    status, answer = service.assisted.complete(parse_vend(body, "KEY-EXIT-FLAG"))
+    if service.assisted.settling is not None:
+        service.assisted.settling.join(timeout=5)
+    assert status == 202, answer
+    controller.events.flush()
+    assert exits.closed[-1]["exit_id"] == "exit-1"
+    assert "let_out_by" not in exits.closed[-1]
+
+
+def test_a_close_the_lane_opened_on_its_own_names_no_person():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    exits.exit_answer = dict(PAID)
+    clock.tick()
+    controller.observe_exit_case()
+    controller.events.flush()
+    assert vend.vend_count == 1 and exits.closed[-1]["exit_id"] == "exit-1"
+    assert "let_out_by" not in exits.closed[-1]
+
+
+class CloseOverHttp:
+    """The fake platform, with the close sent through a real `PlatformClient`
+    to a platform that answers it as `answers` say, one answer a request."""
+
+    def __init__(self, fake: FakePlatform, answers: list[tuple[int, dict | None]]) -> None:
+        self.fake = fake
+        self.answers = answers
+        self.bodies: list[dict] = []
+        self.client = PlatformClient("http://platform.test", "tok", opener=self._open)
+
+    def __getattr__(self, name):
+        return getattr(self.fake, name)
+
+    def close_session(self, **kwargs):
+        return self.client.close_session(**kwargs)
+
+    def _open(self, request, timeout):
+        sent = json.loads(request.data)
+        self.bodies.append(sent)
+        status, body = self.answers.pop(0)
+        if status >= 400:
+            raise urllib.error.HTTPError(request.full_url, status, "refused", {},
+                                         io.BytesIO(json.dumps(body).encode()))
+        echo = {"session": {"id": "s-7", "exit_confirmation": sent["exit_confirmation"]},
+                "closed": True}
+
+        class Answer:
+            def read(self):
+                return json.dumps(echo).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return Answer()
+
+
+def test_a_persons_close_answered_503_payment_unsettled_stays_queued_and_is_sent_again():
+    controller, vend, exits, _, _ = an_exit(answer=PAYMENT)
+    unsettled = {"error": "the exit case's payment could not be settled with Stripe now",
+                 "code": "payment_unsettled"}
+    platform = CloseOverHttp(exits, [(503, unsettled), (200, None)])
+    controller.events = EventQueue(PlatformTransport(platform))
+    service = LaneService(controller)
+    controller.run_once()
+    status, answer = person_opens(service, controller)
+    assert status == 202 and vend.vend_count == 1, answer
+    assert len(platform.bodies) == 1, "the close was not sent"
+    assert controller.events.pending_sessions == 1, "a 503 close was dropped from the outbox"
+    controller.events.flush()
+    assert controller.events.pending_sessions == 0
+    first, again = platform.bodies
+    assert again == first, "the close sent again is not the close that was refused"
+    assert first["exit_id"] == "exit-1"
+    assert first["let_out_by"] == VendAuthority.HUMAN_OPEN_NOW.value

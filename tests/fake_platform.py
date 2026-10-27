@@ -81,6 +81,9 @@ class FakePlatform:
         #: What `/pay` answers `sent` as, or the refusal code it raises (409).
         self.exit_pay_sent: object = True
         self.exit_pay_refusal: str | None = None
+        #: The refusal code `/pay/cancel` raises (409), as `exit_paid` or
+        #: `payment_in_progress` (platform 0042); None cancels.
+        self.exit_pay_cancel_refusal: str | None = None
 
     def _lane_fields(self, *, fast: bool) -> dict:
         if fast and self.lane_on_slow_read_only:
@@ -294,14 +297,16 @@ class FakePlatform:
         local_decision: dict | None = None,
         reader_shown: dict | None = None,
         exit_id: str | None = None,
+        let_out_by: str | None = None,
     ) -> dict:
         self._check()
+        who = {"let_out_by": let_out_by} if let_out_by is not None else {}
         if exit_id and not plate and not ticket_ref:
             # A case with no car named: closed on the case, as the platform
             # closes a case with no stay.
             self.closed.append({"event_id": event_id, "exit_id": exit_id, "exit_at": exit_at,
                                 "exit_confirmation": exit_confirmation,
-                                "local_decision": local_decision})
+                                "local_decision": local_decision, **who})
             self.exits[exit_id]["closed"] = True
             return {"session": None, "exit": dict(self.exits[exit_id]), "closed": True}
         identity = self._identity(plate, ticket_ref)
@@ -320,6 +325,7 @@ class FakePlatform:
                 "local_decision": local_decision,
                 **({"reader_shown": reader_shown} if reader_shown is not None else {}),
                 **({"exit_id": exit_id} if exit_id else {}),
+                **who,
             }
         )
         if event_id in self.sessions_by_close_event:
@@ -391,6 +397,8 @@ class FakePlatform:
     def exit_pay_cancel(self, exit_id: str) -> dict:
         self._check()
         self.exit_requests.append(("pay_cancel", exit_id))
+        if self.exit_pay_cancel_refusal is not None:
+            raise PlatformRejected(409, "{}", self.exit_pay_cancel_refusal)
         return self._case(exit_id)
 
     def exit_receipt(self, exit_id: str, phone: str) -> None:

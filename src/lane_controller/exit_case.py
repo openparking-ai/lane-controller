@@ -452,18 +452,49 @@ def send_receipt(case: ExitCase, platform, display: ExitDisplay | None) -> bool:
     return True
 
 
-def cancel_on_reader(case: ExitCase, platform) -> bool:
-    """Take the case's payment off the lane's reader, through the platform
-    (`/exits/:id/pay/cancel`), when the lane lets the case go without opening
-    for it. Only a case whose fee was handed to the reader. Best effort: a
-    card already being authorised cannot be stopped (`reader_busy`), and the
-    platform records it paid if Stripe took it. True when cleared."""
+#: What `cancel_on_reader` found: the payment canceled at Stripe; the card had
+#: already paid (409 `exit_paid`); a card still being authorised (409
+#: `payment_in_progress`); or the platform not reached, or refusing otherwise.
+CANCELED = "canceled"
+CANCEL_FOUND_PAID = "paid"
+CANCEL_IN_PROGRESS = "in_progress"
+CANCEL_FAILED = "failed"
+
+#: The vend authorities the platform's close takes as `let_out_by` (platform
+#: 0042). It refuses any other with a 400, and a refused close is dropped
+#: from the outbox, not sent again: a close for another authority goes
+#: without it.
+LET_OUT_AUTHORITIES = frozenset({"display_code_confirmed", "human_open_now"})
+
+
+def cancel_on_reader(case: ExitCase, platform) -> str | None:
+    """Cancel the case's payment at Stripe and take it off the lane's reader,
+    through the platform (`/exits/:id/pay/cancel`): the lane let the case go,
+    or a person opened for it. Only a case whose fee was handed to the reader;
+    None for any other. Asked once, never again for the same case.
+
+    A card that had already paid (`exit_paid`) is not a failure: the platform
+    has the case settled as paid, and nothing was canceled. It opens nothing
+    by itself -- a case is let go only once its car has left the loop or a
+    person has opened, and the barrier opens for a paid case only through
+    `_let_out`, for the car still on the loop. A card still being authorised
+    (`payment_in_progress`) opens nothing either."""
     if platform is None or case.exit_id is None or case.sent_at is None:
-        return False
+        return None
     try:
         platform.exit_pay_cancel(case.exit_id)
-    except (PlatformUnreachable, PlatformRejected) as err:
-        log.warning("exit case: the payment could not be taken off the reader: %s",
-                    getattr(err, "code", None) or err.__class__.__name__)
-        return False
-    return True
+    except PlatformRejected as err:
+        if err.code == "exit_paid":
+            log.info("exit case: the card had already paid; the platform settled the case "
+                     "as paid, and nothing was canceled")
+            return CANCEL_FOUND_PAID
+        if err.code == "payment_in_progress":
+            log.info("exit case: a card is being authorised; the payment was not canceled")
+            return CANCEL_IN_PROGRESS
+        log.warning("exit case: the payment could not be canceled: %s",
+                    err.code or err.__class__.__name__)
+        return CANCEL_FAILED
+    except PlatformUnreachable as err:
+        log.warning("exit case: the payment could not be canceled: %s", err.__class__.__name__)
+        return CANCEL_FAILED
+    return CANCELED

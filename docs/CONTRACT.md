@@ -454,10 +454,16 @@ driver's word for when they came in, or let out by a person.
   to it: the lane does not drive its own reader screen for that car, before or
   after the vend. A case the lane lets go of without opening for it (the car
   left, the next car arrived, a person opened at the lane) has its payment
-  taken off the reader through the platform (`POST
-  /api/v1/lane/exits/:id/pay/cancel`), best effort. When the next car arrived,
+  canceled at Stripe and taken off the reader through the platform (`POST
+  /api/v1/lane/exits/:id/pay/cancel`), once. When the next car arrived,
   that call is made after the next car's frames are taken: before its case can
-  hand a fee to the reader, and after the barrier for a car with no case.
+  hand a fee to the reader, and after the barrier for a car with no case. A
+  409 `exit_paid` means the card had already paid: the platform settles the
+  case as paid, and the lane takes it as paid, not as a failure, and does not
+  ask again. It opens nothing by itself: a case is let go only once its car
+  has left the loop or a person has opened, and a paid case opens the barrier
+  only for the car still on the loop when its answer comes back. A 409
+  `payment_in_progress` (a card being authorised) opens nothing either.
 - **When it is settled**, the barrier opens, `vended` names the case, and the
   stay's close names it too. Then a text receipt goes to the phone the driver
   gave, once, best effort: after the barrier, never before it.
@@ -466,7 +472,13 @@ driver's word for when they came in, or let out by a person.
   for the car, the close of that car names the case, and the barrier moves
   once: the vend claims the decision under the lock the case's own opening
   takes, and one that finds it already completed is refused
-  `already_completed` with nothing moved.
+  `already_completed` with nothing moved. That close carries `let_out_by`,
+  the authority the person opened on, when the platform's close takes it
+  (`display_code_confirmed`, `human_open_now`); `human_open_and_flag` is not
+  one, and that close goes without it. The lane holds no name for the person:
+  the platform's change log names this lane computer. A close the platform
+  answers 503 `payment_unsettled` (the case's payment could not be settled
+  with Stripe yet) stays in the outbox and is sent again, as any 5xx is.
 - **Offline**, a covered car still leaves; every other car waits for a person.
 
 What the case carries about the car is its ID -- the plate's positioned

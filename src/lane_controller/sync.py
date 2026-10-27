@@ -542,6 +542,9 @@ class PlatformTransport(EventTransport):
             # The settled exit case this car left on (platform 0037), named
             # instead of the car.
             exit_id=exit_id,
+            # The authority a person opened on, when one did (platform 0042).
+            **({"let_out_by": event.detail["let_out_by"]} if event.detail.get("let_out_by")
+               else {}),
         )
         if exit_id and (result or {}).get("session") is None:
             # A CASE WITH NO STAY -- the driver's word, or a person who let a
