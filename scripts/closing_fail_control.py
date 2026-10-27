@@ -19,7 +19,10 @@ is not known to keep it out.
   board_untaxed              the board's price leaves the tax out
   plan_not_in_force          the board prices from a plan not in force
   pass_only_ignored          "pass holders only" is not read: the default admits anyone
-  pass_only_beyond_allow     "pass holders only" read where the default is deny or none
+  pass_only_only_where_allow "pass holders only" read only where the default is allow
+  pass_only_to_a_person      an uncovered car at a pass-only garage handed to a person
+  closing_wiped_with_the_cache
+                             the closing goes with the personal data at the bound
 """
 
 from __future__ import annotations
@@ -44,7 +47,9 @@ BREAKAGES = [
     ("board_untaxed", "the board's price leaves the tax out"),
     ("plan_not_in_force", "the board prices from a plan not in force"),
     ("pass_only_ignored", "pass holders only is not read at the entry"),
-    ("pass_only_beyond_allow", "pass holders only is read where the default is not allow"),
+    ("pass_only_only_where_allow", "pass holders only is read only where the default is allow"),
+    ("pass_only_to_a_person", "an uncovered car at a pass-only garage goes to a person"),
+    ("closing_wiped_with_the_cache", "the closing goes with the personal data at the bound"),
 ]
 
 

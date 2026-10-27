@@ -72,9 +72,12 @@ ENTRY_UNCONFIRMABLE = "entry_unconfirmable"
 #: barrier that is simply up -- the lane cannot tell which, and says so in the
 #: detail rather than guessing. It is an ENTRY because a vehicle is inside; it
 #: is a DIFFERENT entry because nothing admitted it, and it is never folded
-#: into `entry_confirmed`, which had a vend behind it. It opens no session and
-#: moves no `TransitState`: that enum says what became of the last VEND, and
-#: this had none.
+#: into `entry_confirmed`, which had a vend behind it. It moves no
+#: `TransitState`: that enum says what became of the last VEND, and this had
+#: none. The car is a STAY all the same (the owner's rule: the loops and the
+#: pictures make the entry): a `session_open` follows it, `confirmed` and
+#: `tailgater: true`, with a plate or `plate_unreadable` -- unless the camera
+#: says no car was there, which this event's `stay_opened: false` records.
 #:
 #: THE SAME LITERAL as `platform/src/app.js` `LANE_EVENT_KINDS`, which must
 #: accept a kind before a lane may emit it -- a lane ahead of its platform is
@@ -151,6 +154,12 @@ def to_iso(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
 
 
+#: The answers to a rules read that refuse THIS LANE, not the request: an
+#: unknown or revoked device token (401), a token for something else (403), a
+#: lane or garage the platform no longer has (404).
+LANE_REFUSED = frozenset({401, 403, 404})
+
+
 def sync_rules(client: PlatformClient, cache: DecisionCache) -> dict | None:
     """Refresh the cache from the platform. Returns the payload, or None if offline.
 
@@ -163,6 +172,20 @@ def sync_rules(client: PlatformClient, cache: DecisionCache) -> dict | None:
     except PlatformUnreachable as err:
         log.warning("rule sync failed, keeping the cache we have: %s", err)
         return None
+    except PlatformRejected as err:
+        if err.status in LANE_REFUSED:
+            # THE PLATFORM REFUSED THIS LANE OUTRIGHT -- its token unknown or
+            # revoked, the lane or its garage gone. The registers it handed
+            # this lane are personal data the lane holds for nobody now: they
+            # go at once, from memory and disk, whatever the bound (a pass-only
+            # garage keeps them through an OUTAGE, never through a refusal).
+            if cache.wipe_registers():
+                log.error(
+                    "the platform refused this lane's rules read (HTTP %s); the pass and "
+                    "monthly registers it held were wiped",
+                    err.status,
+                )
+        raise
 
     cache.load_payload(payload)
     log.info(
@@ -459,6 +482,19 @@ class PlatformTransport(EventTransport):
             descriptor=descriptor,
             # Only when true: every other open calls the client as it always did.
             **({"tailgater": True} if event.detail.get("tailgater") else {}),
+            # A plate nobody could read: the third identity (platform 0036).
+            **({"plate_unreadable": True} if event.detail.get("plate_unreadable") else {}),
+            # A car no open command let in, read or not (0036): its own mark.
+            **({"no_open_command": True} if event.detail.get("no_open_command") else {}),
+            # What was read below the confidence, not an identity (0036).
+            **(
+                {
+                    "unsure_plate": event.detail["unsure_plate"],
+                    "unsure_plate_confidence": event.detail.get("unsure_plate_confidence"),
+                }
+                if event.detail.get("unsure_plate")
+                else {}
+            ),
         )
         require_confirmation_echo(result, declared, end="entry", action="open")
         require_descriptor_echo(result, descriptor)

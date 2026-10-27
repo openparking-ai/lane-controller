@@ -11,7 +11,8 @@ What the code does, and it is the whole of what is claimed here:
     ends and both reads share;
   * a vend, then nothing in the window -> `held`, exactly as a two-loop lane;
   * the closing loop occupied with no vend behind it -> an entry nothing
-    admitted, never a confirmed one;
+    admitted, never a confirmed one -- and a stay all the same (2026-10-26),
+    `no_open_command: true`, its plate unreadable when nothing read it;
   * the published geometry says `closing_loops: 1` and no spacing;
   * a lane built from `config/lane.example.toml` -- the drawing's lane -- counts
     in the platform's `inside_count`.
@@ -190,7 +191,10 @@ def test_an_occupancy_slower_than_the_window_is_held():
 
 def test_the_closing_loop_occupied_with_no_vend_is_an_entry_nothing_admitted():
     """The lane refused the car, the car drove in anyway and reached the
-    closing loop. An entry -- a vehicle is inside -- and never a confirmed one."""
+    closing loop. An entry -- a vehicle is inside -- and never a confirmed one.
+    And a stay: the loops and the pictures make the entry, whatever opened the
+    barrier, so the car that drove in is in the money record, flagged as a car
+    no open command let in."""
     controller, vend, loops = build(identities=[BANNED], crossings=[(OCC, 3.0)])
 
     assert controller.run_once().outcome is Outcome.DENY
@@ -202,7 +206,10 @@ def test_the_closing_loop_occupied_with_no_vend_is_an_entry_nothing_admitted():
     assert loops.unread == 0
     assert kinds(controller).count(ENTRY_UNADMITTED) == 1
     assert ENTRY_CONFIRMED not in kinds(controller), "confirmed with no vend behind it"
-    assert SESSION_OPEN not in kinds(controller)
+    opened = detail(controller, SESSION_OPEN)
+    assert (opened["no_open_command"], opened["identity_kind"], opened["plate_unreadable"]) == (
+        True, "unread", True)
+    assert "tailgater" not in opened, "a car nobody could read is never a tailgater"
     recorded = detail(controller, ENTRY_UNADMITTED)
     assert recorded["reason"] == REASON_NO_PENDING_ENTRY
     assert recorded["geometry_assumed"]["closing_loops"] == 1

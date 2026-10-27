@@ -192,7 +192,9 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
     # an outage loses none of them (`durable.OutboxStore`). Same directory,
     # same rule; refused by the same exception if the directory is not ours.
     outbox = (
-        OutboxStore(outbox_path(config.cache_path))
+        OutboxStore(
+            outbox_path(config.cache_path), pictures_max_bytes=config.outbox_pictures_max_bytes
+        )
         if platform is not None and config.cache_path
         else None
     )
@@ -235,7 +237,9 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
         # forged row here opens the barrier. `CacheDirectoryUnsafe` reaches
         # `cmd_serve`, which prints it and exits 2 before the port opens.
         cache = DecisionCache(
-            max_age_seconds=config.rules_max_age_seconds, store=DurableStore(config.cache_path)
+            max_age_seconds=config.rules_max_age_seconds,
+            store=DurableStore(config.cache_path),
+            pass_registers_offline_s=config.pass_registers_offline_days * 86_400.0,
         )
         held = "restored" if cache.default_action is not None or cache.stays_cursor else "empty"
         seams["cache"] = (
@@ -243,7 +247,10 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
             "the same age at which the lane stops trusting it)"
         )
     else:
-        cache = DecisionCache(max_age_seconds=config.rules_max_age_seconds)
+        cache = DecisionCache(
+            max_age_seconds=config.rules_max_age_seconds,
+            pass_registers_offline_s=config.pass_registers_offline_days * 86_400.0,
+        )
         seams["cache"] = "MEMORY ONLY (no [lane] cache_path): a restart holds nothing"
     if platform is not None:
         seams["outbox"] = (
@@ -415,6 +422,10 @@ def _last_send(runner: LaneRunner) -> None:
     in the outbox file when there is one. Guarded like every drain turn, and a
     platform it cannot reach costs one client timeout, not one per item: the
     flush stops at the first part it cannot deliver."""
+    # And before it, the disk thread catches up -- bounded -- so what was
+    # recorded just before the stop is in the outbox file whatever the send
+    # does: the lane thread hands its writes over and never waits on them.
+    runner.controller.events.wait_written()
     if runner.controller.events.transport is not None:
         runner.drain_turn()
 

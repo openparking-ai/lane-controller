@@ -152,8 +152,10 @@ class PlatformClient:
         return self._request("POST", "/api/v1/lane/events", {"events": events})
 
     @staticmethod
-    def _identity(plate: str | None, ticket_ref: str | None) -> dict:
-        """EXACTLY ONE of the two, on the wire, and refused here if not.
+    def _identity(
+        plate: str | None, ticket_ref: str | None, plate_unreadable: bool = False
+    ) -> dict:
+        """EXACTLY ONE identity, on the wire, and refused here if not.
 
         The platform refuses both and neither with a 400, which this lane's
         transport dead-letters -- counted and logged, but after the barrier has
@@ -163,13 +165,20 @@ class PlatformClient:
 
         The key that is not set is ABSENT rather than null. Nothing on the
         platform distinguishes the two, and this is the shape the record has.
+
+        THE THIRD IDENTITY, an open only: `plate_unreadable: true` -- a car the
+        loops saw go in whose plate nobody could read (platform 0036). Never
+        beside a plate or a ticket: "unreadable" and a plate are not both true.
         """
-        if bool(plate) == bool(ticket_ref):
+        given = [bool(plate), bool(ticket_ref), plate_unreadable is True]
+        if sum(given) != 1:
             raise PlatformRejected(
                 None,
-                "a session action must carry exactly one of plate or ticket_ref; this one "
-                f"carries {'both' if plate else 'neither'}",
+                "a session action must carry exactly one of plate, ticket_ref or "
+                f"plate_unreadable; this one carries {'several' if sum(given) else 'none'}",
             )
+        if plate_unreadable is True:
+            return {"plate_unreadable": True}
         return {"plate": plate} if plate else {"ticket_ref": ticket_ref}
 
     def open_session(
@@ -183,16 +192,21 @@ class PlatformClient:
         plate_region: str | None = None,
         descriptor: str | None = None,
         tailgater: bool = False,
+        plate_unreadable: bool = False,
+        no_open_command: bool = False,
+        unsure_plate: str | None = None,
+        unsure_plate_confidence: float | None = None,
     ) -> dict:
         # event_id is the lane's own, and it is what makes a re-sent flush safe.
         # The platform keys the session on it, so this exact arrival can only
-        # ever produce one session however many times we deliver it.
+        # ever produce one session however many times we deliver it -- and an
+        # unreadable car's stay is keyed on nothing else (platform 0036).
         return self._request(
             "POST",
             "/api/v1/lane/sessions/open",
             {
                 "event_id": event_id,
-                **self._identity(plate, ticket_ref),
+                **self._identity(plate, ticket_ref, plate_unreadable),
                 "entry_at": entry_at,
                 "plate_region": plate_region,
                 # Not optional and not defaulted, here or at the platform. A
@@ -205,9 +219,22 @@ class PlatformClient:
                 # existed -- so a lane with the descriptor switched off is
                 # unchanged against any platform, old or new.
                 **({"descriptor": descriptor} if descriptor is not None else {}),
-                # A car through the gate that no vend let in (U7f). Only when
+                # A car no vend let in whose plate was read (U7f). Only when
                 # true: every other open is byte-identical to before.
                 **({"tailgater": True} if tailgater else {}),
+                # A car no open command let in, read or not (0036). Only when
+                # true.
+                **({"no_open_command": True} if no_open_command else {}),
+                # What was read of an unread car's plate below the lane's
+                # confidence, with that confidence (0036): not an identity.
+                **(
+                    {
+                        "unsure_plate": unsure_plate,
+                        "unsure_plate_confidence": unsure_plate_confidence,
+                    }
+                    if unsure_plate is not None
+                    else {}
+                ),
             },
         )
 

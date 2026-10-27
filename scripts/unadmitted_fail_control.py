@@ -42,8 +42,10 @@ what the idle read writes -- and never on the fixture that drives it.
             reads as business as usual
   bypass    the idle read records and does not flush, unlike every other path
             that writes a record
-  session   the idle read opens a session with no identity: the phantom
+  session   a crossing the camera says no car made opens a stay: the phantom
             occupant in a different hat
+  no_stay   a car that crossed with no open command opens no stay, as before
+            the owner's rule of 2026-10-26: inside, and in no money record
 
 This also proves the suite RUNS -- see `_control.py` for what a break has to
 do before it is reported as a control.
@@ -68,7 +70,8 @@ BREAKAGES = [
     ("reason", "a promotion carries the unadmitted reason"),
     ("folded", "the new case is recorded as entry_confirmed"),
     ("bypass", "the idle read does not flush"),
-    ("session", "the idle read opens a session"),
+    ("session", "a crossing no car made opens a stay"),
+    ("no_stay", "a car that crossed with no open command opens no stay"),
 ]
 
 

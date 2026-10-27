@@ -198,9 +198,24 @@ class FakePlatform:
         plate_region=None,
         descriptor: str | None = None,
         tailgater: bool = False,
+        plate_unreadable: bool = False,
+        no_open_command: bool = False,
+        unsure_plate: str | None = None,
+        unsure_plate_confidence: float | None = None,
     ) -> dict:
         self._check()
-        identity = self._identity(plate, ticket_ref)
+        if unsure_plate is not None and not plate_unreadable:
+            # As the real route: only beside `plate_unreadable` (0036).
+            raise PlatformRejected(400, "unsure_plate goes only with plate_unreadable: true")
+        if plate_unreadable:
+            # The third identity (platform 0036), on an open only and never
+            # beside another: a car of its own, keyed on the lane's event id --
+            # so its replay is its stay and nobody else's.
+            if plate or ticket_ref or plate_unreadable is not True:
+                raise PlatformRejected(400, "plate_unreadable is true, alone")
+            identity = f"unread:{event_id}"
+        else:
+            identity = self._identity(plate, ticket_ref)
         # Refused here exactly as the real platform refuses it. A fake that
         # accepted an open with no confirmation would let the lane's side of
         # this pass while the contract it is written against says no.
@@ -216,6 +231,10 @@ class FakePlatform:
                 "entry_confirmation": entry_confirmation,
                 "descriptor": descriptor,
                 "tailgater": tailgater,
+                "plate_unreadable": plate_unreadable,
+                "no_open_command": no_open_command,
+                "unsure_plate": unsure_plate,
+                "unsure_plate_confidence": unsure_plate_confidence,
             }
         )
         # Keyed on the event, exactly as the platform is. An entry replayed

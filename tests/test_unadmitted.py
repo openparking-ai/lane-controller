@@ -148,7 +148,7 @@ def test_a_crossing_with_nothing_pending_is_recorded_as_an_entry_nothing_admitte
     assert controller.run_once() is None, "an idle turn: no arrival"
 
     assert loops.unread == 0, "the idle turn read the loops"
-    assert kinds(controller)[-1] == ENTRY_UNADMITTED
+    assert kinds(controller)[-2:] == [ENTRY_UNADMITTED, SESSION_OPEN]
     assert kinds(controller).count(ENTRY_UNADMITTED) == 1
     recorded = detail(controller, ENTRY_UNADMITTED)
     assert recorded["reason"] == REASON_NO_PENDING_ENTRY
@@ -207,24 +207,44 @@ def test_it_is_the_literal_the_platform_accepts():
 # ---------------------------------------------------------------------------
 
 
-def test_it_opens_no_session_and_moves_no_transit_state():
-    """An entry nothing admitted has no identity to open a session on, and a
-    session with none would be the phantom occupant in a different hat. And
-    `TransitState` says what became of the last VEND; this had none."""
+def test_it_opens_a_stay_and_moves_no_transit_state():
+    """The car that crossed is inside, so it is a stay (2026-10-26: the loops
+    and the pictures make the entry, whatever opened the barrier) -- with no
+    plate when nothing read one, never a guessed one. Here it crossed after
+    the lane's own vend was held, so it may be that car: a stay, and not a
+    tailgater (`_late_admitted`). And `TransitState` says what became of the
+    last VEND; this had none, so it does not move."""
     controller, _, _ = build(
         crossings=[(ClosingSequence.NONE, 0.0), (F, 3.0)],
     )
     controller.run_once()  # allow, vend, nothing crosses in the window: HELD
     assert controller.transit_state == TransitState.HELD.value
-    sessions_before = controller.events.pending_sessions
+    assert controller.events.pending_sessions == 0, "a held vend is no stay"
 
     controller.run_once()  # idle: the car goes through late
 
     assert ENTRY_UNADMITTED in kinds(controller)
     assert detail(controller, ENTRY_UNADMITTED)["last_transit"] == TransitState.HELD.value
-    assert controller.events.pending_sessions == sessions_before, "the idle poll opened a session"
-    assert not any(k in SESSION_KINDS for k in kinds(controller))
+    assert detail(controller, ENTRY_UNADMITTED)["stay_opened"] is True
+    assert controller.events.pending_sessions == 1, "the car that crossed is not a stay"
+    opened = detail(controller, SESSION_OPEN)
+    assert opened["plate_unreadable"] is True and "plate" not in opened
+    assert "tailgater" not in opened, "the car this lane admitted, late, is not a tailgater"
     assert controller.transit_state == TransitState.HELD.value, "the idle poll moved the transit"
+
+
+def test_a_crossing_the_camera_says_no_car_made_opens_no_stay():
+    """The one crossing that is not a stay: the closing-loop pictures say the
+    lane is empty (`presence: false`, against the lane's reference view). The
+    camera's word over the loop's, as at the arming read -- a loop tripped by
+    something that is not a car is no phantom occupant. Recorded all the same."""
+    nobody = VehicleIdentity(plate=None, confidence=0.0, presence=False)
+    controller, _, _ = build(identities=[BANNED, nobody], crossings=[(F, 3.0)])
+    controller.run_once()
+    controller.run_once()
+    assert ENTRY_UNADMITTED in kinds(controller)
+    assert detail(controller, ENTRY_UNADMITTED)["stay_opened"] is False
+    assert not any(k in SESSION_KINDS for k in kinds(controller))
 
 
 def test_a_reverse_with_nothing_pending_is_read_and_is_not_an_entry(caplog):
@@ -335,7 +355,7 @@ def test_a_crossing_while_a_vend_is_pending_is_the_vends_answer_not_a_new_entry(
     # And with nothing pending and nothing reading, the poll runs.
     assert controller.run_once() is None
     assert loops.polls == 1
-    assert kinds(controller)[-1] == ENTRY_UNADMITTED
+    assert kinds(controller)[-2:] == [ENTRY_UNADMITTED, SESSION_OPEN]
 
 
 class PollThatStartsAVend(ClosingLoops):
@@ -965,7 +985,7 @@ def test_a_crossing_the_poll_holds_when_a_vend_begins_during_its_read_is_the_ven
     loops.release.clear()
     loops.release.set()
     assert controller.run_once(timeout=0) is None
-    assert kinds(controller)[-1] == ENTRY_UNADMITTED
+    assert kinds(controller)[-2:] == [ENTRY_UNADMITTED, SESSION_OPEN]
 
 
 def test_a_handed_crossing_is_taken_by_the_transit_it_was_handed_for_and_by_nothing_else():

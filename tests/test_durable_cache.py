@@ -62,6 +62,21 @@ def cache_dir(tmp_path):
     return directory
 
 
+def holds_no_personal_data(state) -> bool:
+    """What the store may hold past the bound: nothing, or the garage's entry
+    settings alone -- no rule, no register, no stay, no banned car, no plan."""
+    if state is None:
+        return True
+    return (
+        state.get("refreshed_at") is None
+        and not state.get("rules")
+        and not state.get("entitlements")
+        and not state.get("stays")
+        and not state.get("banned")
+        and not state.get("plans")
+    )
+
+
 def filled_platform() -> FakePlatform:
     platform = FakePlatform()
     platform.entitlements["garage_pass"] = {"consulted": True, "register": A_REGISTER}
@@ -201,8 +216,11 @@ def test_a_cache_past_its_bound_is_wiped_from_memory_and_disk_and_not_restored(c
     # past it: memory and disk, both
     assert cache.expire_if_past_bound(now=refreshed + 3601) is True
     assert cache.stays == {} and cache.entitlements == {} and cache.plans == []
-    assert cache.default_action is None and cache.is_stale()
-    assert DurableStore(path).read() is None, "the file still holds the plates"
+    assert cache.is_stale()
+    assert holds_no_personal_data(DurableStore(path).read()), "the file still holds the plates"
+    # what outlives it is the garage's entry settings, which name no car
+    assert cache.default_action == "allow"
+    assert DurableStore(path).read()["default_action"] == "allow"
     # and a second call is a no-op, not a second wipe
     assert cache.expire_if_past_bound(now=refreshed + 9999) is False
 
@@ -215,7 +233,10 @@ def test_a_store_older_than_the_bound_is_wiped_on_start_never_read_into_memory(c
     assert DurableStore(path).read()["stays"], "the premise: plates are on disk"
     restarted = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
     assert restarted.stays == {} and restarted.entitlements == {} and restarted.is_stale()
-    assert DurableStore(path).read() is None, "a store past its bound survived the start"
+    assert holds_no_personal_data(DurableStore(path).read()), (
+        "a store past its bound survived the start"
+    )
+    assert restarted.default_action == "allow", "the garage's settings did not"
 
 
 def test_the_bound_is_the_staleness_age_one_number(cache_dir):
@@ -252,7 +273,7 @@ def test_the_runner_enforces_the_bound_on_every_tick(cache_dir):
     wall["now"] += 1
     assert runner.refresh_tick(10.0) == "stays"
     assert runner.state.cache_expiries == 1
-    assert cache.stays == {} and DurableStore(path).read() is None
+    assert cache.stays == {} and holds_no_personal_data(DurableStore(path).read())
     # the platform returns: the next rules read refills it
     platform.online = True
     assert runner.refresh_tick(300.0) == "rules"

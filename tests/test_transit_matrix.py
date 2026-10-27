@@ -23,6 +23,15 @@ through -- each gained one trailing `session_open`, transit and vends
 unchanged. The held car is the one this lane admitted: its stay is not a
 tailgater's (`_late_admitted`). Nothing else moved.
 
+THE ENTRY RULE OF 2026-10-26 MOVED ONE ROW, ON PURPOSE. Every car through the
+activation loop and the closing loop is a stay, read or not: the idle poll's
+car whose plate was read below the lane's confidence -- "fallback, then A>B" --
+gained one trailing `session_open`, its plate unreadable, transit and vends
+unchanged. Run against `main` (`c2e19a4`) and the branch, that is the only row
+that differs. The matrix's garage has not said whether it takes transients, so
+its arrivals decide as before; "no vehicle, then A>B" did not move, because
+the camera that said no car was there says so at the closing loop too.
+
 The §3h answers -- A>B promotes, B>A closes, the window elapsing holds, a late
 A>B holds, no loops is unconfirmable -- are the first five rows, and they are
 the rows that did not move.
@@ -137,6 +146,7 @@ EXPECTED = {
             "decision",
             "fallback_needs_human",
             "entry_unadmitted",
+            "session_open",
         ],
         "transit": "none",
         "vends": 0,

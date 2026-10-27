@@ -670,7 +670,13 @@ def queue_an_outage(queue, plates, *, close=None):
 def test_queued_stays_survive_the_process_being_killed_mid_outage(tmp_path):
     """The process is KILLED -- no stop, no flush, nothing run on the way out
     -- with three opens and a close queued and the platform unreachable. The
-    next process, on the same file, delivers all four."""
+    next process, on the same file, delivers all four.
+
+    The disk thread is let catch up before the kill (`wait_written`): the lane
+    thread hands its writes over and never waits on them (`events.DiskWriter`),
+    so an action is on disk milliseconds after it is recorded, and a kill
+    inside those milliseconds is the window the lane states. Nothing else
+    runs before the kill -- no flush, no stop."""
     path = a_narrow_directory(tmp_path) / "lane.outbox.sqlite"
     child = textwrap.dedent(
         f"""
@@ -686,6 +692,7 @@ def test_queued_stays_survive_the_process_being_killed_mid_outage(tmp_path):
                      session_id=None)
         queue.record("armed", "lane-entry")
         print(queue.pending_sessions, flush=True)
+        assert queue.wait_written(30)
         os.kill(os.getpid(), signal.SIGKILL)
         """
     )
@@ -705,6 +712,7 @@ def test_queued_stays_survive_the_process_being_killed_mid_outage(tmp_path):
     assert platform.unique_opens == 3
     assert [c["plate"] for c in platform.closed] == ["KILL-0"]
     assert platform.open_sessions.keys() == {"KILL-1", "KILL-2"}
+    assert queue.wait_written(5)
     assert EventQueue(store=OutboxStore(path)).pending_sessions == 0, (
         "what the platform took is still in the file"
     )
@@ -716,6 +724,7 @@ def test_a_restarted_queue_replays_what_it_held_in_the_order_it_happened(tmp_pat
     before = EventQueue(PlatformTransport(down), store=OutboxStore(path))
     queue_an_outage(before, ["CAR-A", "CAR-B", "CAR-C"], close="CAR-A")
     assert before.flush() == 0
+    assert before.wait_written(5), "the disk thread caught up before the restart"
 
     platform = FakePlatform()
     after = EventQueue(PlatformTransport(platform), store=OutboxStore(path))
@@ -749,6 +758,7 @@ def test_serve_keeps_the_outbox_beside_the_cache_and_says_so(tmp_path):
     assert first.seams["outbox"].startswith(f"DURABLE {outbox} (0 ")
     queue_an_outage(first.controller.events, ["SERVE-1", "SERVE-2"])
     assert first.controller.events.flush() == 0
+    assert first.controller.events.wait_written(5)
 
     # The restart: a new process, the same configuration, the platform back.
     platform.online = True
@@ -786,6 +796,7 @@ def test_a_stay_the_disk_cannot_take_stays_queued_in_memory(tmp_path, caplog):
     )
     with caplog.at_level(logging.ERROR):
         queue_an_outage(queue, ["DISK-1"])
+        assert queue.wait_written(5)
     assert queue.pending_sessions == 1, "a failed write must not cost the record"
     assert any("outbox file" in r.getMessage() for r in caplog.records)
     platform.online = True

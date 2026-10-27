@@ -778,6 +778,7 @@ class LaneService:
             current = queue.cursor
             items = queue.since(since)
             dropped = queue.dropped
+            pictures_dropped = queue.pictures_dropped
             oldest = queue.oldest
         return EventPage(
             cursor=current,
@@ -799,6 +800,7 @@ class LaneService:
             # different bound on a different queue.
             reset=since > current or (oldest is not None and since + 1 < oldest),
             dropped=dropped,
+            pictures_dropped=pictures_dropped,
             events=tuple(
                 {
                     "cursor": seq,

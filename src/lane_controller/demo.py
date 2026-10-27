@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .config import CameraConfig, GateConfig, LaneConfig
 from .controller import LaneController
-from .decision import DecisionCache
+from .decision import DecisionCache, plate_read
 from .events import EventQueue
 from .interfaces import VehicleIdentity
 from .platform_client import PlatformClient
@@ -102,7 +102,7 @@ def main(argv=None) -> int:
         "--confidence",
         type=float,
         default=0.97,
-        help="drop below 0.85 to watch the lane refuse to guess",
+        help="drop below 0.85 to watch a read the lane does not stand behind",
     )
     args = parser.parse_args(argv)
 
@@ -147,6 +147,14 @@ def main(argv=None) -> int:
         print(
             f"\n  fallback: {fallback_name} — nothing was guessed."
         )
+        return 0
+
+    if plate_read(decision.identity, entry.config.confidence_threshold) is None:
+        # The owner's entry rule: the car is in, and its stay's plate is
+        # "unreadable" -- the identity carries what was seen, never a guess.
+        print("    stay         plate UNREADABLE — the car is in, and nothing was guessed")
+        print("\n  [exit lane]  matching an exit to an unread stay is not built yet: a person "
+              "settles it")
         return 0
 
     # --- what the platform now believes -----------------------------------

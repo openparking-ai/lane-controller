@@ -48,7 +48,7 @@ from .contract import (
     is_idempotency_key,
     is_ticket_ref,
 )
-from .decision import Outcome, closed_to, decide
+from .decision import ADMITS_PASSES_ONLY, Outcome, closed_to, decide, garage_admits
 from .interfaces import VehicleIdentity
 
 log = logging.getLogger(__name__)
@@ -183,6 +183,16 @@ def _instant(value) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else None
+
+
+def person_only(controller) -> bool:
+    """Whether only a person's word may complete a decision at this lane: an
+    ENTRY of a garage that takes monthlies and passes only (`garage_admits`),
+    read off the cache now, as the closing is."""
+    return (
+        controller.config.direction == "entry"
+        and garage_admits(controller.cache) == ADMITS_PASSES_ONLY
+    )
 
 
 class AssistedVend:
@@ -378,6 +388,21 @@ class AssistedVend:
                     "only a person's word does (human_open_now or human_open_and_flag)"
                 ),
             )
+        # AND AT A MONTHLY/PASS-ONLY GARAGE'S ENTRY, likewise: a car whose pass
+        # this lane could not confirm is a PERSON's case, and a display code is
+        # a driver serving themselves -- which at a garage that takes no
+        # stranger would let in any car. A person's word still opens it.
+        if (
+            person_only(controller)
+            and request.authorised_by is VendAuthority.DISPLAY_CODE_CONFIRMED
+        ):
+            return VendRefused(
+                code=VendRefusal.NOT_COMPLETABLE.value,
+                error=(
+                    "this garage takes monthlies and passes only; a display code does not open "
+                    "it, only a person's word does (human_open_now or human_open_and_flag)"
+                ),
+            )
         outcome = controller.last_decision.outcome
         if outcome is Outcome.ALLOW:
             return VendRefused(
@@ -515,7 +540,11 @@ class AssistedVend:
 
         def resolve() -> None:
             try:
-                controller.resolve_transit(identity, at, claim=claim)
+                # The arming read of the car being let in, which
+                # `complete_vend` set aside for this transit: kept with its stay.
+                controller.resolve_transit(
+                    identity, at, claim=claim, arming=controller.take_completion_arming(at)
+                )
             except Exception:  # noqa: BLE001
                 # A settling thread that died silently would leave the transit
                 # `pending` for ever with nothing anywhere saying why.

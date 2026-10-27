@@ -224,6 +224,15 @@ jobs:
           # refused -- each broken, and requires tests/test_tailgater.py to
           # fail each time.
           - tailgater
+          # Entry fail-control (the owner's entry rule, 2026-10-26)
+          # Every car through both loops a stay, read or not, flagged when no
+          # open command let it in and kept on disk like any stay; the arming
+          # read's pictures kept, on disk, uncapped, sent one at a time; a
+          # garage that takes transients opening for every car but full,
+          # closed, banned or nothing there; a pass-only garage denying every
+          # car no register covers; no disk on the car's path. Each broken, and
+          # requires tests/test_entry_always_a_stay.py to fail each time.
+          - entry_stay
           # Deactivate-loop fail-control
           # Breaks the third loop's guarantees on purpose -- the level (an edge
           # deadlocks two queued cars), each end of the held interval, its

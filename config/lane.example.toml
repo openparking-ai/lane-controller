@@ -9,16 +9,38 @@ site_id   = "site-1"
 # "entry" opens a session; "exit" closes one and the platform prices it.
 direction = "entry"
 
-# Below this confidence the lane takes its fallback path instead of deciding.
-# Raising it makes the lane more cautious and sends more vehicles to fallback;
-# lowering it lets the lane act on reads it is less sure about. It should never
-# be lowered to make a fallback rate look better.
+# Below this confidence a plate is not one the lane stands behind: it is never
+# looked up in a rule or a register, and never becomes a stay's plate -- the
+# stay's plate is "unreadable". At an entry whose garage takes transients the
+# car is let in all the same; at a pass-only garage it is denied; at a garage
+# that has not said which it is, and at an exit, the lane takes its fallback
+# path instead of deciding. Raising it makes the lane more cautious; lowering
+# it lets the lane act on reads it is less sure about. It should never be
+# lowered to make a fallback rate look better.
 confidence_threshold = 0.85
 
-# How old cached rules may be before the lane stops trusting them and falls
-# back. The lane keeps working with the internet down; it does not keep working
-# forever with the internet down.
+# How old cached rules may be before the lane stops trusting them -- and stops
+# holding the personal data in them. The lane keeps working with the internet
+# down; it does not keep trusting its registers forever with the internet down.
+# Past it, a garage that takes transients still opens for every car (the
+# garage's entry settings outlive the bound) and a car a register covered is no
+# longer recognised until the platform answers again; a pass-only garage keeps
+# its registers until then; a garage that has not said what it takes falls
+# back.
 rules_max_age_seconds = 86400
+
+# A pass-only garage's registers outlive the age above while the platform
+# cannot be reached -- there they are the only way a car gets in -- but not
+# for ever: this many days after the platform last confirmed them they go too,
+# and a car whose pass cannot be confirmed goes to a person. A platform that
+# refuses this lane outright (401, 403, 404) wipes them at once.
+pass_registers_offline_days = 7
+
+# How long a refused car's arming pictures wait for a crossing that may be
+# that car driving in anyway. Past it -- or when the plates, the reads below
+# the confidence or the appearance descriptors say it is another car, or the
+# comparison could not be made -- they go with no stay.
+refused_arming_seconds = 120
 
 # Where events are reported and the cache is refreshed from, when connectivity
 # allows. Never on the hot path. With this set, `serve` REQUIRES the device
@@ -108,6 +130,13 @@ stays_refresh_seconds = 5
 # are already lost. A site whose link is normally down for hours raises it; a
 # site that wants to hear about a five-minute outage lowers it.
 outbox_depth_threshold = 1000
+
+# The most the pictures kept with entries may take of the outbox file, in
+# bytes. A CEILING, so the stays' opens and closes always have room: past it
+# the oldest pictures not yet sent are dropped, and each drop is counted
+# (`pictures_dropped` on `GET /v1/lane/events`). An assumption, not a
+# measurement: a box with a small disk lowers it. At least 16 MiB.
+outbox_pictures_max_bytes = 1073741824
 
 # How long `GET /v1/lane/health` may wait for the identification service's own
 # health route before answering `unknown` for `identity_service_degraded`.

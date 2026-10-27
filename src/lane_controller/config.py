@@ -254,6 +254,28 @@ def _declared_loops(raw: dict) -> dict:
 #: site that wants to hear about a five-minute outage lowers it.
 DEFAULT_OUTBOX_DEPTH_THRESHOLD = 1_000
 
+#: The published default for `LaneConfig.outbox_pictures_max_bytes`: the most
+#: the pictures kept with entries may take of the outbox file, in bytes (1 GiB).
+#: A CEILING, so the stays' opens and closes always have room on the disk: past
+#: it the oldest unsent pictures are dropped, and each drop is counted
+#: (`pictures_dropped` on `GET /v1/lane/events`). A per-site setting and an
+#: assumption -- a box with a small disk lowers it, one that expects long
+#: outages and has the room raises it. Nothing here measures a disk.
+DEFAULT_OUTBOX_PICTURES_MAX_BYTES = 1 << 30
+#: The least it may be: a few of the largest pictures the platform takes.
+MIN_OUTBOX_PICTURES_MAX_BYTES = 16 << 20
+
+#: The published default for `LaneConfig.pass_registers_offline_days`: how long
+#: a pass-only garage's registers may be held after the platform last confirmed
+#: them, while it cannot be reached. Past the cache's age bound they are kept
+#: (there they are the only way a car gets in), but not for ever: past this,
+#: they go too, and a car whose pass cannot be confirmed goes to a person.
+DEFAULT_PASS_REGISTERS_OFFLINE_DAYS = 7.0
+#: The published default for `LaneConfig.refused_arming_seconds`: how long a
+#: refused car's arming pictures may wait for a crossing that may be that car
+#: driving in anyway. Past it they go with no stay.
+DEFAULT_REFUSED_ARMING_SECONDS = 120.0
+
 #: The published default for `LaneConfig.identity_health_timeout_s`: how long
 #: `GET /v1/lane/health` may wait for the identification service's own health
 #: route before answering `unknown` for `identity_service_degraded`.
@@ -464,6 +486,15 @@ class LaneConfig:
     # reports `outbox_depth_growing` as `active`. A per-site setting: see
     # DEFAULT_OUTBOX_DEPTH_THRESHOLD above for what it is and is not.
     outbox_depth_threshold: int = DEFAULT_OUTBOX_DEPTH_THRESHOLD
+    # The ceiling on the pictures' share of the outbox file, in bytes. A
+    # per-site setting: see DEFAULT_OUTBOX_PICTURES_MAX_BYTES above.
+    outbox_pictures_max_bytes: int = DEFAULT_OUTBOX_PICTURES_MAX_BYTES
+    # The ceiling on a pass-only garage's registers held while the platform
+    # cannot be reached. See DEFAULT_PASS_REGISTERS_OFFLINE_DAYS above.
+    pass_registers_offline_days: float = DEFAULT_PASS_REGISTERS_OFFLINE_DAYS
+    # How long a refused car's arming pictures wait for a crossing that may be
+    # that car. See DEFAULT_REFUSED_ARMING_SECONDS above.
+    refused_arming_seconds: float = DEFAULT_REFUSED_ARMING_SECONDS
     # How long the health route may wait on the identification service's own
     # health route before answering `unknown`. A per-site setting: see
     # DEFAULT_IDENTITY_HEALTH_TIMEOUT_S above for what it is and is not.
@@ -506,6 +537,15 @@ class LaneConfig:
                 f"outbox_depth_threshold must be a positive integer, "
                 f"got {self.outbox_depth_threshold!r}"
             )
+        if (
+            isinstance(self.outbox_pictures_max_bytes, bool)
+            or not isinstance(self.outbox_pictures_max_bytes, int)
+            or self.outbox_pictures_max_bytes < MIN_OUTBOX_PICTURES_MAX_BYTES
+        ):
+            raise ValueError(
+                f"outbox_pictures_max_bytes must be a whole number of bytes, at least "
+                f"{MIN_OUTBOX_PICTURES_MAX_BYTES}, got {self.outbox_pictures_max_bytes!r}"
+            )
         # Every duration through the SAME validator. Zero or negative would
         # mean: a health route that never waits and answers `unknown` for ever
         # while looking like it measured something; a lane whose act surface
@@ -520,6 +560,8 @@ class LaneConfig:
             "arming_loop_max_occupied_s",
             "rules_refresh_seconds",
             "stays_refresh_seconds",
+            "pass_registers_offline_days",
+            "refused_arming_seconds",
         ):
             positive_finite(getattr(self, name), name)
         # The two cadences are ordered, and both sit inside the staleness
@@ -568,6 +610,15 @@ class LaneConfig:
             cache_path=lane.get("cache_path"),
             outbox_depth_threshold=int(
                 lane.get("outbox_depth_threshold", DEFAULT_OUTBOX_DEPTH_THRESHOLD)
+            ),
+            outbox_pictures_max_bytes=int(
+                lane.get("outbox_pictures_max_bytes", DEFAULT_OUTBOX_PICTURES_MAX_BYTES)
+            ),
+            pass_registers_offline_days=float(
+                lane.get("pass_registers_offline_days", DEFAULT_PASS_REGISTERS_OFFLINE_DAYS)
+            ),
+            refused_arming_seconds=float(
+                lane.get("refused_arming_seconds", DEFAULT_REFUSED_ARMING_SECONDS)
             ),
             identity_health_timeout_s=float(
                 lane.get("identity_health_timeout_s", DEFAULT_IDENTITY_HEALTH_TIMEOUT_S)
