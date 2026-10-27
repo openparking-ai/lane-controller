@@ -215,6 +215,10 @@ class EventQueue:
         self._pictures: deque[Picture] = deque(maxlen=max_pictures)
         self._max_pictures = max_pictures
         self._unwritten: dict[str, Picture] = {}
+        #: Pictures the platform has taken whose removal from the file has not
+        #: been confirmed: never sent again, and their removal retried, so a
+        #: delete that fails neither repeats a send nor stops the flush.
+        self._sent_unremoved: set[str] = set()
         self.pictures_dropped = 0
         self._sessions: deque[LaneEvent] = deque()
         self._transport = transport
@@ -430,19 +434,32 @@ class EventQueue:
         if picture is None:
             return
         try:
-            self._store.add_picture(picture)
+            dropped = self._store.add_picture(picture)
         except Exception:  # noqa: BLE001 -- a disk that fails never costs the picture
             log.exception("a picture could not be kept in the outbox file; it waits in memory")
             return
         with self._state:
             self._unwritten.pop(ref, None)
+            # THE CEILING: the oldest pictures the file let go to keep room for
+            # the stays, counted -- a gap nobody knows about is worse.
+            self.pictures_dropped += dropped
+        if dropped:
+            log.warning(
+                "the outbox file's pictures reached their ceiling; %d of the oldest dropped",
+                dropped,
+            )
 
     def _remove_pictures(self, refs: list[str]) -> None:
-        """On the disk thread: pictures the platform has taken or refused."""
+        """On the disk thread: pictures the platform has taken or refused. A
+        removal that fails leaves them in `_sent_unremoved`: not sent again, and
+        their removal tried again by the next flush."""
         try:
             self._store.remove_pictures(refs)
-        except Exception:  # noqa: BLE001 -- left on disk, it is sent again, idempotently
+        except Exception:  # noqa: BLE001 -- left on disk, never sent again
             log.exception("a delivered picture could not be removed from the outbox file")
+            return
+        with self._state:
+            self._sent_unremoved.difference_update(refs)
 
     @property
     def pending_pictures(self) -> int:
@@ -500,14 +517,23 @@ class EventQueue:
             return sent
 
     def _flush_disk_pictures(self, send) -> tuple[int, bool]:
-        """The pictures on disk, oldest first, a batch at a time, each removed
-        once done. Returns (how many left, whether the platform stopped it)."""
+        """The pictures on disk, oldest first, a page at a time BY POSITION,
+        each removed once done. Returns (how many left, whether the platform
+        stopped it).
+
+        By position, and not "the oldest eight": a picture whose removal
+        failed is still the oldest row, and reading the oldest eight again
+        handed back the same eight for ever -- the flush stopped there, and
+        every picture behind them waited for good. Now a page starts after the
+        last row read, and a picture already taken (`_sent_unremoved`) is not
+        sent again: only its removal is tried again."""
         sent = 0
-        done: set[str] = set()
+        after = 0
         while True:
             try:
                 answered, held = self._disk.call(
-                    lambda: self._store.held_pictures(PICTURE_BATCH), DISK_WAIT_S
+                    lambda position=after: self._store.held_pictures(PICTURE_BATCH, after=position),
+                    DISK_WAIT_S,
                 )
             except Exception:  # noqa: BLE001 -- a disk that fails never costs the drain
                 log.exception("the pictures in the outbox file could not be read")
@@ -517,16 +543,22 @@ class EventQueue:
                     "the outbox file did not answer in %.1fs; its pictures wait", DISK_WAIT_S
                 )
                 return sent, False
-            batch = [p for p in held if p.picture_ref not in done]
-            if not batch:
+            fresh = [(position, picture) for position, picture in held if position > after]
+            if not fresh:
                 return sent, False
-            for picture in batch:
-                if not send([picture]):
-                    return sent, True
-                done.add(picture.picture_ref)
+            for position, picture in fresh:
+                after = position
+                ref = picture.picture_ref
+                with self._state:
+                    taken = ref in self._sent_unremoved
+                if not taken:
+                    if not send([picture]):
+                        return sent, True
+                    with self._state:
+                        self._sent_unremoved.add(ref)
+                    sent += 1
                 # Removed on the disk thread, ahead of the next read there.
-                self._disk.submit(lambda ref=picture.picture_ref: self._remove_pictures([ref]))
-                sent += 1
+                self._disk.submit(lambda ref=ref: self._remove_pictures([ref]))
 
     def _flush_memory_pictures(self, send) -> int:
         """The memory-only lane's pictures, one at a time, as above."""

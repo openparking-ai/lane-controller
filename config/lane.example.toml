@@ -23,9 +23,10 @@ confidence_threshold = 0.85
 # holding the personal data in them. The lane keeps working with the internet
 # down; it does not keep trusting its registers forever with the internet down.
 # Past it, a garage that takes transients still opens for every car (the
-# garage's entry settings outlive the bound); a car a register covered is no
-# longer recognised until the platform answers again; a garage that has not
-# said what it takes falls back.
+# garage's entry settings outlive the bound) and a car a register covered is no
+# longer recognised until the platform answers again; a pass-only garage keeps
+# its registers until then; a garage that has not said what it takes falls
+# back.
 rules_max_age_seconds = 86400
 
 # Where events are reported and the cache is refreshed from, when connectivity
@@ -116,6 +117,13 @@ stays_refresh_seconds = 5
 # are already lost. A site whose link is normally down for hours raises it; a
 # site that wants to hear about a five-minute outage lowers it.
 outbox_depth_threshold = 1000
+
+# The most the pictures kept with entries may take of the outbox file, in
+# bytes. A CEILING, so the stays' opens and closes always have room: past it
+# the oldest pictures not yet sent are dropped, and each drop is counted
+# (`pictures_dropped` on `GET /v1/lane/events`). An assumption, not a
+# measurement: a box with a small disk lowers it. At least 16 MiB.
+outbox_pictures_max_bytes = 1073741824
 
 # How long `GET /v1/lane/health` may wait for the identification service's own
 # health route before answering `unknown` for `identity_service_degraded`.

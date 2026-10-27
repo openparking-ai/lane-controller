@@ -34,6 +34,27 @@ requires this file to go red:
      DENIES every other car -- not a person's case -- whatever its default
   5  no disk on the car's path: a hung disk does not hold the next car, and
      what was recorded reaches the disk when the disk answers
+
+And what the independent review of this round asked for:
+
+  B  "no open command let it in" is its own mark (`no_open_command`), and
+     `tailgater` keeps its meaning -- a car no vend let in whose plate was
+     READ; a car nobody could read is never a tailgater, so never ban-listed
+  A  what was read below the confidence is kept on the stay (`unsure_plate`,
+     with its confidence) and is never its plate
+  C  at a pass-only garage, until the registration QR: a car whose pass cannot
+     be confirmed -- plate unread or unsure, or no register held -- goes to a
+     person, and a display code does not complete it; a car read with
+     confidence that no register covers is denied, full or not
+  4  a pass-only garage's registers outlive the cache's bound while the
+     platform cannot be reached, and go when it answers again
+  F  the pictures' share of the outbox file has a ceiling, the drops are
+     counted on `GET /v1/lane/events`, and a removal that fails holds no flush
+  E  an exit records its pending close as before; a closed exit stays closed
+     past the bound (its gate was shut there before too); a stale owner's rule
+     is never applied
+  D  the arming read of a car a person lets in, or of a refused car that
+     drives in anyway, is kept with its stay
 """
 
 from __future__ import annotations
@@ -54,6 +75,7 @@ from lane_controller import (
     LoopConfig,
     VehicleIdentity,
 )
+from lane_controller.contract import VendAuthority, VendRefusal
 from lane_controller.decision import (
     REASON_NOT_REGISTERED,
     Fallback,
@@ -64,6 +86,7 @@ from lane_controller.durable import CACHE_DIR_MODE, DurableStore, OutboxStore
 from lane_controller.events import EventQueue, Picture
 from lane_controller.interfaces import ClosingSequence, Frame, Unavailable
 from lane_controller.platform_client import PlatformClient, PlatformRejected
+from lane_controller.service import LaneService
 from lane_controller.simulated import (
     CannedCameraFeed,
     ExactBannedMatcher,
@@ -79,8 +102,10 @@ from lane_controller.sync import (
     SESSION_OPEN,
     UNCONFIRMABLE,
     PlatformTransport,
+    sync_rules,
 )
 from test_exit_decision import NEW_YORK, NOW, gp_register, gp_row
+from test_vend import complete, settled
 
 OCC = ClosingSequence.OCCUPIED
 FWD = ClosingSequence.FORWARD
@@ -207,7 +232,9 @@ def test_a_refused_car_that_drove_in_is_a_stay_flagged_as_no_open_command_let_it
     [opened] = platform.opened
     assert (opened["plate"], opened["entry_confirmation"], opened["tailgater"]) == (
         "TAIL-1", CONFIRMED, True)
-    assert len(pictures_of(platform, opened["event_id"])) == 2, "the closing-loop pictures"
+    assert opened["no_open_command"] is True
+    # The closing-loop pictures only: its plate says it is not the car refused.
+    assert len(pictures_of(platform, opened["event_id"])) == 2
 
 
 @pytest.mark.parametrize("crossing", [UNREAD, LOW, ENGINE_DOWN],
@@ -221,9 +248,11 @@ def test_a_car_nobody_could_read_through_the_gate_is_a_stay_with_an_unreadable_p
     controller.run_once()
     [opened] = platform.opened
     assert opened["plate"] is None and opened["plate_unreadable"] is True
-    assert opened["tailgater"] is True and opened["entry_confirmation"] == CONFIRMED
+    assert opened["no_open_command"] is True and opened["entry_confirmation"] == CONFIRMED
+    assert opened["tailgater"] is False, "a car nobody could read is never a tailgater"
     assert opened["descriptor"] == crossing.descriptor, "what was seen goes with it"
-    assert len(pictures_of(platform, opened["event_id"])) == 2
+    # The refused car's arming read (two frames), then the closing loop's two.
+    assert len(pictures_of(platform, opened["event_id"])) == 4
 
 
 def test_the_second_car_through_one_opening_gets_its_own_stay():
@@ -270,8 +299,9 @@ def test_the_admitted_car_crossing_late_is_not_a_tailgater_and_only_once():
     controller.run_once()
     controller.run_once()
     late, follower = platform.opened
-    assert late["tailgater"] is False
-    assert follower["tailgater"] is True
+    assert (late["tailgater"], late["no_open_command"]) == (False, False), "its open command"
+    assert follower["no_open_command"] is True
+    assert follower["tailgater"] is False, "unread: never a tailgater"
 
 
 def test_a_stay_with_no_open_command_survives_a_restart_in_an_outage(tmp_path):
@@ -293,8 +323,8 @@ def test_a_stay_with_no_open_command_survives_a_restart_in_an_outage(tmp_path):
     assert after.pending_sessions == 1
     assert after.flush() == 1
     [opened] = platform.opened
-    assert (opened["plate_unreadable"], opened["tailgater"]) == (True, True)
-    assert after.flush_pictures() == 2, "and its pictures, from the same file"
+    assert (opened["plate_unreadable"], opened["no_open_command"]) == (True, True)
+    assert after.flush_pictures() == 4, "and its pictures, from the same file"
 
 
 def test_the_open_carries_plate_unreadable_on_the_wire_and_nothing_else():
@@ -533,13 +563,12 @@ def test_a_pass_only_garage_opens_for_a_covered_car_and_denies_every_other(defau
                              register=a_register())
     assert holder.run_once().outcome is Outcome.ALLOW
     assert vend.vend_count == 1
-    for other in (SEEN, LOW, NO_PLATE, ENGINE_DOWN, HOLDER_UNSURE):
-        controller, vend, platform = a_lane([other], transient=False,
-                                            default_action=default_action, register=a_register())
-        decision = controller.run_once()
-        assert (decision.outcome, decision.reason) == (Outcome.DENY, REASON_NOT_REGISTERED), other
-        assert decision.fallback is None, "not handed to a person"
-        assert vend.vend_count == 0 and platform.opened == [], other
+    stranger, vend, platform = a_lane([SEEN], transient=False, default_action=default_action,
+                                      register=a_register())
+    decision = stranger.run_once()
+    assert (decision.outcome, decision.reason) == (Outcome.DENY, REASON_NOT_REGISTERED)
+    assert decision.fallback is None, "a plate read with confidence that no register covers"
+    assert vend.vend_count == 0 and platform.opened == []
 
 
 def test_a_garage_that_takes_transients_but_denies_strangers_is_read_as_pass_only():
@@ -620,3 +649,338 @@ def test_the_picture_record_is_the_platforms_shape():
     platform = FakePlatform()
     assert PlatformTransport(platform).send_pictures([picture])
     assert platform.pictures[picture.picture_ref]["event_id"] == "e-1"
+
+
+# ---------------------------------------------------------------------------
+# B -- its own mark; a tailgater is a car whose plate was read
+# ---------------------------------------------------------------------------
+
+
+def test_no_open_command_is_its_own_mark_and_an_admitted_car_carries_neither():
+    controller, _, platform = a_lane([SEEN, UNREAD], crossings=[(OCC, 3.0), (OCC, 3.0)])
+    assert controller.run_once().outcome is Outcome.ALLOW
+    controller.run_once()
+    admitted, unread = platform.opened
+    assert (admitted["no_open_command"], admitted["tailgater"]) == (False, False)
+    assert (unread["no_open_command"], unread["tailgater"]) == (True, False), (
+        "a car nobody could read is never a tailgater: a dirty plate is never ban-listed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A -- what was seen below the confidence is kept, and is not the plate
+# ---------------------------------------------------------------------------
+
+
+def test_what_was_read_below_the_confidence_is_kept_beside_an_unreadable_plate():
+    controller, _, platform = a_lane([LOW])
+    assert controller.run_once().outcome is Outcome.ALLOW
+    [opened] = platform.opened
+    assert (opened["plate"], opened["plate_unreadable"]) == (None, True)
+    assert (opened["unsure_plate"], opened["unsure_plate_confidence"]) == (STRANGER, 0.42)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [SEEN, ENGINE_DOWN, NO_PLATE,
+     VehicleIdentity(plate="P" * 33, confidence=0.42, presence=True)],
+    ids=["read", "engine down", "no plate", "longer than the platform takes"],
+)
+def test_nothing_is_kept_as_unsure_where_nothing_was_read_below_the_confidence(identity):
+    controller, _, platform = a_lane([identity])
+    controller.run_once()
+    [opened] = platform.opened
+    assert opened["unsure_plate"] is None, "and the stay is opened all the same"
+
+
+# ---------------------------------------------------------------------------
+# C -- a pass-only garage, until the registration QR
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("identity", "fallback"),
+    [(LOW, Fallback.LOW_CONFIDENCE), (HOLDER_UNSURE, Fallback.LOW_CONFIDENCE),
+     (NO_PLATE, Fallback.NO_PLATE_READ), (ENGINE_DOWN, Fallback.ENGINE_UNREACHABLE)],
+    ids=["below the confidence", "the holder's plate, unsure", "no plate", "engine down"],
+)
+def test_a_pass_only_car_whose_pass_cannot_be_confirmed_goes_to_a_person(identity, fallback):
+    controller, vend, platform = a_lane([identity], transient=False, register=a_register())
+    decision = controller.run_once()
+    assert (decision.outcome, decision.fallback) == (Outcome.FALLBACK, fallback)
+    assert "the pass could not be confirmed" in decision.reason
+    assert vend.vend_count == 0, "the gate stays shut until a person answers"
+    assert [e for e in platform.events.values() if e["kind"] == "fallback_needs_human"]
+
+
+def test_a_pass_only_garage_holding_no_register_sends_every_car_to_a_person():
+    controller, vend, _ = a_lane([HOLDER_SEEN], transient=False, register=None)
+    decision = controller.run_once()
+    assert (decision.outcome, decision.fallback) == (Outcome.FALLBACK, Fallback.STALE_RULES)
+    assert vend.vend_count == 0
+
+
+def test_a_pass_only_garage_closed_full_denies_an_uncovered_car():
+    stranger, vend, _ = a_lane([SEEN], transient=False, register=a_register(), closing=FULL)
+    assert stranger.run_once().outcome is Outcome.DENY, "denied, not sent to a person"
+    assert vend.vend_count == 0
+    holder, vend, _ = a_lane([HOLDER_SEEN], transient=False, register=a_register(), closing=FULL)
+    assert holder.run_once().outcome is Outcome.ALLOW
+    unclear, vend, _ = a_lane([LOW], transient=False, register=a_register(), closing=FULL)
+    assert unclear.run_once().outcome is Outcome.FALLBACK, "its pass may yet be confirmed"
+
+
+def test_a_display_code_does_not_open_a_pass_only_garage_and_a_person_does():
+    controller, vend, _ = a_lane([LOW], transient=False, register=a_register())
+    controller.run_once()
+    service = LaneService(controller)
+    status, refused = complete(service, controller,
+                               authority=VendAuthority.DISPLAY_CODE_CONFIRMED)
+    assert (status, refused["code"]) == (409, VendRefusal.NOT_COMPLETABLE.value)
+    assert vend.vend_count == 0
+    status, _ = complete(service, controller, authority=VendAuthority.HUMAN_OPEN_NOW, key="KEY-002")
+    assert status == 202
+    settled(service)
+    assert vend.vend_count == 1
+    # THE CONTROL: at a garage that has not said, a display code still completes.
+    unsaid, vend, _ = a_lane([LOW], transient=None, default_action=None)
+    unsaid.run_once()
+    status, _ = complete(LaneService(unsaid), unsaid,
+                         authority=VendAuthority.DISPLAY_CODE_CONFIRMED)
+    assert status == 202
+
+
+# ---------------------------------------------------------------------------
+# 4 -- a pass-only garage's registers through an outage
+# ---------------------------------------------------------------------------
+
+
+def a_pass_only_platform():
+    platform = FakePlatform()
+    platform.entitlements["garage_pass"] = {"consulted": True, "register": a_register()}
+    rules = platform.get_rules
+    platform.get_rules = lambda: {**rules(), "transient_available": False}
+    return platform
+
+
+def test_a_pass_only_garages_registers_outlive_the_bound_while_the_platform_is_away(tmp_path):
+    path = narrow(tmp_path) / "cache.sqlite"
+    platform = a_pass_only_platform()
+    cache = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    sync_rules(platform, cache)
+    cache._refreshed_at -= 7200
+    assert cache.expire_if_past_bound() is True, "the premise: the personal data is wiped"
+    assert cache.stays == {} and "garage_pass" in cache.entitlements, "the registers are kept"
+    controller, vend, _ = a_lane([HOLDER_SEEN], cache=cache)
+    assert controller.run_once().outcome is Outcome.ALLOW, "the monthly still gets in"
+    restarted = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    controller, vend, _ = a_lane([HOLDER_SEEN], cache=restarted)
+    assert controller.run_once().outcome is Outcome.ALLOW, "and after a restart"
+
+
+def test_they_are_wiped_when_the_platform_answers_again(tmp_path):
+    path = narrow(tmp_path) / "cache.sqlite"
+    platform = a_pass_only_platform()
+    cache = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    sync_rules(platform, cache)
+    cache._refreshed_at -= 7200
+    cache.expire_if_past_bound()
+    # The platform answers -- and could not read the pass module this time.
+    platform.entitlements["garage_pass"] = {"consulted": False, "unavailable": "timed out"}
+    assert sync_rules(platform, cache) is not None
+    assert "garage_pass" not in cache.entitlements, "kept through the outage, not past it"
+    controller, vend, _ = a_lane([HOLDER_SEEN], cache=cache)
+    assert controller.run_once().outcome is Outcome.FALLBACK, "no register held: a person"
+    # THE CONTROL: inside the bound an unreadable module keeps its register, as it always did.
+    fresh = DecisionCache(max_age_seconds=3600)
+    platform.entitlements["garage_pass"] = {"consulted": True, "register": a_register()}
+    sync_rules(platform, fresh)
+    platform.entitlements["garage_pass"] = {"consulted": False, "unavailable": "timed out"}
+    sync_rules(platform, fresh)
+    assert "garage_pass" in fresh.entitlements
+
+
+def test_the_control_a_transient_garages_registers_go_with_the_bound():
+    platform = FakePlatform()
+    platform.entitlements["garage_pass"] = {"consulted": True, "register": a_register()}
+    rules = platform.get_rules
+    platform.get_rules = lambda: {**rules(), "transient_available": True}
+    cache = DecisionCache(max_age_seconds=3600)
+    sync_rules(platform, cache)
+    cache._refreshed_at -= 7200
+    cache.expire_if_past_bound()
+    assert cache.entitlements == {}
+
+
+# ---------------------------------------------------------------------------
+# F -- the pictures' ceiling, counted; a failed removal holds no flush
+# ---------------------------------------------------------------------------
+
+
+def sized(n, size, start=0):
+    return [Frame(image_bytes=bytes([i % 251]) * size, captured_at=1.0 + i, camera_id="c")
+            for i in range(start, start + n)]
+
+
+def test_the_pictures_share_of_the_outbox_file_has_a_ceiling_and_drops_are_counted(tmp_path):
+    store = OutboxStore(narrow(tmp_path) / "lane.outbox.sqlite", pictures_max_bytes=350)
+    queue = EventQueue(PlatformTransport(FakePlatform(online=False)), store=store)
+    queue.record(SESSION_OPEN, "lane-entry", plate="CAP-1", at="2026-10-27T10:00:00+00:00",
+                 entry_confirmation=CONFIRMED)
+    for car in range(5):
+        queue.queue_pictures(f"e-{car}", sized(1, 100, start=car))
+        assert queue.wait_written(5)
+    assert store.picture_count() == 3, "the ceiling: 350 bytes hold three of 100"
+    assert queue.pictures_dropped == 2
+    kept = {p.event_id for _, p in store.held_pictures(10)}
+    assert kept == {"e-2", "e-3", "e-4"}, "the oldest went first"
+    assert len(store.held()) == 1, "and the stay is still on disk"
+    queue.queue_pictures("e-big", sized(1, 400))
+    assert queue.wait_written(5)
+    assert queue.pictures_dropped == 3, "a picture larger than the ceiling is not kept"
+    # Published where the lane's other drops are.
+    controller, _, _ = a_lane([SEEN])
+    controller.events = queue
+    assert LaneService(controller).events(0).to_dict()["pictures_dropped"] == 3
+
+
+def test_serve_wires_the_ceiling_a_site_states(tmp_path):
+    from lane_controller import cli
+
+    directory = narrow(tmp_path)
+    base = dict(lane_id="l", site_id="s", camera=CameraConfig(camera_id="c", rtsp_url=""),
+                gate=GateConfig(), cache_path=str(directory / "cache.sqlite"))
+    platform = FakePlatform()
+    platform.base_url = "https://platform.test"
+    wired = cli.wire_lane(LaneConfig(**base, outbox_pictures_max_bytes=32 << 20), platform=platform)
+    assert wired.controller.events._store.pictures_max_bytes == 32 << 20
+    with pytest.raises(ValueError, match="outbox_pictures_max_bytes"):
+        LaneConfig(**base, outbox_pictures_max_bytes=1024)
+
+
+def test_a_removal_that_fails_holds_no_flush_and_sends_nothing_twice(tmp_path):
+    class StuckDeletes(OutboxStore):
+        """The first eight pictures -- a whole page -- cannot be removed."""
+
+        def remove_pictures(self, refs):
+            if any(ref in self.stuck for ref in refs):
+                raise OSError(5, "I/O error")
+            super().remove_pictures(refs)
+
+    class Counting(FakePlatform):
+        """Every post taken, and counted per picture."""
+
+        def __init__(self):
+            super().__init__()
+            self.taken: dict[str, int] = {}
+
+        def post_picture(self, *, picture_ref, **kwargs):
+            self.taken[picture_ref] = self.taken.get(picture_ref, 0) + 1
+            return super().post_picture(picture_ref=picture_ref, **kwargs)
+
+    platform = Counting()
+    store = StuckDeletes(narrow(tmp_path) / "lane.outbox.sqlite")
+    queue = EventQueue(PlatformTransport(platform), store=store)
+    queue.queue_pictures("e-1", pictures(10))
+    assert queue.wait_written(5)
+    store.stuck = {p.picture_ref for _, p in store.held_pictures(8)}
+    for _ in range(3):
+        queue.flush_pictures()
+        assert queue.wait_written(5)
+    assert len(platform.pictures) == 10, "the pictures behind the stuck page were never sent"
+    assert set(platform.taken.values()) == {1}, "a picture already taken was sent again"
+
+
+# ---------------------------------------------------------------------------
+# E -- the three differences the review named, each held
+# ---------------------------------------------------------------------------
+
+
+def an_exit_lane(identity, *, cache=None):
+    config = LaneConfig(
+        lane_id="lane-exit", site_id="site-1", direction="exit",
+        camera=CameraConfig(camera_id="sim-cam-1", rtsp_url="", frames_per_read=1),
+        gate=GateConfig(), confidence_threshold=THRESHOLD,
+        loops=LoopConfig(arming_loops=1, closing_loops=1, closing_spacing_m=0.0,
+                         confirmation_window_seconds=WINDOW),
+    )
+    return LaneController(
+        config, loop=SimulatedLoopInput(arrivals=1), camera=CannedCameraFeed(),
+        vend=RecordingVendOutput(), identifier=StubVehicleIdentifier([identity]),
+        closing_loops=ScriptedClosingLoops([]),
+        # `is not None`, never `or`: an empty cache has no rules and is falsy.
+        cache=cache if cache is not None else DecisionCache(),
+    )
+
+
+def test_an_exit_records_its_pending_close_on_the_read_as_it_came():
+    """E1: the stay's "unreadable" is an entry's; an exit's pending record is
+    what it was before this round."""
+    unsure = VehicleIdentity(plate="EX-1", plate_region="FL", confidence=0.42)
+    exit_lane = an_exit_lane(unsure)
+    exit_lane.begin_transit(unsure, "2026-10-27T10:00:00+00:00")
+    [pending] = [e.detail for e in exit_lane.events._queue if e.kind == "exit_pending"]
+    assert (pending["identity_kind"], pending["plate_region"]) == ("plate", "FL")
+
+
+def test_a_closed_exit_stays_closed_past_the_bound_and_its_gate_was_shut_there_before_too():
+    """E2: kept, with this reason. The closing names no car, so it outlives the
+    personal-data wipe. Before this round the wipe took the closing too -- and
+    the empty cache then fell back `stale_rules` on every car at that exit, so
+    the gate was shut either way. What changed is only the record: it now says
+    the owner closed the lane, which is true, rather than that rules are old."""
+    cache = DecisionCache(max_age_seconds=3600)
+    cache.load([], default_action="allow", now=time.time() - 7200)
+    cache._take_lane({"lane": EVERYONE})
+    assert cache.expire_if_past_bound() is True
+    exit_lane = an_exit_lane(SEEN, cache=cache)
+    decision = exit_lane.run_once()
+    assert (decision.outcome, decision.fallback) == (Outcome.FALLBACK, Fallback.LANE_CLOSED)
+    assert exit_lane.vend.vend_count == 0
+
+
+def test_a_stale_owners_rule_is_never_applied():
+    """E3: reverted to what it was before this round -- an owner's rule for a
+    plate is used only while the cache is trusted."""
+    stale, vend, _ = a_lane([SEEN], rules=[Rule(plate=STRANGER, allow=False)], stale=True)
+    assert stale.run_once().outcome is Outcome.ALLOW, "a stale deny rule was applied"
+    fresh, vend, _ = a_lane([SEEN], rules=[Rule(plate=STRANGER, allow=False)])
+    assert fresh.run_once().outcome is Outcome.DENY, "the control: a fresh one is"
+
+
+# ---------------------------------------------------------------------------
+# D -- the arming read of a car a person lets in, or that drives in anyway
+# ---------------------------------------------------------------------------
+
+
+def test_the_arming_read_of_a_car_a_person_lets_in_is_kept_with_its_stay():
+    controller, _, platform = a_lane([LOW], transient=False, register=a_register(),
+                                     images=IMAGES)
+    controller.run_once()
+    service = LaneService(controller)
+    status, _ = complete(service, controller, authority=VendAuthority.HUMAN_OPEN_NOW)
+    assert status == 202
+    settled(service)
+    [opened] = platform.opened
+    kept = {p["image"] for p in pictures_of(platform, opened["event_id"])}
+    assert set(IMAGES[:2]) <= kept, "the pictures the car was identified from were lost"
+
+
+def test_the_arming_read_of_a_refused_car_that_drives_in_anyway_is_kept_with_its_stay():
+    controller, _, platform = a_lane([SEEN, UNREAD], rules=[Rule(plate=STRANGER, allow=False)],
+                                     images=IMAGES)
+    controller.run_once()
+    controller.run_once()
+    [opened] = platform.opened
+    kept = {p["image"] for p in pictures_of(platform, opened["event_id"])}
+    assert set(IMAGES[:2]) <= kept
+
+
+def test_a_crossing_whose_plate_says_it_is_another_car_does_not_take_them():
+    controller, _, platform = a_lane([SEEN, TAILGATER], rules=[Rule(plate=STRANGER, allow=False)],
+                                     images=IMAGES)
+    controller.run_once()
+    controller.run_once()
+    [opened] = platform.opened
+    kept = {p["image"] for p in pictures_of(platform, opened["event_id"])}
+    assert not set(IMAGES[:2]) & kept

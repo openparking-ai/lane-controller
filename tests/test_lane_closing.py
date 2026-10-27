@@ -22,8 +22,10 @@ requires this file to go red:
   14 a price on the board is what the lane would charge for that stay at that
      moment, tax and an event window included
   15 pass holders only, at an entry: a car a register covers today gets in;
-     every other car is DENIED, the gate shut (the owner's rule, 2026-10-26,
-     not the fallback path it used to take); the exit still lets cars out;
+     every other car read with confidence is DENIED, the gate shut (the
+     owner's rule, 2026-10-26, not the fallback path it used to take); a car
+     read too unclearly to confirm goes to a person, for now; the exit still
+     lets cars out;
      a garage that has not said so is the lane as it was; and it is one rule
      whatever the garage's default -- it used to be read only where the
      default was `allow`
@@ -584,9 +586,12 @@ def test_pass_holders_only_keeps_the_gate_shut_for_every_other_car():
     ended.cache.transient_available = False
     assert ended.run_once().outcome is Outcome.DENY
     assert ended.vend.vend_count == 0
-    # and so is a car nobody could read: it cannot be matched to a register
+    # but a car read too unclearly to be matched is not denied for it: its
+    # pass cannot be confirmed, and until a registration QR can be scanned at
+    # the lane that is a person's case -- the gate still shut
     unclear = pass_only_lane([UNCLEAR])
-    assert unclear.run_once().outcome is Outcome.DENY
+    decision = unclear.run_once()
+    assert (decision.outcome, decision.fallback) == (Outcome.FALLBACK, Fallback.LOW_CONFIDENCE)
     assert unclear.vend.vend_count == 0
 
 

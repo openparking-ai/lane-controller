@@ -464,6 +464,17 @@ class PlatformTransport(EventTransport):
             **({"tailgater": True} if event.detail.get("tailgater") else {}),
             # A plate nobody could read: the third identity (platform 0036).
             **({"plate_unreadable": True} if event.detail.get("plate_unreadable") else {}),
+            # A car no open command let in, read or not (0036): its own mark.
+            **({"no_open_command": True} if event.detail.get("no_open_command") else {}),
+            # What was read below the confidence, not an identity (0036).
+            **(
+                {
+                    "unsure_plate": event.detail["unsure_plate"],
+                    "unsure_plate_confidence": event.detail.get("unsure_plate_confidence"),
+                }
+                if event.detail.get("unsure_plate")
+                else {}
+            ),
         )
         require_confirmation_echo(result, declared, end="entry", action="open")
         require_descriptor_echo(result, descriptor)

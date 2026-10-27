@@ -918,13 +918,17 @@ class EventPage:
     `dropped` is the lane's own count of LOG events the OUTBOX discarded
     because it reached its limit. That is a different queue with a different
     bound, and it is published because a gap nobody knows about is worse than
-    one that is counted.
+    one that is counted. `pictures_dropped` is the same count for the pictures
+    kept with entries: past the ceiling on their share of the outbox file (or,
+    without a file, past what memory holds), the oldest are let go so the
+    stays always have room. Added within version 2.
     """
 
     cursor: int
     reset: bool
     dropped: int
     events: tuple[dict, ...] = field(default_factory=tuple)
+    pictures_dropped: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -932,6 +936,7 @@ class EventPage:
             "cursor": self.cursor,
             "reset": self.reset,
             "dropped": self.dropped,
+            "pictures_dropped": self.pictures_dropped,
             "events": list(self.events),
         }
 

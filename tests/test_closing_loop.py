@@ -12,7 +12,7 @@ What the code does, and it is the whole of what is claimed here:
   * a vend, then nothing in the window -> `held`, exactly as a two-loop lane;
   * the closing loop occupied with no vend behind it -> an entry nothing
     admitted, never a confirmed one -- and a stay all the same (2026-10-26),
-    `tailgater: true`, its plate unreadable when nothing read it;
+    `no_open_command: true`, its plate unreadable when nothing read it;
   * the published geometry says `closing_loops: 1` and no spacing;
   * a lane built from `config/lane.example.toml` -- the drawing's lane -- counts
     in the platform's `inside_count`.
@@ -207,8 +207,9 @@ def test_the_closing_loop_occupied_with_no_vend_is_an_entry_nothing_admitted():
     assert kinds(controller).count(ENTRY_UNADMITTED) == 1
     assert ENTRY_CONFIRMED not in kinds(controller), "confirmed with no vend behind it"
     opened = detail(controller, SESSION_OPEN)
-    assert (opened["tailgater"], opened["identity_kind"], opened["plate_unreadable"]) == (
+    assert (opened["no_open_command"], opened["identity_kind"], opened["plate_unreadable"]) == (
         True, "unread", True)
+    assert "tailgater" not in opened, "a car nobody could read is never a tailgater"
     recorded = detail(controller, ENTRY_UNADMITTED)
     assert recorded["reason"] == REASON_NO_PENDING_ENTRY
     assert recorded["geometry_assumed"]["closing_loops"] == 1

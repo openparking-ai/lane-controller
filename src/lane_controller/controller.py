@@ -505,6 +505,12 @@ class LaneController:
         #: The held vend (its `transit_since`) whose late crossing has already
         #: been taken for its car, so a second crossing after it is not.
         self._late_taken_for: str | None = None
+        #: A refused car's arming read, `(decision_at, frames)`, held until the
+        #: next arrival (`_keep_refused_arming`); and the one a person's
+        #: completion set aside for its transit, `(at, frames)`
+        #: (`take_completion_arming`).
+        self._held_arming: tuple[str, list] | None = None
+        self._completion_arming: tuple[str, list] | None = None
 
     def now(self) -> float:
         """This lane's clock, which is the authority for WHEN.
@@ -619,6 +625,9 @@ class LaneController:
         self.last_decision_completed_at = None
         self.last_read_ref = identity.read_ref
         self.last_cause = identity.unavailable.value if identity.unavailable else None
+        # A refused car's arming read is held until the next arrival, for the
+        # stay it may yet get -- by a person's word, or by driving in anyway.
+        self._keep_refused_arming(decision, frames)
 
         if self.config.direction == "exit" and decision.outcome is not Outcome.NO_VEHICLE:
             # THE FEE ON THE READER, BEFORE THE BARRIER MOVES -- handed over,
@@ -768,6 +777,8 @@ class LaneController:
         # THE DECISION IS CONSUMED HERE, beside the relay pulse it authorised
         # rather than in the route that asked for it, so nothing can vend
         # without consuming and nothing can consume without vending.
+        arming = self._take_held_arming()
+        self._completion_arming = (at, arming) if arming else None
         self.last_decision_completed_at = at
         self.begin_transit(identity, at)
 
@@ -931,7 +942,10 @@ class LaneController:
         names = _ENTRY if self.config.direction == "entry" else _EXIT
         geometry = self.config.loops.as_published()
 
-        identity = self._stay_identity(identity)
+        if self.config.direction == "entry":
+            # What the stay will carry. An exit records its pending close on
+            # the read as it came, exactly as before this rule.
+            identity = self._stay_identity(identity)
         self.events.record(
             names.pending,
             lane,
@@ -1345,12 +1359,15 @@ class LaneController:
         # one the camera says no car made (`_crossing_identity`).
         frames = self._take_pictures(CLOSING_PICTURES)
         identity = self._crossing_identity(frames)
+        read = (
+            plate_read(identity, self.config.confidence_threshold) if identity is not None else None
+        )
         unadmitted = self.events.record(
             ENTRY_UNADMITTED,
             lane,
             reason=REASON_NO_PENDING_ENTRY,
             # Whether the plate was read: a fact, not whether there is a stay.
-            identified=identity is not None and bool(identity.plate),
+            identified=read is not None,
             stay_opened=identity is not None,
             at=at,
             geometry_assumed=self.config.loops.as_published(),
@@ -1366,10 +1383,26 @@ class LaneController:
             last_transit=self.transit_state,
         )
         if identity is not None:
+            # TWO MARKS, NOT ONE. `no_open_command`: no open command of this
+            # lane let the car in -- every such car, read or not. `tailgater`
+            # keeps its own meaning (U7f): such a car whose plate was READ, the
+            # one a garage that bans tailgaters may list. A car nobody could
+            # read is never a tailgater: a monthly with a dirty plate through a
+            # raised barrier must not be locked out on a match nobody can check.
+            # The car this lane admitted and held, crossing late, carries
+            # neither: its open command let it in.
+            late = self._late_admitted(identity)
             opened = self._record_session(
-                identity, at, confirmation=CONFIRMED, tailgater=not self._late_admitted(identity)
+                identity,
+                at,
+                confirmation=CONFIRMED,
+                tailgater=not late and read is not None,
+                no_open_command=not late,
             )
-            self.events.queue_pictures(opened.event_id, frames)
+            # And the arming read of the car this lane last refused, when this
+            # crossing may be that car driving in anyway.
+            arming = [] if late else self._refused_arming_for(identity)
+            self.events.queue_pictures(opened.event_id, [*arming, *frames])
         else:
             self.events.queue_pictures(unadmitted.event_id, frames)
         self._unadmitted_leaves_the_box()
@@ -1577,7 +1610,8 @@ class LaneController:
         closing-loop pictures -- what a stay opened for it carries.
 
         A plate read at the lane's confidence, or "unreadable": the stay is
-        opened either way (`_stay_identity` says what it carries). The
+        opened either way (`_stay_identity` says what it carries, and
+        `_unsure_plate` what it keeps of a read below the confidence). The
         appearance descriptor goes with it whenever the read produced one.
         No pictures, or an identifier that fails, is still a car the loops saw
         cross: an unreadable stay with no descriptor. None ONLY when the camera
@@ -1594,7 +1628,94 @@ class LaneController:
         if read.presence is False:
             return None
         # A ticket is asserted, never read: the seam `handle_arrival` keeps.
-        return self._stay_identity(replace(read, ticket_ref=None))
+        # The READ as it came, a plate below the confidence included: the stay
+        # makes it "unreadable" and keeps what was seen beside it
+        # (`_record_session`).
+        return replace(read, ticket_ref=None)
+
+    #: The longest plate text the platform takes (its `PLATE_MAX`): what was
+    #: read below the confidence is kept only within it, so a read nobody can
+    #: use never costs the car its stay (a refused open is a lost stay).
+    UNSURE_PLATE_MAX = 32
+
+    def _unsure_plate(self, identity) -> dict:
+        """What the camera read of a plate BELOW the lane's confidence, with that
+        confidence, for an unread car's open: `{"unsure_plate", "unsure_plate_
+        confidence"}`, or `{}`.
+
+        NOT AN IDENTITY (platform 0036): never looked up here or there, never
+        the stay's plate, never compared to a register, never ban-listed. It is
+        what was seen, kept for the exit's matching -- dropped, a car read the
+        same way at the exit had nothing to be matched on. Nothing for a ticket,
+        a plate this lane stands behind, a read that never happened, or a text
+        the platform would refuse."""
+        if (
+            identity.ticket_ref
+            or not identity.plate
+            or identity.unavailable is not None
+            or identity.presence is False
+            or plate_read(identity, self.config.confidence_threshold)
+        ):
+            return {}
+        text = identity.plate
+        confidence = identity.confidence
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or len(text) > self.UNSURE_PLATE_MAX
+            or not isinstance(confidence, int | float)
+            or not 0.0 <= float(confidence) <= 1.0
+        ):
+            return {}
+        return {"unsure_plate": text, "unsure_plate_confidence": round(float(confidence), 4)}
+
+    def _keep_refused_arming(self, decision, frames) -> None:
+        """Keep a refused car's arming read, with the decision it belongs to,
+        until the next arrival: if that car is let in by a person
+        (`take_completion_arming`) or drives in anyway (`_refused_arming_for`),
+        the pictures it was identified from go with its stay."""
+        self._held_arming = (
+            (self.last_decision_at, list(frames))
+            if self.config.direction == "entry"
+            and not decision.should_vend
+            and decision.outcome is not Outcome.NO_VEHICLE
+            and frames
+            else None
+        )
+
+    def _take_held_arming(self) -> list:
+        held, self._held_arming = self._held_arming, None
+        if held is None or held[0] != self.last_decision_at:
+            return []
+        return held[1]
+
+    def _refused_arming_for(self, identity) -> list:
+        """The arming read of the car this lane last refused, for a crossing
+        that may be that car driving in anyway: no arrival since, the refusal
+        not completed by anybody, and no plate read on both that says they are
+        two cars. Taken once. Not a binding -- the lane cannot prove whose
+        crossing this was -- which is why a contradicting plate keeps them out."""
+        if (
+            self._held_arming is None
+            or self.last_decision is None
+            or self.last_decision.should_vend
+            or self.last_decision_completed_at is not None
+        ):
+            return []
+        refused = plate_read(self.last_decision.identity, self.config.confidence_threshold)
+        crossing = plate_read(identity, self.config.confidence_threshold)
+        if refused and crossing and refused.upper() != crossing.upper():
+            return []
+        return self._take_held_arming()
+
+    def take_completion_arming(self, at: str) -> list:
+        """The arming read of the car a person's completion let in, for the
+        transit that completion began at `at` -- taken once (`complete_vend`
+        set it aside). The assisted vend's settle hands it to `resolve_transit`."""
+        held, self._completion_arming = self._completion_arming, None
+        if held is None or held[0] != at:
+            return []
+        return held[1]
 
     def _stay_identity(self, identity):
         """The identity a stay carries: what this lane stands behind.
@@ -1630,7 +1751,8 @@ class LaneController:
         ):
             return False
         held = plate_read(self.last_decision.identity, self.config.confidence_threshold)
-        if held and identity.plate and held.upper() != identity.plate.upper():
+        crossing = plate_read(identity, self.config.confidence_threshold)
+        if held and crossing and held.upper() != crossing.upper():
             return False
         self._late_taken_for = self.transit_since
         return True
@@ -1659,7 +1781,14 @@ class LaneController:
             return None
 
     def _record_session(
-        self, identity, at: str, *, confirmation: str, exit_pricing=None, tailgater: bool = False
+        self,
+        identity,
+        at: str,
+        *,
+        confirmation: str,
+        exit_pricing=None,
+        tailgater: bool = False,
+        no_open_command: bool = False,
     ) -> LaneEvent | None:
         """Put the session action on the queue, saying what confirmed it -- and,
         at an exit, what the barrier decided (`local_decision`). Returns the
@@ -1667,19 +1796,24 @@ class LaneController:
         lane = self.config.lane_id
         if self.config.direction == "entry":
             # What this lane stands behind, and nothing it does not: a plate
-            # read below its confidence is "unreadable" on the stay.
+            # read below its confidence is "unreadable" on the stay -- and what
+            # was read is kept beside it, as a field that is not an identity.
+            unsure = self._unsure_plate(identity)
             identity = self._stay_identity(identity)
             return self.events.record(
                 SESSION_OPEN,
                 lane,
                 **self._identity_detail(identity, with_region=True),
                 **self._session_descriptor(identity),
+                **unsure,
                 at=at,
                 entry_confirmation=confirmation,
-                # A car through the gate that no open command let in (U7f).
-                # Only when true, so every other open is the record it always
-                # was.
+                # A car no vend let in whose plate was READ (U7f). Only when
+                # true, so every other open is the record it always was.
                 **({"tailgater": True} if tailgater else {}),
+                # A car the loops saw go in that no open command let in, read
+                # or not (platform 0036). Only when true.
+                **({"no_open_command": True} if no_open_command else {}),
             )
         # WHICH SESSION THIS IS is asked of the platform when the close is
         # DELIVERED, by the transport, on the thread that drains the outbox

@@ -11,8 +11,9 @@ with it (tests/test_entry_always_a_stay.py holds that round's guarantees).
      the vend and the closing loop, and at it. A held entry keeps none; nor
      does a refused car's arming read -- it opened no stay
   2  a tailgater read at the closing loop is a stay, `tailgater: true`; not
-     read, it is a stay too, `plate_unreadable`, with its pictures. The car
-     this lane admitted and held, crossing late, is a stay but not a tailgater
+     read, it is a stay too, `plate_unreadable` and `no_open_command` -- never
+     a tailgater -- with its pictures. The car this lane admitted and held,
+     crossing late, is a stay but not a tailgater
   4  a car whose descriptor matches the banned list: no vend, reason `banned`,
      its pictures with the decision. No match, no comparison wired, or a
      comparison that fails: the car is decided as before
@@ -187,10 +188,12 @@ def test_a_tailgater_not_read_is_a_stay_with_an_unreadable_plate_and_its_picture
     assert platform.events[unadmitted]["detail"]["identified"] is False
     assert platform.events[unadmitted]["detail"]["stay_opened"] is True
     [opened] = platform.opened
-    assert (opened["plate"], opened["plate_unreadable"], opened["tailgater"]) == (
+    assert (opened["plate"], opened["plate_unreadable"], opened["no_open_command"]) == (
         None, True, True)
+    assert opened["tailgater"] is False, "a car nobody could read is never a tailgater"
     assert opened["entry_confirmation"] == CONFIRMED
-    assert pictures_of(platform, opened["event_id"]) == 2
+    # The refused car's arming read (one frame) and the closing loop's two.
+    assert pictures_of(platform, opened["event_id"]) == 3
 
 
 def test_a_read_below_the_lanes_confidence_is_not_a_read():
@@ -202,6 +205,9 @@ def test_a_read_below_the_lanes_confidence_is_not_a_read():
     controller.run_once()
     [opened] = platform.opened
     assert (opened["plate"], opened["plate_unreadable"]) == (None, True)
+    # What was read is kept beside it, as a field that is not an identity.
+    assert (opened["unsure_plate"], opened["unsure_plate_confidence"]) == ("TAIL-2", 0.5)
+    assert opened["tailgater"] is False
 
 
 def test_the_car_this_lane_admitted_and_held_crossing_late_is_a_stay_but_not_a_tailgater():

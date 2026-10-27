@@ -192,7 +192,9 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
     # an outage loses none of them (`durable.OutboxStore`). Same directory,
     # same rule; refused by the same exception if the directory is not ours.
     outbox = (
-        OutboxStore(outbox_path(config.cache_path))
+        OutboxStore(
+            outbox_path(config.cache_path), pictures_max_bytes=config.outbox_pictures_max_bytes
+        )
         if platform is not None and config.cache_path
         else None
     )

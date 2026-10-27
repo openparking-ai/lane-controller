@@ -147,7 +147,7 @@ def _break_the_queue(monkeypatch):
         # `serve` keeps the outbox in memory whatever the cache does.
         from lane_controller import cli as cli_module
 
-        monkeypatch.setattr(cli_module, "OutboxStore", lambda path: None)
+        monkeypatch.setattr(cli_module, "OutboxStore", lambda path, **kwargs: None)
 
     elif mode == "all_or_nothing":
         # The old flush: the whole queue in one send, everything kept on the
@@ -3092,7 +3092,12 @@ def _break_the_entry_stay(monkeypatch):
 
         def read_only(self, frames):
             identity = original(self, frames)
-            return identity if identity is not None and identity.plate else None
+            read = (
+                decision_module.plate_read(identity, self.config.confidence_threshold)
+                if identity is not None
+                else None
+            )
+            return identity if read else None
 
         monkeypatch.setattr(LaneController, "_crossing_identity", read_only)
 
@@ -3172,7 +3177,8 @@ def _break_the_entry_stay(monkeypatch):
 
         def capped(self, picture):
             if self.picture_count() < 200:
-                original(self, picture)
+                return original(self, picture)
+            return 1
 
         monkeypatch.setattr(durable_module.OutboxStore, "add_picture", capped)
 
@@ -3185,7 +3191,7 @@ def _break_the_entry_stay(monkeypatch):
                 return 0
             if self._store is not None:
                 self.wait_written()
-                batch = self._store.held_pictures(10**6)
+                batch = [picture for _, picture in self._store.held_pictures(10**6)]
                 if not batch or not send(batch):
                     return 0
                 self._store.remove_pictures([p.picture_ref for p in batch])
@@ -3292,6 +3298,192 @@ def _break_the_entry_stay(monkeypatch):
             return len(kept)
 
         monkeypatch.setattr(EventQueue, "queue_pictures", write_now)
+
+    elif mode == "unread_is_a_tailgater":
+        # B: every car no open command let in is marked a tailgater, read or
+        # not -- the dirty-plate monthly ends up on a banned list.
+        original = LaneController._record_session
+
+        def everyone_tails(self, identity, at, **kwargs):
+            if kwargs.get("no_open_command"):
+                kwargs["tailgater"] = True
+            return original(self, identity, at, **kwargs)
+
+        monkeypatch.setattr(LaneController, "_record_session", everyone_tails)
+
+    elif mode == "no_mark":
+        # B: "no open command let it in" is not said at all.
+        original = LaneController._record_session
+
+        def unmarked(self, identity, at, **kwargs):
+            kwargs["no_open_command"] = False
+            return original(self, identity, at, **kwargs)
+
+        monkeypatch.setattr(LaneController, "_record_session", unmarked)
+
+    elif mode == "unsure_plate_dropped":
+        # A: what was read below the confidence is thrown away.
+        monkeypatch.setattr(LaneController, "_unsure_plate", lambda self, identity: {})
+
+    elif mode == "pass_only_unread_denied":
+        # C: a pass-only car whose pass cannot be confirmed is denied.
+        original = controller_module.decide
+
+        def denied(identity, cache, **kwargs):
+            decision = original(identity, cache, **kwargs)
+            if "the pass could not be confirmed" in decision.reason:
+                return replace(decision, outcome=decision_module.Outcome.DENY, fallback=None)
+            return decision
+
+        monkeypatch.setattr(controller_module, "decide", denied)
+
+    elif mode == "no_register_denied":
+        # C: a pass-only garage holding no register denies every car.
+        original = controller_module.decide
+
+        def denied(identity, cache, **kwargs):
+            decision = original(identity, cache, **kwargs)
+            if "no register is held" in decision.reason:
+                return replace(decision, outcome=decision_module.Outcome.DENY, fallback=None)
+            return decision
+
+        monkeypatch.setattr(controller_module, "decide", denied)
+
+    elif mode == "pass_only_full_to_a_person":
+        # C: a pass-only garage closed full hands an uncovered car to a person.
+        original = controller_module.decide
+
+        def to_a_person(identity, cache, **kwargs):
+            decision = original(identity, cache, **kwargs)
+            if (
+                decision.outcome is decision_module.Outcome.DENY
+                and decision.reason.startswith("this lane is closed full")
+            ):
+                return replace(
+                    decision,
+                    outcome=decision_module.Outcome.FALLBACK,
+                    fallback=decision_module.Fallback.LANE_CLOSED,
+                )
+            return decision
+
+        monkeypatch.setattr(controller_module, "decide", to_a_person)
+
+    elif mode == "display_code_opens_pass_only":
+        # C: a display code completes a pass-only garage's person case.
+        from lane_controller import vend as vend_module
+
+        monkeypatch.setattr(vend_module, "person_only", lambda controller: False)
+
+    elif mode == "registers_wiped_at_the_bound":
+        # 4: a pass-only garage's registers go with the cache a day into an
+        # outage, and every monthly waits for a person.
+        original = decision_module.DecisionCache.clear
+
+        def wipe_registers(self):
+            self.entitlements = {}
+            self._reindex_coverage()
+            original(self)
+
+        monkeypatch.setattr(decision_module.DecisionCache, "clear", wipe_registers)
+
+    elif mode == "registers_kept_on_reconnect":
+        # 4: registers kept through an outage outlive it: the platform answers
+        # and a module it could not read keeps what the lane held from before.
+        original = decision_module.DecisionCache.load_payload
+
+        def keeping(self, payload, *, now=None):
+            self._registers_past_bound = False
+            return original(self, payload, now=now)
+
+        monkeypatch.setattr(decision_module.DecisionCache, "load_payload", keeping)
+
+    elif mode == "pictures_uncapped":
+        # F: no ceiling on the pictures' share of the outbox file.
+        original = durable_module.OutboxStore.add_picture
+
+        def uncapped(self, picture):
+            self.pictures_max_bytes = 1 << 62
+            return original(self, picture)
+
+        monkeypatch.setattr(durable_module.OutboxStore, "add_picture", uncapped)
+
+    elif mode == "pictures_dropped_unpublished":
+        # F: the drops are counted and never published.
+        from lane_controller import service as service_module
+
+        original = service_module.LaneService.events
+
+        def unsaid(self, since):
+            return replace(original(self, since), pictures_dropped=0)
+
+        monkeypatch.setattr(service_module.LaneService, "events", unsaid)
+
+    elif mode == "stuck_flush":
+        # F: the flush reads "the oldest few" again instead of the next page:
+        # a page whose removal failed holds every picture behind it.
+        original = durable_module.OutboxStore.held_pictures
+
+        def from_the_top(self, limit, *, after=0):
+            return original(self, limit)
+
+        monkeypatch.setattr(durable_module.OutboxStore, "held_pictures", from_the_top)
+
+    elif mode == "taken_sent_again":
+        # F: a picture whose removal failed is sent again on every flush.
+        original = EventQueue._flush_disk_pictures
+
+        def forgetful(self, send):
+            with self._state:
+                self._sent_unremoved.clear()
+            return original(self, send)
+
+        monkeypatch.setattr(EventQueue, "_flush_disk_pictures", forgetful)
+
+    elif mode == "exit_stay_identity":
+        # E1: an exit's pending close is made "unreadable" like an entry's.
+        original = LaneController.begin_transit
+
+        def stripped(self, identity, at):
+            return original(self, self._stay_identity(identity), at)
+
+        monkeypatch.setattr(LaneController, "begin_transit", stripped)
+
+    elif mode == "closing_reopens_at_the_bound":
+        # E2: the closing goes with the personal data, as before this round.
+        original = decision_module.DecisionCache.clear
+
+        def reopening(self):
+            original(self)
+            self.lane = dict(decision_module.OPEN_LANE)
+
+        monkeypatch.setattr(decision_module.DecisionCache, "clear", reopening)
+
+    elif mode == "stale_rule_applied":
+        # E3: an owner's rule is applied from a cache past its age.
+        original = decision_module._decide_entry
+
+        def trusting(identity, cache, **kwargs):
+            return original(identity, cache, **{**kwargs, "stale": False})
+
+        monkeypatch.setattr(decision_module, "_decide_entry", trusting)
+
+    elif mode == "assisted_arming_dropped":
+        # D: the car a person lets in keeps none of its arming read.
+        monkeypatch.setattr(LaneController, "take_completion_arming", lambda self, at: [])
+
+    elif mode == "refused_arming_dropped":
+        # D: a refused car that drives in anyway keeps none of its arming read.
+        monkeypatch.setattr(LaneController, "_refused_arming_for", lambda self, identity: [])
+
+    elif mode == "refused_arming_any_car":
+        # D: the refused car's arming read goes with whatever crosses, even a
+        # car whose plate says it is another.
+        def any_car(self, identity):
+            if self._held_arming is None or self.last_decision is None:
+                return []
+            return self._take_held_arming()
+
+        monkeypatch.setattr(LaneController, "_refused_arming_for", any_car)
 
     else:
         raise RuntimeError(f"unknown BREAK_ENTRY_STAY mode: {mode}")

@@ -383,16 +383,25 @@ not change; how often each member appears does.
   `no_plate_read`, `unknown_vehicle`, `engine_unreachable` or `stale_rules` at
   such a lane's entry.
 - **A monthly/pass-only garage** decides `allow` for a car its registers cover
-  today and `deny` for every other car, read or not -- never `fallback` for it.
-  `human_open_now` overrides that `deny` exactly as it overrides any (see
-  `not_completable` below); a display code does not. Where a scanned
+  today and `deny` for every other car whose plate it read with confidence,
+  full or not. `human_open_now` overrides that `deny` exactly as it overrides
+  any (see `not_completable` below); a display code does not. Where a scanned
   registration QR will be presented is that `deny`; this version has no scanner.
+  Until there is one, a car whose pass this lane cannot confirm -- its plate
+  unread or read below the confidence (`low_confidence`, `no_plate_read`,
+  `engine_unreachable`), or no register held at all (`stale_rules`) -- is
+  decided `fallback`, a person's case, and at such a garage's entry
+  **`display_code_confirmed` is refused `not_completable`**, as at a closed lane:
+  a display code is a driver serving themselves, and this garage takes no
+  stranger.
 - **A garage that has not stated it**, and **every exit**, decide as before.
 
 Whatever was decided, every car the loops see go in -- the one the lane opened
 for, a second car through the same opening, a refused car that drove in anyway
--- is a stay on the platform, identified by a plate or as `plate_unreadable`.
-None of it is on this contract: session actions never are.
+-- is a stay on the platform, identified by a plate or as `plate_unreadable`
+(with what was read below the confidence kept beside it, never as an identity),
+and a car no open command let in is marked `no_open_command`. None of it is on
+this contract: session actions never are.
 
 ### The transit
 
@@ -609,6 +618,7 @@ so a monitor built on this surface must not page a human on it.
   "cursor": 7,
   "reset": false,
   "dropped": 0,
+  "pictures_dropped": 0,
   "events": [
     {
       "cursor": 7,
@@ -646,6 +656,11 @@ policy for both surfaces.
   it reached its limit. That is a different queue with a different bound from
   the read window above, and it is published because a gap nobody knows about
   is worse than one that is counted.
+- `pictures_dropped` is the same count for the **pictures** kept with entries:
+  past the ceiling on their share of the outbox file (`[lane]
+  outbox_pictures_max_bytes`), or past what memory holds on a lane with no
+  file, the oldest not yet sent are let go so the stays always have room. It
+  was added within version 2; a consumer ignores a field it does not know.
 
 **This route serves LOG events.** Session actions — a session opened, a session
 closed — are not on it. They are the ledger's: they become

@@ -26,6 +26,28 @@ the platform client -- and never on the fixture that drives it.
   disk_on_the_lane_thread       the stay's write holds the next car on the disk
   pictures_disk_on_the_lane_thread
                                 the pictures' writes hold the next car on the disk
+
+and the review's fixes:
+
+  unread_is_a_tailgater         a car nobody could read is marked a tailgater
+  no_mark                       "no open command let it in" is not said
+  unsure_plate_dropped          what was read below the confidence is thrown away
+  pass_only_unread_denied       a pass-only car whose pass cannot be confirmed is denied
+  no_register_denied            a pass-only garage holding no register denies every car
+  pass_only_full_to_a_person    a pass-only garage closed full sends an uncovered car to a person
+  display_code_opens_pass_only  a display code completes a pass-only garage's person case
+  registers_wiped_at_the_bound  a pass-only garage's registers go a day into an outage
+  registers_kept_on_reconnect   registers kept through an outage outlive it
+  pictures_uncapped             no ceiling on the pictures' share of the outbox file
+  pictures_dropped_unpublished  the pictures dropped are not published
+  stuck_flush                   a page whose removal failed holds every picture behind it
+  taken_sent_again              a picture whose removal failed is sent again
+  exit_stay_identity            an exit's pending close is made unreadable like an entry's
+  closing_reopens_at_the_bound  the closing goes with the personal data
+  stale_rule_applied            an owner's rule is applied from a stale cache
+  assisted_arming_dropped       a car a person lets in keeps none of its arming read
+  refused_arming_dropped        a refused car that drives in keeps none of its arming read
+  refused_arming_any_car        a refused car's arming read goes with another car's stay
 """
 
 from __future__ import annotations
@@ -54,6 +76,25 @@ BREAKAGES = [
     ("pass_only_to_a_person", "an uncovered car at a pass-only garage goes to a person"),
     ("disk_on_the_lane_thread", "the stay's write holds the next car on the disk"),
     ("pictures_disk_on_the_lane_thread", "the pictures' writes hold the next car"),
+    ("unread_is_a_tailgater", "a car nobody could read is marked a tailgater"),
+    ("no_mark", "no open command is not said"),
+    ("unsure_plate_dropped", "what was read below the confidence is thrown away"),
+    ("pass_only_unread_denied", "a pass-only car whose pass cannot be confirmed is denied"),
+    ("no_register_denied", "a pass-only garage holding no register denies every car"),
+    ("pass_only_full_to_a_person", "a full pass-only garage sends an uncovered car to a person"),
+    ("display_code_opens_pass_only", "a display code completes a pass-only person case"),
+    ("registers_wiped_at_the_bound", "a pass-only garage's registers go a day into an outage"),
+    ("registers_kept_on_reconnect", "registers kept through an outage outlive it"),
+    ("pictures_uncapped", "the pictures' share of the outbox file has no ceiling"),
+    ("pictures_dropped_unpublished", "the pictures dropped are not published"),
+    ("stuck_flush", "a page whose removal failed holds every picture behind it"),
+    ("taken_sent_again", "a picture whose removal failed is sent again"),
+    ("exit_stay_identity", "an exit's pending close is made unreadable"),
+    ("closing_reopens_at_the_bound", "the closing goes with the personal data"),
+    ("stale_rule_applied", "an owner's rule is applied from a stale cache"),
+    ("assisted_arming_dropped", "a car a person lets in keeps none of its arming read"),
+    ("refused_arming_dropped", "a refused car that drives in keeps none of its arming read"),
+    ("refused_arming_any_car", "a refused car's arming read goes with another car's stay"),
 ]
 
 

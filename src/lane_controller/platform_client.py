@@ -193,6 +193,9 @@ class PlatformClient:
         descriptor: str | None = None,
         tailgater: bool = False,
         plate_unreadable: bool = False,
+        no_open_command: bool = False,
+        unsure_plate: str | None = None,
+        unsure_plate_confidence: float | None = None,
     ) -> dict:
         # event_id is the lane's own, and it is what makes a re-sent flush safe.
         # The platform keys the session on it, so this exact arrival can only
@@ -216,9 +219,22 @@ class PlatformClient:
                 # existed -- so a lane with the descriptor switched off is
                 # unchanged against any platform, old or new.
                 **({"descriptor": descriptor} if descriptor is not None else {}),
-                # A car through the gate that no open command let in (U7f).
-                # Only when true: every other open is byte-identical to before.
+                # A car no vend let in whose plate was read (U7f). Only when
+                # true: every other open is byte-identical to before.
                 **({"tailgater": True} if tailgater else {}),
+                # A car no open command let in, read or not (0036). Only when
+                # true.
+                **({"no_open_command": True} if no_open_command else {}),
+                # What was read of an unread car's plate below the lane's
+                # confidence, with that confidence (0036): not an identity.
+                **(
+                    {
+                        "unsure_plate": unsure_plate,
+                        "unsure_plate_confidence": unsure_plate_confidence,
+                    }
+                    if unsure_plate is not None
+                    else {}
+                ),
             },
         )
 
