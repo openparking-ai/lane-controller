@@ -196,7 +196,9 @@ out by a person. A car that leaves the loop unsettled (clear for two seconds),
 a loop that reads clear for longer than a flicker (half a second) and then
 occupied again — perhaps another car, rolled on without arming — and every case
 with the platform down, is a person's (`fallback_needs_human`); while a car
-waits the loop is sampled every quarter second.
+waits the loop is sampled every quarter second, including while the platform
+is being asked, and a settled case opens only if the car is still on the loop
+when the answer comes back.
 Once the platform has put the case's PaymentIntent on the reader the lane does
 not drive the reader for that car, and a case the lane lets go of — the car
 left, the next car arrived, a person opened at the lane — has its payment taken
@@ -213,7 +215,7 @@ cannot stand behind opens a case with no ID fields, every open stay of the
 garage is a candidate, and the case goes to the picker (ten or fewer) or to
 the driver's word. Checking `plate_characters` at this seam waits for the
 identity service's contract for it. `tests/test_exit_case.py` holds all of it
-and `scripts/exit_settled_fail_control.py` breaks it thirty-seven ways.
+and `scripts/exit_settled_fail_control.py` breaks it forty-two ways.
 **And the close carries that
 decision** (`local_decision` on the session close, the whole of the `decision`
 event's `exit_pricing`, unedited, handed down from the car's own decision and

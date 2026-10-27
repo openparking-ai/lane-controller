@@ -323,8 +323,11 @@ jobs:
           # stuck busy reader alerting nobody, the reader driven for an
           # unpriced case car, a /pay or first answer for another case or
           # event taken, the vend route left busy, the last car's cancel
-          # before the next car's frames -- and requires the exit-case suite
-          # to fail each time.
+          # before the next car's frames; a settled answer opening for a car
+          # that backed off during the call, the loop unwatched during it,
+          # the flicker doubled, the busy count not reset, the driver's-word
+          # answer for another event taken -- and requires the exit-case
+          # suite to fail each time.
           - exit_settled
     steps:
       - uses: actions/checkout@v4

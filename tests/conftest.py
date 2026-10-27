@@ -3892,5 +3892,48 @@ def _break_the_settled_exit(monkeypatch):
 
         monkeypatch.setattr(LaneController, "_drop_exit_case", at_once)
 
+    elif mode == "left_during_call_let_out":
+        # A settled answer opens whether or not the car is still on the loop
+        # after the platform was asked.
+        monkeypatch.setattr(LaneController, "_still_there", lambda self, watch: True)
+
+    elif mode == "loop_unwatched_during_call":
+        # The loop is read before and after a platform call and never during
+        # it, so a car swapped on while the call ran is not seen.
+        monkeypatch.setattr(case_module.LoopWatch, "_run", lambda self: None)
+
+    elif mode == "flicker_doubled":
+        # A clear of up to a second is taken for a flicker.
+        monkeypatch.setattr(case_module, "EXIT_FLICKER_SECONDS", 1.0)
+
+    elif mode == "busy_not_reset":
+        # The busy count is not reset when the reader takes the fee, so busy
+        # answers from before the take are counted towards telling a person.
+        original = case_module._act
+
+        def keeps_count(case, platform, display, *, now):
+            before = case.busy
+            original(case, platform, display, now=now)
+            if before and case.busy == 0:
+                case.busy = before
+
+        monkeypatch.setattr(case_module, "_act", keeps_count)
+
+    elif mode == "word_answer_not_owned":
+        # The answer to the driver's word is taken without checking it is
+        # this case's, under this car's own event.
+        import sys
+
+        original = case_module._own
+
+        def word_unchecked(case, answer):
+            caller = sys._getframe(1)
+            if (caller.f_code.co_name == "_act"
+                    and caller.f_locals.get("needs") == case_module.NEEDS_DRIVER_WORD):
+                return answer
+            return original(case, answer)
+
+        monkeypatch.setattr(case_module, "_own", word_unchecked)
+
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_SETTLED mode: {mode}")

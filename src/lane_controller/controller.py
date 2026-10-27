@@ -939,7 +939,8 @@ class LaneController:
         self.deliver()
         # The last car's payment off the reader before this car's can go on.
         self._free_reader()
-        if self._step(case) == exit_case.SETTLED:
+        settled, watch = self._watched_step(case)
+        if settled and self._still_there(watch):
             if not decision.should_vend:
                 decision = replace(
                     decision,
@@ -950,6 +951,11 @@ class LaneController:
             return decision, case
         with self._exit_lock:
             self._exit_case = case
+        if settled:
+            # Settled on its first answer, but the car backed off the loop
+            # while the platform was asked: nothing opens for whoever is there.
+            self._leave_exit_case(self._LEFT_DURING_CALL)
+            why = "the car left the loop while the platform was asked"
         return replace(
             decision,
             outcome=Outcome.FALLBACK,
@@ -971,10 +977,33 @@ class LaneController:
                 self._reader_case = case.exit_id
         return case.outcome
 
+    #: Why a settled case was dropped rather than opened for.
+    _LEFT_DURING_CALL = (
+        "the arming loop read clear while the platform was asked about the case; "
+        "the car on it now was not read"
+    )
+
+    def _watched_step(self, case: exit_case.ExitCase) -> tuple[bool, exit_case.LoopWatch]:
+        """One step of the case with the arming loop watched while it runs:
+        whether it settled, and the watch."""
+        watch = exit_case.LoopWatch(self.loop, self._clock).start()
+        try:
+            settled = self._step(case) == exit_case.SETTLED
+        finally:
+            watch.stop()
+        return settled, watch
+
+    def _still_there(self, watch: exit_case.LoopWatch) -> bool:
+        """Whether the car the case was asked about is still the car on the
+        loop: occupied now, and no clear longer than a flicker while the
+        platform was asked."""
+        return self.loop.is_occupied() and watch.stayed()
+
     def _advance_exit_case(self, case: exit_case.ExitCase) -> None:
         """One step of the waiting case; the barrier opens when it is settled."""
-        if self._step(case) == exit_case.SETTLED:
-            self._let_out(case)
+        settled, watch = self._watched_step(case)
+        if settled:
+            self._let_out(case, watch)
             return
         self._tell_exit_case(case)
 
@@ -1018,14 +1047,21 @@ class LaneController:
             )
             self.deliver()
 
-    def _let_out(self, case: exit_case.ExitCase) -> None:
-        """The case is settled: the barrier opens, and the close names the case."""
+    def _let_out(self, case: exit_case.ExitCase, watch: exit_case.LoopWatch) -> None:
+        """The case is settled: the barrier opens, and the close names the case
+        -- if its car is still the car on the loop. One that backed off while
+        the platform was asked leaves the case to a person, and nothing opens."""
         with self._exit_lock:
             if self._exit_case is not case:
                 # A person at the lane opened for this car first.
                 return
-            self._exit_case = None
-            self.last_decision_completed_at = to_iso(self._clock())
+            there = self._still_there(watch)
+            if there:
+                self._exit_case = None
+                self.last_decision_completed_at = to_iso(self._clock())
+        if not there:
+            self._leave_exit_case(self._LEFT_DURING_CALL)
+            return
         lane = self.config.lane_id
         reason = f"the exit is settled: {case.why}"
         self.vend.vend(reason)

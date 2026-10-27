@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 
 from fake_platform import FakePlatform
 from lane_controller import EventQueue, LaneController
+from lane_controller import exit_case as exit_case_module
 from lane_controller.contract import VendAuthority, VendRefusal
 from lane_controller.decision import Fallback, Outcome
 from lane_controller.exit_case import (
@@ -679,15 +681,80 @@ def test_a_car_that_rolls_on_unarmed_after_the_paid_car_backed_off_is_not_let_ou
 
 
 def test_a_clear_just_past_a_flicker_ends_the_cases_right_to_open():
+    """Half a second, as the contract states it: not the constant, which a
+    change could move with the test."""
     controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
     controller.run_once()
     exits.exit_answer = dict(PAID)
     controller.loop.clear()
     controller.observe_exit_case()
-    clock.tick(EXIT_FLICKER_SECONDS)
+    clock.tick(0.5)
     controller.loop._occupied = True
     controller.observe_exit_case()
     assert vend.vend_count == 0 and told(controller, "left")
+
+
+def slow_answer(controller, exits, clock, *, backs_off=False, swapped=False):
+    """`get_exit` taking three seconds and answering paid; the car backs off
+    the loop while it is asked, or is swapped for another in that time."""
+    asked = exits.get_exit
+
+    def slow(exit_id):
+        if backs_off or swapped:
+            controller.loop.clear()
+        if swapped:
+            time.sleep(0.1)
+            controller.loop._occupied = True
+        clock.tick(3.0)
+        exits.exit_answer = dict(PAID)
+        return asked(exit_id)
+
+    exits.get_exit = slow
+
+
+def test_a_car_that_backs_off_during_a_slow_platform_call_is_not_let_out():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    slow_answer(controller, exits, clock, backs_off=True)
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 0, "the barrier opened with the arming loop clear"
+    assert [e["detail"]["exit_id"] for e in told(controller, "left")] == ["exit-1"]
+    assert ("pay_cancel", "exit-1") in exits.exit_requests
+
+
+def test_the_control_a_paid_car_that_stayed_put_through_a_slow_call_gets_out():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    slow_answer(controller, exits, clock)
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 1 and not told(controller, "left")
+
+
+def test_a_car_swapped_on_the_loop_during_a_slow_call_is_not_let_out(monkeypatch):
+    monkeypatch.setattr(exit_case_module, "EXIT_SAMPLE_SECONDS", 0.005)
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    slow_answer(controller, exits, clock, swapped=True)
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 0, "a case opened for the car swapped on while it was asked"
+    assert told(controller, "left")
+
+
+def test_a_car_that_backs_off_while_its_first_answer_is_asked_is_not_let_out():
+    controller, vend, exits, _, _ = an_exit(answer=PAID)
+    opened = exits.open_exit
+
+    def backs_off(**kwargs):
+        controller.loop.clear()
+        return opened(**kwargs)
+
+    exits.open_exit = backs_off
+    decision = controller.run_once()
+    assert decision.fallback is Fallback.EXIT_NOT_SETTLED and vend.vend_count == 0
+    assert [e["detail"]["exit_id"] for e in told(controller, "left")] == ["exit-1"]
 
 
 def test_the_arming_loop_is_sampled_inside_a_flicker_while_a_car_waits():
@@ -729,6 +796,38 @@ def test_a_reader_that_stays_busy_tells_a_person_once_and_the_gate_stays_shut():
         controller.observe_exit_case()
     assert [e["detail"]["exit_id"] for e in told(controller, "reader_busy")] == ["exit-1"]
     assert controller._exit_case.attempts == 1 and vend.vend_count == 0
+
+
+def test_busy_answers_count_again_once_the_reader_takes_the_fee():
+    controller, _, exits, clock, _ = an_exit(answer=PAYMENT)
+    exits.exit_answer = {**PAYMENT, "payment": {"status": "open", "last_failure": None}}
+    controller.run_once()
+
+    def turns(n):
+        for _ in range(n):
+            clock.tick(EXIT_RESEND_SECONDS)
+            controller.observe_exit_case()
+
+    exits.exit_pay_refusal = "reader_busy"
+    turns(EXIT_READER_BUSY - 1)
+    exits.exit_pay_refusal = None
+    turns(1)
+    exits.exit_pay_refusal = "reader_busy"
+    turns(EXIT_READER_BUSY - 1)
+    assert not told(controller, "reader_busy"), "busy answers before the take were counted"
+    turns(1)
+    assert len(told(controller, "reader_busy")) == 1
+
+
+def test_a_settled_word_answer_for_another_event_opens_nothing():
+    display = SimulatedExitDisplay("2026-06-10T09:00:00Z")
+    controller, vend, exits, _, _ = an_exit(
+        "NEW-1", answer={"settled": False, "needs": "driver_word"}, display=display)
+    exits.exit_word = lambda exit_id, entry_at: {
+        "id": exit_id, "event_id": "another-event", "settled": True, "why": "paid"}
+    decision = controller.run_once()
+    assert decision.fallback is Fallback.EXIT_NOT_SETTLED and vend.vend_count == 0
+    assert controller._exit_case.refused == "another_exit_case"
 
 
 def test_a_case_car_the_lane_could_not_price_never_has_the_reader_driven_after_its_fee():

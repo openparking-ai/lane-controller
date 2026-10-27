@@ -444,7 +444,12 @@ driver's word for when they came in, or let out by a person.
   that ends with the loop occupied again also drops the case (`left`): the car
   on the loop may be another one that rolled on without arming, and it is read
   when it arms. While a car waits the loop is sampled every quarter second, so
-  a flicker reads as one clear sample.
+  a flicker reads as one clear sample. That includes the time the lane spends
+  waiting on the platform, which can be up to the client's timeout: a settled
+  answer opens the barrier only if the loop is occupied when it comes back and
+  read no clear longer than a flicker while the platform was asked. Otherwise
+  the case is dropped (`left`), its payment comes off the reader, and nothing
+  opens. This holds for a case settled on its first answer too.
 - **The reader is the platform's** once it has handed the case's PaymentIntent
   to it: the lane does not drive its own reader screen for that car, before or
   after the vend. A case the lane lets go of without opening for it (the car
@@ -473,7 +478,7 @@ cannot stand behind opens a case with no ID fields: that excludes no stay, and
 the platform's picker or the driver's word decides. The positioned characters
 are passed on unchecked until the identity service's contract for them lands.
 `tests/test_exit_case.py` holds this, and `scripts/exit_settled_fail_control.py`
-breaks it thirty-seven ways.
+breaks it forty-two ways.
 
 ### The transit
 

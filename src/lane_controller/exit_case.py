@@ -32,7 +32,8 @@ is still on the arming loop, the platform asked at most every
 that leaves the loop leaves its case to a person; nothing opens for it. Nor
 for a car that rolled on after it: a loop that read clear for longer than a
 flicker and is occupied again drops the case, since the car on it was not
-read.
+read. The loop is watched while the platform is asked too (`LoopWatch`), and
+a settled answer opens only for a car that is still there when it comes back.
 
 WHAT TRAVELS. The case carries the car's ID fields (`id_fields`) and nothing
 of the plate text. A low-confidence plate gives no characters at all: an ID
@@ -58,6 +59,7 @@ car's fee: after the next car's frames are taken, before its fee goes on.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -233,6 +235,61 @@ class ExitCase:
         if self.refused:
             view["refused"] = self.refused
         return view
+
+
+class LoopWatch:
+    """The arming loop, sampled every `EXIT_SAMPLE_SECONDS` on its own thread
+    while the lane's thread waits on the platform for a case: a call can take
+    up to the client's timeout, and a car can back off in that time.
+
+    `stayed()` after `stop()`: the loop was occupied at the start and at the
+    end, and no clear in between was longer than a flicker -- two clear
+    samples in a row, or `EXIT_FLICKER_SECONDS` on the lane's clock."""
+
+    def __init__(self, loop, clock) -> None:
+        self._loop = loop
+        self._clock = clock
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._clear_since: float | None = None
+        self._clear_run = 0
+        self._left = False
+        self._sample()
+        self._thread = threading.Thread(target=self._run, name="exit-loop-watch", daemon=True)
+
+    def start(self) -> LoopWatch:
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join()
+        self._sample()
+
+    def stayed(self) -> bool:
+        with self._lock:
+            return not self._left and self._clear_since is None
+
+    def _run(self) -> None:
+        while not self._stop.wait(EXIT_SAMPLE_SECONDS):
+            self._sample()
+
+    def _sample(self) -> None:
+        occupied = self._loop.is_occupied()
+        now = self._clock()
+        with self._lock:
+            if occupied:
+                since = self._clear_since
+                if since is not None and now - since >= EXIT_FLICKER_SECONDS:
+                    self._left = True
+                self._clear_since, self._clear_run = None, 0
+                return
+            if self._clear_since is None:
+                self._clear_since = now
+            self._clear_run += 1
+            if self._clear_run >= 2:
+                self._left = True
 
 
 def _own(case: ExitCase, answer: dict) -> dict:

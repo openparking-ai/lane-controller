@@ -42,6 +42,11 @@ not known to stay down for one.
   first_answer_not_owned     the case's first answer is not checked against the car's event.
   route_busy_after_already_completed  the vend route stays busy after `already_completed`.
   cancel_before_next_frames  the last car's cancel holds up the next car's frames.
+  left_during_call_let_out   a settled answer opens though the car backed off during the call.
+  loop_unwatched_during_call the loop is not watched while the platform is asked.
+  flicker_doubled            a clear of up to a second is taken for a flicker.
+  busy_not_reset             busy answers before the reader took the fee still count.
+  word_answer_not_owned      an answer to the driver's word for another event is taken.
 """
 
 from __future__ import annotations
@@ -98,6 +103,13 @@ BREAKAGES = [
      "the vend route stays busy for good after refusing already_completed"),
     ("cancel_before_next_frames",
      "the last car's payment comes off the reader before the next car's frames are taken"),
+    ("left_during_call_let_out",
+     "a settled answer opens though the car backed off the loop while the platform was asked"),
+    ("loop_unwatched_during_call",
+     "the loop is not watched during a platform call, so a car swapped on is not seen"),
+    ("flicker_doubled", "a clear of up to a second is taken for a flicker"),
+    ("busy_not_reset", "busy answers from before the reader took the fee still count"),
+    ("word_answer_not_owned", "a settled answer to the driver's word for another event opens"),
 ]
 
 
