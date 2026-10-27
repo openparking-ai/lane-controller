@@ -1288,9 +1288,9 @@ def test_a_persons_close_names_the_authority_it_opened_on():
     assert exits.closed[-1].get("let_out_by") == VendAuthority.HUMAN_OPEN_NOW.value
 
 
-def test_a_persons_close_on_an_authority_the_platform_does_not_take_goes_without_one():
-    """`human_open_and_flag` is not one the close takes (400): sent, the close
-    would be refused and dropped from the outbox. It goes without it."""
+def test_a_persons_close_after_a_flagged_opening_names_that_authority():
+    """`human_open_and_flag` rides the close as the other two do; the
+    platform marks its change-log line flagged."""
     controller, vend, exits, _, _ = an_exit(answer=PAYMENT)
     service = LaneService(controller)
     controller.run_once()
@@ -1300,10 +1300,10 @@ def test_a_persons_close_on_an_authority_the_platform_does_not_take_goes_without
     status, answer = service.assisted.complete(parse_vend(body, "KEY-EXIT-FLAG"))
     if service.assisted.settling is not None:
         service.assisted.settling.join(timeout=5)
-    assert status == 202, answer
+    assert status == 202 and vend.vend_count == 1, answer
     controller.events.flush()
     assert exits.closed[-1]["exit_id"] == "exit-1"
-    assert "let_out_by" not in exits.closed[-1]
+    assert exits.closed[-1].get("let_out_by") == VendAuthority.HUMAN_OPEN_AND_FLAG.value
 
 
 def test_a_close_the_lane_opened_on_its_own_names_no_person():

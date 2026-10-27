@@ -62,7 +62,7 @@ not known to stay down for one.
   cancel_paid_asked_again    a cancel answered exit_paid is asked again.
   close_unsettled_dropped    a close answered 503 payment_unsettled is dropped, not resent.
   let_out_by_not_sent        a person's close does not say what they opened on.
-  flagged_let_out_sent       an authority the platform's close refuses is sent as let_out_by.
+  flagged_let_out_dropped    a close after a flagged opening goes without let_out_by.
 """
 
 from __future__ import annotations
@@ -144,7 +144,7 @@ BREAKAGES = [
     ("close_unsettled_dropped",
      "a close answered 503 payment_unsettled is dropped from the outbox, not sent again"),
     ("let_out_by_not_sent", "a person's close does not say what authority they opened on"),
-    ("flagged_let_out_sent", "an authority the platform's close refuses is sent as let_out_by"),
+    ("flagged_let_out_dropped", "a close after a flagged opening goes without let_out_by"),
 ]
 
 

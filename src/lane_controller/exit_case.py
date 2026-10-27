@@ -461,10 +461,11 @@ CANCEL_IN_PROGRESS = "in_progress"
 CANCEL_FAILED = "failed"
 
 #: The vend authorities the platform's close takes as `let_out_by` (platform
-#: 0042). It refuses any other with a 400, and a refused close is dropped
-#: from the outbox, not sent again: a close for another authority goes
-#: without it.
-LET_OUT_AUTHORITIES = frozenset({"display_code_confirmed", "human_open_now"})
+#: 0042; `human_open_and_flag` is marked flagged on its change-log line). It
+#: refuses any other with a 400, and a refused close is dropped from the
+#: outbox, not sent again: a close for another authority goes without it.
+LET_OUT_AUTHORITIES = frozenset({"display_code_confirmed", "human_open_now",
+                                 "human_open_and_flag"})
 
 
 def cancel_on_reader(case: ExitCase, platform) -> str | None:

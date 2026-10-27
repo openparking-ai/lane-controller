@@ -4084,13 +4084,11 @@ def _break_the_settled_exit(monkeypatch):
         # The close after a person's vend does not say what they opened on.
         monkeypatch.setattr(LaneController, "_take_let_out_by", lambda self, exit_id: {})
 
-    elif mode == "flagged_let_out_sent":
-        # Every vend authority is sent as `let_out_by`, one the platform
-        # refuses included.
-        from lane_controller.contract import VendAuthority
-
+    elif mode == "flagged_let_out_dropped":
+        # A close after a flagged opening goes without `let_out_by`, as it
+        # had to before the platform took `human_open_and_flag`.
         monkeypatch.setattr(case_module, "LET_OUT_AUTHORITIES",
-                            frozenset(a.value for a in VendAuthority))
+                            case_module.LET_OUT_AUTHORITIES - {"human_open_and_flag"})
 
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_SETTLED mode: {mode}")

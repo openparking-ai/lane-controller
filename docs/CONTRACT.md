@@ -473,10 +473,10 @@ driver's word for when they came in, or let out by a person.
   once: the vend claims the decision under the lock the case's own opening
   takes, and one that finds it already completed is refused
   `already_completed` with nothing moved. That close carries `let_out_by`,
-  the authority the person opened on, when the platform's close takes it
-  (`display_code_confirmed`, `human_open_now`); `human_open_and_flag` is not
-  one, and that close goes without it. The lane holds no name for the person:
-  the platform's change log names this lane computer. A close the platform
+  the authority the person opened on: `display_code_confirmed`,
+  `human_open_now` or `human_open_and_flag`, which the platform's change log
+  marks flagged. The lane holds no name for the person: the platform's change
+  log names this lane computer. A close the platform
   answers 503 `payment_unsettled` (the case's payment could not be settled
   with Stripe yet) stays in the outbox and is sent again, as any 5xx is.
 - **Offline**, a covered car still leaves; every other car waits for a person.
