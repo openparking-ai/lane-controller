@@ -4004,5 +4004,27 @@ def _break_the_settled_exit(monkeypatch):
 
         monkeypatch.setattr(case_module.LoopWatch, "stop", stops_blind)
 
+    elif mode == "person_checked_before_read":
+        # Whether a person took the case first is checked before the loop
+        # read and not again after it, so a person's vend during the read
+        # is followed by the case opening the barrier again.
+        original = LaneController._let_out
+        there = LaneController._still_there
+
+        def checks_then_reads(self, case, watch):
+            with self._exit_lock:
+                if self._exit_case is not case:
+                    return
+            seen = there(self, watch)
+            with self._exit_lock:
+                self._exit_case = case
+            self._still_there = lambda watch: seen
+            try:
+                return original(self, case, watch)
+            finally:
+                del self._still_there
+
+        monkeypatch.setattr(LaneController, "_let_out", checks_then_reads)
+
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_SETTLED mode: {mode}")

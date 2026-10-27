@@ -55,6 +55,7 @@ not known to stay down for one.
   watch_not_stopped_on_raise a platform call that raises leaves its watcher running.
   decide_not_read_now        the lane decides without reading the loop at that moment.
   no_final_sample            the watch stops without reading the loop as the call returns.
+  person_checked_before_read a person's vend during the lane's last loop read is opened again.
 """
 
 from __future__ import annotations
@@ -127,6 +128,8 @@ BREAKAGES = [
     ("watch_not_stopped_on_raise", "a platform call that raises leaves its watcher thread running"),
     ("decide_not_read_now", "the lane decides without reading the loop at that moment"),
     ("no_final_sample", "the watch stops without reading the loop as the call returns"),
+    ("person_checked_before_read",
+     "whether a person took the case is checked before the lane's last loop read, not after"),
 ]
 
 

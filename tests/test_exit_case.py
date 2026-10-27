@@ -487,6 +487,49 @@ def test_a_person_who_opens_while_the_case_is_being_asked_is_the_only_one_who_op
     assert vend.vend_count == 1, "the case opened the barrier a person had already opened"
 
 
+def test_a_person_who_opens_while_the_lane_reads_the_loop_is_the_only_one_who_opens(monkeypatch):
+    """A person's vend lands while the lane is stalled in its last read of
+    the loop, after the platform answered paid and before it decides. The
+    turn opens nothing, and the person's car is not told "left"."""
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    decision = controller.run_once()
+    exits.exit_answer = dict(PAID)
+    reading, released = threading.Event(), threading.Event()
+    deciding = {"now": False}
+    read = controller.loop.is_occupied
+
+    def stalls_as_the_lane_decides():
+        if deciding["now"] and threading.current_thread() is threading.main_thread():
+            deciding["now"] = False
+            reading.set()
+            assert released.wait(5), "the person's vend never finished"
+        return read()
+
+    controller.loop.is_occupied = stalls_as_the_lane_decides
+    stop = exit_case_module.LoopWatch.stop
+
+    def stop_then_decide(self):
+        stop(self)
+        deciding["now"] = True
+
+    monkeypatch.setattr(exit_case_module.LoopWatch, "stop", stop_then_decide)
+
+    def person():
+        assert reading.wait(5), "the lane never read the loop to decide"
+        controller.complete_vend(decision.identity, authorised_by="attendant",
+                                 assisted={"authorised_by": "attendant"})
+        released.set()
+
+    attendant = threading.Thread(target=person)
+    attendant.start()
+    clock.tick()
+    controller.observe_exit_case()
+    attendant.join(5)
+    assert released.is_set(), "the person's vend did not land during the lane's read"
+    assert vend.vend_count == 1, "the case opened the barrier a person had already opened"
+    assert not told(controller, "left")
+
+
 # ---------------------------------------------------------------------------
 # The fee is offered again while it waits for a card, and attempts are counted.
 # ---------------------------------------------------------------------------
