@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -97,6 +98,9 @@ EXIT_FLICKER_SECONDS = 0.5
 #: How often the arming loop is sampled while a car waits on its case: short
 #: enough that a flicker reads as one clear sample, under `EXIT_FLICKER_SECONDS`.
 EXIT_SAMPLE_SECONDS = 0.25
+
+#: How many clear samples in a row are a car gone rather than a flicker.
+EXIT_CLEAR_SAMPLES = 2
 
 #: How many `reader_busy` answers in a row before a person is told the reader
 #: is stuck: at `EXIT_RESEND_SECONDS` apart, half a minute of a reader that
@@ -243,8 +247,10 @@ class LoopWatch:
     up to the client's timeout, and a car can back off in that time.
 
     `stayed()` after `stop()`: the loop was occupied at the start and at the
-    end, and no clear in between was longer than a flicker -- two clear
-    samples in a row, or `EXIT_FLICKER_SECONDS` on the lane's clock."""
+    end, and no clear in between was longer than a flicker --
+    `EXIT_CLEAR_SAMPLES` clear samples in a row, or `EXIT_FLICKER_SECONDS` on
+    the lane's clock. A loop read that raises is taken as the car gone: a
+    watch that cannot see the loop vouches for nothing."""
 
     def __init__(self, loop, clock) -> None:
         self._loop = loop
@@ -262,10 +268,16 @@ class LoopWatch:
         return self
 
     def stop(self) -> None:
+        """Stop sampling, and read the loop as the call returns. A clear
+        reading then is read once more after `EXIT_SAMPLE_SECONDS`, so a
+        flicker at that moment is not taken for the car gone."""
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join()
         self._sample()
+        if self._clear_since is not None and not self._left:
+            time.sleep(EXIT_SAMPLE_SECONDS)
+            self._sample()
 
     def stayed(self) -> bool:
         with self._lock:
@@ -275,8 +287,18 @@ class LoopWatch:
         while not self._stop.wait(EXIT_SAMPLE_SECONDS):
             self._sample()
 
+    def _fail(self, err: Exception) -> None:
+        log.warning("exit case: the arming loop could not be read while the platform "
+                    "was asked; the car is taken as gone: %s", err.__class__.__name__)
+        with self._lock:
+            self._left = True
+
     def _sample(self) -> None:
-        occupied = self._loop.is_occupied()
+        try:
+            occupied = self._loop.is_occupied()
+        except Exception as err:  # noqa: BLE001 -- an unread loop fails shut
+            self._fail(err)
+            return
         now = self._clock()
         with self._lock:
             if occupied:
@@ -288,7 +310,7 @@ class LoopWatch:
             if self._clear_since is None:
                 self._clear_since = now
             self._clear_run += 1
-            if self._clear_run >= 2:
+            if self._clear_run >= EXIT_CLEAR_SAMPLES:
                 self._left = True
 
 

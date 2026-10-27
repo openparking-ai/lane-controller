@@ -3935,5 +3935,74 @@ def _break_the_settled_exit(monkeypatch):
 
         monkeypatch.setattr(case_module, "_own", word_unchecked)
 
+    elif mode == "watcher_error_trusted":
+        # A loop read that raises on the watcher's thread kills it, and the
+        # watch then vouches from its last good sample.
+        def dies(self, err):
+            raise err
+
+        monkeypatch.setattr(case_module.LoopWatch, "_fail", dies)
+
+    elif mode == "loop_read_under_lock":
+        # The loop is read holding `_exit_lock`, so a stalled read holds up
+        # a person's vend.
+        original = LaneController._let_out
+        there = LaneController._still_there
+
+        def reads_under_lock(self, case, watch):
+            with self._exit_lock:
+                seen = there(self, watch)
+            self._still_there = lambda watch: seen
+            try:
+                return original(self, case, watch)
+            finally:
+                del self._still_there
+
+        monkeypatch.setattr(LaneController, "_let_out", reads_under_lock)
+
+    elif mode == "stop_flicker_drops":
+        # The watch's reading as the call returns is not read again when
+        # clear, so one flicker then drops a paid car.
+        def stops_once(self):
+            self._stop.set()
+            if self._thread.is_alive():
+                self._thread.join()
+            self._sample()
+
+        monkeypatch.setattr(case_module.LoopWatch, "stop", stops_once)
+
+    elif mode == "decide_flicker_drops":
+        # The lane's reading as it decides is not read again when clear.
+        monkeypatch.setattr(LaneController, "_loop_now", lambda self: self.loop.is_occupied())
+
+    elif mode == "three_clear_samples":
+        # Three clear samples in a row are needed for a car gone, not two.
+        monkeypatch.setattr(case_module, "EXIT_CLEAR_SAMPLES", 3)
+
+    elif mode == "watch_not_stopped_on_raise":
+        # The watch is stopped only when the platform call returns, so a
+        # call that raises leaves its watcher thread running.
+        def unguarded(self, case):
+            watch = case_module.LoopWatch(self.loop, self._clock).start()
+            settled = self._step(case) == case_module.SETTLED
+            watch.stop()
+            return settled, watch
+
+        monkeypatch.setattr(LaneController, "_watched_step", unguarded)
+
+    elif mode == "decide_not_read_now":
+        # The lane decides from the watch alone, without reading the loop
+        # at that moment.
+        monkeypatch.setattr(LaneController, "_loop_now", lambda self: True)
+
+    elif mode == "no_final_sample":
+        # The watch stops without reading the loop as the call returns.
+        def stops_blind(self):
+            self._stop.set()
+            if self._thread.is_alive():
+                self._thread.join()
+
+        monkeypatch.setattr(case_module.LoopWatch, "stop", stops_blind)
+
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_SETTLED mode: {mode}")

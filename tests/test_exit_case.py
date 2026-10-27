@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import copy
 import json
+import threading
 import time
+
+import pytest
 
 from fake_platform import FakePlatform
 from lane_controller import EventQueue, LaneController
@@ -741,6 +744,179 @@ def test_a_car_swapped_on_the_loop_during_a_slow_call_is_not_let_out(monkeypatch
     controller.observe_exit_case()
     assert vend.vend_count == 0, "a case opened for the car swapped on while it was asked"
     assert told(controller, "left")
+
+
+def watchers():
+    return [t for t in threading.enumerate() if t.name == "exit-loop-watch" and t.is_alive()]
+
+
+def lane_reads(controller):
+    """The loop as the lane's own thread reads it, with `flicker` clear
+    readings to come on that thread only."""
+    read = controller.loop.is_occupied
+    state = {"flicker": 0}
+
+    def reading():
+        if state["flicker"] and threading.current_thread() is threading.main_thread():
+            state["flicker"] -= 1
+            return False
+        return read()
+
+    controller.loop.is_occupied = reading
+    return state
+
+
+def test_a_loop_read_that_fails_on_the_watcher_opens_nothing(monkeypatch):
+    monkeypatch.setattr(exit_case_module, "EXIT_SAMPLE_SECONDS", 0.005)
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    read = controller.loop.is_occupied
+
+    def fails_on_the_watcher():
+        if threading.current_thread().name == "exit-loop-watch":
+            raise OSError("loop driver")
+        return read()
+
+    controller.loop.is_occupied = fails_on_the_watcher
+    asked = exits.get_exit
+
+    def slow(exit_id):
+        time.sleep(0.05)
+        exits.exit_answer = dict(PAID)
+        return asked(exit_id)
+
+    exits.get_exit = slow
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 0, "a watch that could not read the loop vouched for the car"
+    assert told(controller, "left")
+
+
+def test_the_loop_is_not_read_under_the_exit_lock_when_a_case_settles():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    exits.exit_answer = dict(PAID)
+    held: list[bool] = []
+    read = controller.loop.is_occupied
+
+    def reading():
+        held.append(controller._exit_lock.locked())
+        return read()
+
+    controller.loop.is_occupied = reading
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 1 and held
+    assert not any(held), "the loop was read holding the lock a person's vend needs"
+
+
+def test_a_flicker_as_the_answer_comes_back_does_not_drop_a_paid_car():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    state = lane_reads(controller)
+    asked = exits.get_exit
+
+    def answers(exit_id):
+        exits.exit_answer = dict(PAID)
+        state["flicker"] = 1
+        return asked(exit_id)
+
+    exits.get_exit = answers
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 1 and not told(controller, "left")
+
+
+def test_a_flicker_as_the_lane_decides_does_not_drop_a_paid_car(monkeypatch):
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    state = lane_reads(controller)
+    stop = exit_case_module.LoopWatch.stop
+
+    def stop_then_flicker(self):
+        stop(self)
+        state["flicker"] = 1
+
+    monkeypatch.setattr(exit_case_module.LoopWatch, "stop", stop_then_flicker)
+    exits.exit_answer = dict(PAID)
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 1 and not told(controller, "left")
+
+
+class Readings:
+    """A loop that reads as scripted, one reading a call."""
+
+    def __init__(self, *readings: bool) -> None:
+        self.readings = list(readings)
+
+    def is_occupied(self) -> bool:
+        return self.readings.pop(0)
+
+
+def test_two_clear_samples_in_a_row_are_a_car_gone():
+    watch = exit_case_module.LoopWatch(Readings(True, False, False, True), Clock())
+    for _ in range(3):
+        watch._sample()
+    assert not watch.stayed()
+    # The control: one clear sample is a flicker.
+    watch = exit_case_module.LoopWatch(Readings(True, False, True), Clock())
+    for _ in range(2):
+        watch._sample()
+    assert watch.stayed()
+
+
+def test_no_watcher_is_left_running_after_a_platform_call_that_raised():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    exits.get_exit = lambda exit_id: (_ for _ in ()).throw(RuntimeError("client"))
+    clock.tick()
+    with pytest.raises(RuntimeError):
+        controller.observe_exit_case()
+    assert not watchers(), "a watcher thread outlived the call that raised"
+    assert vend.vend_count == 0
+
+
+def test_a_car_that_backs_off_as_the_lane_decides_is_not_let_out(monkeypatch):
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    stop = exit_case_module.LoopWatch.stop
+
+    def stop_then_backs_off(self):
+        stop(self)
+        controller.loop.clear()
+
+    monkeypatch.setattr(exit_case_module.LoopWatch, "stop", stop_then_backs_off)
+    exits.exit_answer = dict(PAID)
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 0 and told(controller, "left")
+
+
+def test_the_watch_reads_the_loop_as_the_call_returns(monkeypatch):
+    """Clear from the moment the answer comes back until the watch stops, and
+    a car on the loop again by the time the lane decides: only the watch's
+    own reading at the stop saw the loop clear."""
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    asked = exits.get_exit
+
+    def answers(exit_id):
+        exits.exit_answer = dict(PAID)
+        controller.loop.clear()
+        return asked(exit_id)
+
+    stop = exit_case_module.LoopWatch.stop
+
+    def stop_then_back(self):
+        stop(self)
+        controller.loop._occupied = True
+
+    exits.get_exit = answers
+    monkeypatch.setattr(exit_case_module.LoopWatch, "stop", stop_then_back)
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 0 and told(controller, "left")
 
 
 def test_a_car_that_backs_off_while_its_first_answer_is_asked_is_not_let_out():

@@ -47,6 +47,14 @@ not known to stay down for one.
   flicker_doubled            a clear of up to a second is taken for a flicker.
   busy_not_reset             busy answers before the reader took the fee still count.
   word_answer_not_owned      an answer to the driver's word for another event is taken.
+  watcher_error_trusted      a loop read that raises on the watcher leaves its last sample vouching.
+  loop_read_under_lock       the loop is read holding the lock a person's vend needs.
+  stop_flicker_drops         one flicker as the call returns drops a paid car.
+  decide_flicker_drops       one flicker as the lane decides drops a paid car.
+  three_clear_samples        three clear samples are needed for a car gone, not two.
+  watch_not_stopped_on_raise a platform call that raises leaves its watcher running.
+  decide_not_read_now        the lane decides without reading the loop at that moment.
+  no_final_sample            the watch stops without reading the loop as the call returns.
 """
 
 from __future__ import annotations
@@ -110,6 +118,15 @@ BREAKAGES = [
     ("flicker_doubled", "a clear of up to a second is taken for a flicker"),
     ("busy_not_reset", "busy answers from before the reader took the fee still count"),
     ("word_answer_not_owned", "a settled answer to the driver's word for another event opens"),
+    ("watcher_error_trusted",
+     "a loop read that raises on the watcher's thread leaves its last good sample vouching"),
+    ("loop_read_under_lock", "the loop is read holding the lock a person's vend needs"),
+    ("stop_flicker_drops", "one flicker of the loop as the call returns drops a paid car"),
+    ("decide_flicker_drops", "one flicker of the loop as the lane decides drops a paid car"),
+    ("three_clear_samples", "three clear samples in a row are needed for a car gone, not two"),
+    ("watch_not_stopped_on_raise", "a platform call that raises leaves its watcher thread running"),
+    ("decide_not_read_now", "the lane decides without reading the loop at that moment"),
+    ("no_final_sample", "the watch stops without reading the loop as the call returns"),
 ]
 
 

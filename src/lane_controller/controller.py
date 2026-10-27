@@ -996,8 +996,22 @@ class LaneController:
     def _still_there(self, watch: exit_case.LoopWatch) -> bool:
         """Whether the car the case was asked about is still the car on the
         loop: occupied now, and no clear longer than a flicker while the
-        platform was asked."""
-        return self.loop.is_occupied() and watch.stayed()
+        platform was asked. Reads the loop, so never under `_exit_lock`: a
+        stalled read must not hold up a person's vend."""
+        return self._loop_now() and watch.stayed()
+
+    def _loop_now(self) -> bool:
+        """The arming loop now. A clear reading is read once more after
+        `EXIT_SAMPLE_SECONDS`: one clear sample is a flicker, two a car gone.
+        A read that raises is a car gone."""
+        try:
+            if self.loop.is_occupied():
+                return True
+            time.sleep(exit_case.EXIT_SAMPLE_SECONDS)
+            return self.loop.is_occupied()
+        except Exception:  # noqa: BLE001 -- an unread loop fails shut
+            log.warning("exit case: the arming loop could not be read; nothing opens")
+            return False
 
     def _advance_exit_case(self, case: exit_case.ExitCase) -> None:
         """One step of the waiting case; the barrier opens when it is settled."""
@@ -1050,12 +1064,14 @@ class LaneController:
     def _let_out(self, case: exit_case.ExitCase, watch: exit_case.LoopWatch) -> None:
         """The case is settled: the barrier opens, and the close names the case
         -- if its car is still the car on the loop. One that backed off while
-        the platform was asked leaves the case to a person, and nothing opens."""
+        the platform was asked leaves the case to a person, and nothing opens.
+        The loop is read before the lock is taken; the decision is made under
+        it."""
+        there = self._still_there(watch)
         with self._exit_lock:
             if self._exit_case is not case:
                 # A person at the lane opened for this car first.
                 return
-            there = self._still_there(watch)
             if there:
                 self._exit_case = None
                 self.last_decision_completed_at = to_iso(self._clock())
