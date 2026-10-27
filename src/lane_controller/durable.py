@@ -33,6 +33,13 @@ refresh, so a plate that left the register or a stay that closed is gone
 from the box at the next read. One bound, stated once: the cache is held
 exactly as long as it is trusted, and not a second longer.
 
+EXCEPT THE GARAGE'S ENTRY SETTINGS, which are not personal data: whether it
+takes transients, its default for a car with no rule, and this lane's closing.
+The entry is decided on them, so they outlive the wipe -- in memory and in the
+file, written back alone -- and a lane two days into an outage still opens for
+every car at a garage that takes transients, and still keeps a `full` lane
+shut (`DecisionCache.clear`).
+
 THE DIRECTORY IS THE PROCESS'S OWN, OR THE STORE REFUSES TO OPEN. A cache row
 is `plate -> allow`: a line somebody wrote into this file by hand OPENS THE
 BARRIER for that plate, with no platform and no register behind it. So the
@@ -50,7 +57,9 @@ their own in the same directory, under the same rule. A stay's open and close
 wait in the outbox until the platform takes them, and that outbox lived in
 memory only: a restart during an outage lost every one it held. They are not
 cache and not bounded by `rules_max_age_seconds`: each is held until the
-platform has taken it or refused it, and not after.
+platform has taken it or refused it, and not after. The pictures kept with an
+entry are kept in the same file, on the same terms. Both are written by the
+outbox's own disk thread (`events.DiskWriter`), never by the lane's.
 """
 
 from __future__ import annotations
@@ -62,7 +71,7 @@ import stat
 import threading
 from pathlib import Path
 
-from .events import LaneEvent
+from .events import LaneEvent, Picture
 
 #: The file's mode, applied on every write and not only at creation: SQLite
 #: may recreate the file, and a mode set once is a mode that can be undone.
@@ -236,9 +245,19 @@ class OutboxStore:
     LOG EVENTS ARE NOT KEPT HERE. They are bounded and dropped first by design
     (`EventQueue`); the money is in the session actions.
 
+    THE PICTURES KEPT WITH AN ENTRY ARE KEPT HERE TOO, in a table of their
+    own: the pictures of the stays this file holds, which a restart during an
+    outage used to lose with the process (they lived in memory, 200 at most,
+    sent all or nothing). Each is a row until the platform has taken it or
+    refused it, read back a few at a time (`held_pictures`), never bounded
+    and never dropped -- the disk is the bound, and the platform's one-week
+    retention starts when it has them.
+
     The directory rule and the file mode are the cache's, because it is the
-    cache's directory: what a row holds is a plate or a ticket, and a row
-    written by hand would be a stay this lane never saw.
+    cache's directory: what a row holds is a plate, a ticket or a picture of a
+    car, and a row written by hand would be a stay this lane never saw.
+
+    EVERY WRITE COMES FROM `events.DiskWriter`'s thread, never the lane's.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -250,6 +269,10 @@ class OutboxStore:
             _touch(self.path, lambda c: c.execute(
                 "CREATE TABLE IF NOT EXISTS outbox (event_id TEXT PRIMARY KEY, at REAL NOT NULL, "
                 "kind TEXT NOT NULL, lane_id TEXT NOT NULL, detail TEXT NOT NULL)"
+            ))
+            _touch(self.path, lambda c: c.execute(
+                "CREATE TABLE IF NOT EXISTS pictures (picture_ref TEXT PRIMARY KEY, "
+                "event_id TEXT NOT NULL, taken_at REAL NOT NULL, image BLOB NOT NULL)"
             ))
 
     def add(self, event: LaneEvent) -> None:
@@ -279,3 +302,41 @@ class OutboxStore:
                       event_id=event_id)
             for kind, lane_id, at, detail, event_id in rows
         ]
+
+    # -- the pictures ---------------------------------------------------------
+
+    def add_picture(self, picture: Picture) -> None:
+        with self._lock:
+            _touch(self.path, lambda c: c.execute(
+                "INSERT OR REPLACE INTO pictures (picture_ref, event_id, taken_at, image) "
+                "VALUES (?, ?, ?, ?)",
+                (picture.picture_ref, picture.event_id, picture.taken_at,
+                 sqlite3.Binary(picture.image_bytes)),
+            ))
+
+    def held_pictures(self, limit: int) -> list[Picture]:
+        """The oldest `limit` pictures not yet taken, in the order they were kept."""
+        with self._lock:
+            rows = _touch(self.path, lambda c: c.execute(
+                "SELECT picture_ref, event_id, taken_at, image FROM pictures "
+                "ORDER BY rowid LIMIT ?", (limit,)
+            ).fetchall())
+        return [
+            Picture(event_id=event_id, taken_at=taken_at, image_bytes=bytes(image),
+                    picture_ref=picture_ref)
+            for picture_ref, event_id, taken_at, image in rows
+        ]
+
+    def remove_pictures(self, picture_refs: list[str]) -> None:
+        if not picture_refs:
+            return
+        with self._lock:
+            _touch(self.path, lambda c: c.executemany(
+                "DELETE FROM pictures WHERE picture_ref = ?", [(ref,) for ref in picture_refs]
+            ))
+
+    def picture_count(self) -> int:
+        with self._lock:
+            return _touch(self.path, lambda c: c.execute(
+                "SELECT count(*) FROM pictures"
+            ).fetchone()[0])

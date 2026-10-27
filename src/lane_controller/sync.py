@@ -72,9 +72,12 @@ ENTRY_UNCONFIRMABLE = "entry_unconfirmable"
 #: barrier that is simply up -- the lane cannot tell which, and says so in the
 #: detail rather than guessing. It is an ENTRY because a vehicle is inside; it
 #: is a DIFFERENT entry because nothing admitted it, and it is never folded
-#: into `entry_confirmed`, which had a vend behind it. It opens no session and
-#: moves no `TransitState`: that enum says what became of the last VEND, and
-#: this had none.
+#: into `entry_confirmed`, which had a vend behind it. It moves no
+#: `TransitState`: that enum says what became of the last VEND, and this had
+#: none. The car is a STAY all the same (the owner's rule: the loops and the
+#: pictures make the entry): a `session_open` follows it, `confirmed` and
+#: `tailgater: true`, with a plate or `plate_unreadable` -- unless the camera
+#: says no car was there, which this event's `stay_opened: false` records.
 #:
 #: THE SAME LITERAL as `platform/src/app.js` `LANE_EVENT_KINDS`, which must
 #: accept a kind before a lane may emit it -- a lane ahead of its platform is
@@ -459,6 +462,8 @@ class PlatformTransport(EventTransport):
             descriptor=descriptor,
             # Only when true: every other open calls the client as it always did.
             **({"tailgater": True} if event.detail.get("tailgater") else {}),
+            # A plate nobody could read: the third identity (platform 0036).
+            **({"plate_unreadable": True} if event.detail.get("plate_unreadable") else {}),
         )
         require_confirmation_echo(result, declared, end="entry", action="open")
         require_descriptor_echo(result, descriptor)

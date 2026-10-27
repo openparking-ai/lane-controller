@@ -277,8 +277,10 @@ before.
 - **`message`** is the owner's text exactly as typed. A screen writes it in
   capitals. It names no car.
 - The closing arrives on the platform's fast read (`/lane/stays`) as well as
-  its slow one, and it is kept on disk with the rest of the cache, under the
-  same age bound: a lane restarted offline obeys the last closing it was told.
+  its slow one, and it is kept on disk with the rest of the cache: a lane
+  restarted offline obeys the last closing it was told. It names no car, so the
+  age bound that wipes the cache's personal data does not take it: a lane
+  closed `full` does not reopen itself in a long outage.
 
 ### `board` — what the screen may show while nothing else wants it
 
@@ -365,6 +367,32 @@ refuses every customer.
 identifier names one — Vehicle ID's `read_id`, which is unique per
 identification and stable across re-delivery. `null` when no read was obtained,
 and `null` from an identifier that does not name its reads.
+
+### What an entry decides, by what the garage takes
+
+The owner's entry rule (2026-10-26) changes which outcome a consumer sees at an
+ENTRY lane whose garage has stated `transient_available`. The closed set does
+not change; how often each member appears does.
+
+- **A garage that takes transients** decides `allow` for every car it sees --
+  a plate read below the lane's confidence, no plate, an unknown car, an engine
+  that did not answer (`cause` names which failure), rules past their age.
+  `fallback` there is `lane_closed` only (full or closed to everyone); `deny`
+  is a banned car or an owner's rule against the plate; `no_vehicle` is nothing
+  there. An intercom consumer will no longer see `low_confidence`,
+  `no_plate_read`, `unknown_vehicle`, `engine_unreachable` or `stale_rules` at
+  such a lane's entry.
+- **A monthly/pass-only garage** decides `allow` for a car its registers cover
+  today and `deny` for every other car, read or not -- never `fallback` for it.
+  `human_open_now` overrides that `deny` exactly as it overrides any (see
+  `not_completable` below); a display code does not. Where a scanned
+  registration QR will be presented is that `deny`; this version has no scanner.
+- **A garage that has not stated it**, and **every exit**, decide as before.
+
+Whatever was decided, every car the loops see go in -- the one the lane opened
+for, a second car through the same opening, a refused car that drove in anyway
+-- is a stay on the platform, identified by a plate or as `plate_unreadable`.
+None of it is on this contract: session actions never are.
 
 ### The transit
 
@@ -1116,6 +1144,12 @@ There is no flag that turns any of that off.
   lane every car after the one it was holding.
 - **No measurement of the boom.** `vend_commanded` is what this lane can stand
   behind; whether the barrier rose is `no_source` and stays that way.
+- **No disk on the barrier's path, and the window that costs.** With an outbox
+  file, every stay open and close and every picture is written by the outbox's
+  own disk thread, never by the thread that decides the next car, so a slow or
+  hung disk holds no car. An item is on disk milliseconds after it is recorded;
+  **a kill inside those milliseconds loses it**, the same class of window as the
+  kill between the relay and the record above.
 - **No verification of a ticket.** Shape only. No signature, no expiry, no
   issuer, and no key on this box.
 - **No SIP identity.** Which lane an intercom call belongs to is unbound. It

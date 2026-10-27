@@ -9,15 +9,23 @@ site_id   = "site-1"
 # "entry" opens a session; "exit" closes one and the platform prices it.
 direction = "entry"
 
-# Below this confidence the lane takes its fallback path instead of deciding.
-# Raising it makes the lane more cautious and sends more vehicles to fallback;
-# lowering it lets the lane act on reads it is less sure about. It should never
-# be lowered to make a fallback rate look better.
+# Below this confidence a plate is not one the lane stands behind: it is never
+# looked up in a rule or a register, and never becomes a stay's plate -- the
+# stay's plate is "unreadable". At an entry whose garage takes transients the
+# car is let in all the same; at a pass-only garage it is denied; at a garage
+# that has not said which it is, and at an exit, the lane takes its fallback
+# path instead of deciding. Raising it makes the lane more cautious; lowering
+# it lets the lane act on reads it is less sure about. It should never be
+# lowered to make a fallback rate look better.
 confidence_threshold = 0.85
 
-# How old cached rules may be before the lane stops trusting them and falls
-# back. The lane keeps working with the internet down; it does not keep working
-# forever with the internet down.
+# How old cached rules may be before the lane stops trusting them -- and stops
+# holding the personal data in them. The lane keeps working with the internet
+# down; it does not keep trusting its registers forever with the internet down.
+# Past it, a garage that takes transients still opens for every car (the
+# garage's entry settings outlive the bound); a car a register covered is no
+# longer recognised until the platform answers again; a garage that has not
+# said what it takes falls back.
 rules_max_age_seconds = 86400
 
 # Where events are reported and the cache is refreshed from, when connectivity

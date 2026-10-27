@@ -33,9 +33,18 @@ up crossed loops nobody was reading and were in no record at all. Now the loops
 are polled on every idle turn of `run_once` while nothing is pending, and a
 crossing found that way that would have confirmed a vend -- forward over two
 loops, an occupancy of one -- is an `entry_unadmitted` event: an entry, because a
-vehicle is inside; a different one, because nothing admitted it. It opens no
-session, it moves no transit state, and it is never folded into
-`entry_confirmed`. A stream of them is what a broken boom looks like from here.
+vehicle is inside; a different one, because nothing admitted it. It moves no
+transit state, and it is never folded into `entry_confirmed`. A stream of them
+is what a broken boom looks like from here.
+
+AND EVERY SUCH CAR IS A STAY. The owner's rule (2026-10-26): the activation
+loop, the closing loop and the pictures make the entry, and the barrier plays
+no part in the record. So the crossing with no open command opens a stay like
+a confirmed entry's -- `confirmed`, because the loops saw it; `tailgater:
+true`, because no open command let it in -- with its closing-loop pictures and
+the identity read from them, a plate or "unreadable". A held vend is still no
+stay: that car did not cross. A lane with no closing loop is unchanged: every
+stay `unconfirmable`.
 
 The whole sequence runs against simulated implementations of all three seams,
 which is why `tests/` needs no hardware.
@@ -51,7 +60,15 @@ from dataclasses import dataclass, replace
 
 from .config import LaneConfig
 from .contract import TransitState
-from .decision import Decision, DecisionCache, Fallback, Outcome, closed_to, decide
+from .decision import (
+    Decision,
+    DecisionCache,
+    Fallback,
+    Outcome,
+    closed_to,
+    decide,
+    plate_read,
+)
 from .events import EventQueue, LaneEvent
 from .exit_pricing import price_exit
 from .interfaces import (
@@ -61,6 +78,7 @@ from .interfaces import (
     ClosingSequence,
     LoopInput,
     VehicleIdentifier,
+    VehicleIdentity,
     VendOutput,
 )
 from .reader import ReaderScreen
@@ -169,8 +187,11 @@ log = logging.getLogger(__name__)
 #: The pictures kept with an entry (U7f), from the lane's camera: between the
 #: vend and the closing loop, at the closing loop, and of a banned car refused
 #: at the gate. A few of each -- enough to see the car and, for a tailgater,
-#: to read it. The arming loop's frames are not among them: they are read and
-#: never kept, as before.
+#: to read it. AND THE ARMING READ'S OWN FRAMES (`[camera] frames_per_read`),
+#: the ones the car was identified from: kept with the stay it opens, because
+#: they are the pictures its colour, its shape and any damage were seen in --
+#: read and thrown away, they were the one record of the car at the moment it
+#: was decided on.
 BETWEEN_PICTURES = 2
 CLOSING_PICTURES = 2
 REFUSED_PICTURES = 2
@@ -481,6 +502,9 @@ class LaneController:
         #: in hand is that vend's either way.
         self._transits_published = 0
         self._board = threading.Condition()
+        #: The held vend (its `transit_since`) whose late crossing has already
+        #: been taken for its car, so a second crossing after it is not.
+        self._late_taken_for: str | None = None
 
     def now(self) -> float:
         """This lane's clock, which is the authority for WHEN.
@@ -533,6 +557,12 @@ class LaneController:
             direction=self.config.direction,
             day_at=self.now(),
         )
+        # THE QR SEAM (Phase 1b, not built): at a monthly/pass-only garage a
+        # car no register covers is decided DENY with `REASON_NOT_REGISTERED`.
+        # That decision is where a registration QR scanned at this lane will be
+        # presented to the pass module's enrolment, before the gate's answer is
+        # final; a QR it accepts turns the DENY into an open for this car.
+        # Today there is no scanner seam, and the DENY stands.
         banned = self._banned(identity) if decision.should_vend else None
         if banned is not None:
             # A CAR ON THE GARAGE'S BANNED LIST (U7f): the gate stays shut,
@@ -559,6 +589,16 @@ class LaneController:
             **(
                 {"exit_pricing": decision.exit_pricing.to_detail()}
                 if decision.exit_pricing is not None
+                else {}
+            ),
+            # A CAR LET IN WITH NO READ AT ALL -- the engine not reached, no
+            # frames -- says which failure, as `fallback_needs_human` does for
+            # one that was not let in: somebody has to go and fix it, and the
+            # car getting in is not a reason for the record to stop saying so.
+            # A member of `Unavailable`, never text: this detail is append-only.
+            **(
+                {"cause": identity.unavailable.value}
+                if identity.unavailable is not None and decision.should_vend
                 else {}
             ),
         )
@@ -612,7 +652,14 @@ class LaneController:
             # lane-priced close `inputs_disagree` with the fee right.
             exit_at = getattr(decision.exit_pricing, "exit_at", None)
             at = exit_at if exit_at else to_iso(self._clock())
-            self._settle_transit(identity, at, exit_pricing=decision.exit_pricing)
+            # The arming read's frames ride with the transit, to be kept with
+            # the stay it opens -- and with nothing if it opens none.
+            self._settle_transit(
+                identity,
+                at,
+                exit_pricing=decision.exit_pricing,
+                arming=frames if self.config.direction == "entry" else (),
+            )
 
         elif decision.outcome is Outcome.NO_VEHICLE:
             # D3. Nothing was there, so nothing happens: no ticket, no session,
@@ -847,15 +894,20 @@ class LaneController:
 
     @staticmethod
     def _identity_kind(identity) -> str:
-        """What KIND of identity this is: read, or asserted.
+        """What KIND of identity this is: read, asserted, or a plate nobody
+        could read.
 
         Derived from the identity itself rather than passed alongside it, so a
         record cannot say `plate` about a ticket. It is published on the pending
-        event; the ticket REFERENCE is not -- see `begin_transit`.
+        event; the ticket REFERENCE is not -- see `begin_transit`. Called on
+        the identity a stay carries (`_stay_identity`), so `plate` means a
+        plate this lane stands behind and `unread` means there is none.
         """
-        return "ticket" if identity.ticket_ref else "plate"
+        if identity.ticket_ref:
+            return "ticket"
+        return "plate" if identity.plate else "unread"
 
-    def _settle_transit(self, identity, at: str, *, exit_pricing=None) -> None:
+    def _settle_transit(self, identity, at: str, *, exit_pricing=None, arming=()) -> None:
         """Record the pending entry, then let the closing loops decide its fate.
 
         Two halves, called as one here and separately by the assisted vend --
@@ -867,10 +919,11 @@ class LaneController:
         `exit_pricing` is THIS car's local decision, handed down explicitly so
         the close carries the decision the barrier moved on -- not whatever
         `last_decision` holds by the time a settle records the session, which
-        on a thread of its own could be the next car's.
+        on a thread of its own could be the next car's. `arming` is THIS car's
+        arming read, handed down for the same reason, to be kept with its stay.
         """
         self.begin_transit(identity, at)
-        self.resolve_transit(identity, at, exit_pricing=exit_pricing)
+        self.resolve_transit(identity, at, exit_pricing=exit_pricing, arming=arming)
 
     def begin_transit(self, identity, at: str) -> None:
         """The vend created a PENDING entry. Nothing has decided its fate yet."""
@@ -878,6 +931,7 @@ class LaneController:
         names = _ENTRY if self.config.direction == "entry" else _EXIT
         geometry = self.config.loops.as_published()
 
+        identity = self._stay_identity(identity)
         self.events.record(
             names.pending,
             lane,
@@ -894,8 +948,14 @@ class LaneController:
         )
         self._transit(TransitState.PENDING, at)
 
-    def resolve_transit(self, identity, at: str, *, claim=None, exit_pricing=None) -> None:
+    def resolve_transit(
+        self, identity, at: str, *, claim=None, exit_pricing=None, arming=()
+    ) -> None:
         """What the loops after the barrier made of the pending entry.
+
+        `arming` is the arming read's frames, kept with the stay this transit
+        opens -- confirmed, or unconfirmable at a lane with no closing loop --
+        and with nothing when it opens none.
 
         `claim` is how the assisted vend bounds a loop driver that does not
         return: the settle waits for this call under its own deadline and, when
@@ -931,9 +991,13 @@ class LaneController:
                 geometry_assumed=geometry,
             )
             self._transit(TransitState.UNCONFIRMABLE, at)
-            self._record_session(
+            opened = self._record_session(
                 identity, at, confirmation=UNCONFIRMABLE, exit_pricing=exit_pricing
             )
+            if opened is not None and arming:
+                # No closing loop to picture the car at: the arming read's
+                # frames are the stay's pictures.
+                self.events.queue_pictures(opened.event_id, arming)
             return
 
         window = self._confirmation_window()
@@ -976,9 +1040,11 @@ class LaneController:
                 identity, at, confirmation=CONFIRMED, exit_pricing=exit_pricing
             )
             if opened is not None:
-                # And at the closing loop: the car that confirmed the entry.
+                # The arming read's frames, and at the closing loop the car
+                # that confirmed the entry.
                 self.events.queue_pictures(
-                    opened.event_id, [*between, *self._take_pictures(CLOSING_PICTURES)]
+                    opened.event_id,
+                    [*arming, *between, *self._take_pictures(CLOSING_PICTURES)],
                 )
             return
 
@@ -1168,12 +1234,17 @@ class LaneController:
         `entry_unadmitted`, with its own reason and with what this lane last
         decided and what its last vend became beside it -- the lane cannot bind
         the crossing to either, and the detail says what it knew rather than
-        guessing which car this was. No plate: nothing was identified, and no
-        identity text goes on the event stream in any case.
+        guessing which car this was. No plate on the event: no identity text
+        goes on the event stream.
 
-        WHAT IT DOES NOT. It opens no session -- the platform's open takes an
-        identity and this crossing has none, and a session with no identity
-        would be the phantom occupant wearing a different hat. It moves no
+        AND IT OPENS A STAY. A car that crossed the loops after the gate is
+        inside, whatever opened the barrier, and the owner's rule is that the
+        loops and the pictures make the entry: `session_open`, `confirmed` (the
+        loops saw it), `tailgater: true` (no open command let it in -- except
+        the car this lane admitted and held, crossing late: `_late_admitted`),
+        with the closing-loop pictures and the identity read from them, a plate
+        or "unreadable" (`_crossing_identity`). Only a crossing the camera says
+        no car made opens nothing. It moves no
         transit state, because that enum says what became of the last VEND.
         A REVERSE crossing with nothing pending is a vehicle leaving through
         an entry the wrong way, which is not an entry of any kind and has no
@@ -1262,18 +1333,25 @@ class LaneController:
             "recorded as an entry nothing admitted",
             lane,
         )
-        # THE TAILGATER (U7f): pictures at the closing loop, and the car's
-        # identity read from them. Read as a regular entry needs it read, it
-        # is a stay like any other -- it pays at the exit -- and the platform
-        # lists it where the garage bans tailgaters. Not read, it stays an
-        # entry nothing admitted, now with its pictures.
+        # A CAR THROUGH THE GATE WITH NO OPEN COMMAND IS A STAY (the owner's
+        # rule, 2026-10-26: the loops and the pictures make the entry, the
+        # barrier plays no part in the record). Pictures at the closing loop,
+        # and the car's identity from them: a plate read at the lane's
+        # confidence, or "unreadable" -- a value of the car's identity, never a
+        # reason to leave it out of the record. The tailgater, the refused car
+        # that drove in anyway, the car through a barrier that is up: each is a
+        # stay like any other, pays at the exit, and says no open command let
+        # it in (`tailgater: true`). The only crossing that opens nothing is
+        # one the camera says no car made (`_crossing_identity`).
         frames = self._take_pictures(CLOSING_PICTURES)
-        identity = self._tailgater_identity(frames)
+        identity = self._crossing_identity(frames)
         unadmitted = self.events.record(
             ENTRY_UNADMITTED,
             lane,
             reason=REASON_NO_PENDING_ENTRY,
-            identified=identity is not None,
+            # Whether the plate was read: a fact, not whether there is a stay.
+            identified=identity is not None and bool(identity.plate),
+            stay_opened=identity is not None,
             at=at,
             geometry_assumed=self.config.loops.as_published(),
             # What this lane knew, not which car this was. `last_decision` is
@@ -1406,9 +1484,17 @@ class LaneController:
         These are the only events in this package that have ever carried
         identity text, and they are not on the read contract -- they become
         `POST /lane/sessions/open` and `/close`.
+
+        A PLATE NOBODY COULD READ is the third shape, and an open only: no
+        plate key and no ticket key, `plate_unreadable: true` -- the value the
+        owner's rule makes of it ("the plate is unreadable, and that is part of
+        the ID"). The platform holds such a stay as a car of its own (0036);
+        the descriptor and the pictures are what identify it further.
         """
         if identity.ticket_ref:
             return {"ticket_ref": identity.ticket_ref, "identity_kind": "ticket"}
+        if not identity.plate:
+            return {"plate_unreadable": True, "identity_kind": "unread"}
         detail = {"plate": identity.plate, "identity_kind": "plate"}
         if with_region:
             # The open carries it and the close never has. Kept that way rather
@@ -1486,39 +1572,68 @@ class LaneController:
             )
             return []
 
-    def _tailgater_identity(self, frames):
-        """The tailgater's identity from its pictures, when it is read as a
-        regular entry needs it read: a plate, at the lane's confidence, from a
-        read that happened. None otherwise -- and for an identifier that fails."""
-        if not frames:
-            return None
-        try:
-            identity = self.identifier.identify(frames)
-        except Exception:  # noqa: BLE001 -- an unread tailgater is the record as it was
-            log.exception("lane %s: identifying a tailgater failed", self.config.lane_id)
-            return None
-        if (
-            not identity.plate
-            or identity.presence is False
-            or identity.unavailable is not None
-            or identity.confidence < self.config.confidence_threshold
-        ):
+    def _crossing_identity(self, frames):
+        """The identity of the car that crossed with nothing pending, from its
+        closing-loop pictures -- what a stay opened for it carries.
+
+        A plate read at the lane's confidence, or "unreadable": the stay is
+        opened either way (`_stay_identity` says what it carries). The
+        appearance descriptor goes with it whenever the read produced one.
+        No pictures, or an identifier that fails, is still a car the loops saw
+        cross: an unreadable stay with no descriptor. None ONLY when the camera
+        says no vehicle was there (`presence: false`, measured against the
+        lane's reference view) -- the camera's word over the loop's, as at the
+        arming read, so a loop tripped by something that is not a car is no
+        phantom occupant."""
+        read = VehicleIdentity(plate=None)
+        if frames:
+            try:
+                read = self.identifier.identify(frames)
+            except Exception:  # noqa: BLE001 -- a failed read is an unreadable plate
+                log.exception("lane %s: identifying a crossing car failed", self.config.lane_id)
+        if read.presence is False:
             return None
         # A ticket is asserted, never read: the seam `handle_arrival` keeps.
-        return replace(identity, ticket_ref=None)
+        return self._stay_identity(replace(read, ticket_ref=None))
+
+    def _stay_identity(self, identity):
+        """The identity a stay carries: what this lane stands behind.
+
+        A ticket a person or a display asserted, as it was. Otherwise the plate
+        when it was read at the lane's confidence (`decision.plate_read`), and
+        when it was not, NO plate: "unreadable" is the value, and the open says
+        so (`_identity_detail`). A plate read below the threshold never becomes
+        a stay's plate -- on the platform a plate is a vehicle, and a misread
+        one would land this car on another car's open stay. Everything else
+        that was seen -- the descriptor, the make, the colour -- stays."""
+        if identity.ticket_ref or plate_read(identity, self.config.confidence_threshold):
+            return identity
+        return replace(identity, plate=None, plate_region=None)
 
     def _late_admitted(self, identity) -> bool:
-        """Whether the car read at the closing loop is the one this lane last
+        """Whether the car at the closing loop is the one this lane last
         ADMITTED and held -- vended, but it reached the loop after the window.
         That car was let in: its stay is not a tailgater's, and it is never
-        put on a banned list for being slow. Same plate as the held vend's."""
-        return (
-            self.transit_state == TransitState.HELD.value
-            and self.last_decision is not None
-            and self.last_decision.should_vend
-            and bool(self.last_decision.identity.plate)
-            and self.last_decision.identity.plate.upper() == identity.plate.upper()
-        )
+        put on a banned list for being slow.
+
+        Same plate as the held vend's, when both were read. When either was
+        not, nothing here can tell the two apart, and the crossing is taken
+        for the admitted car: a stay with the tailgater flag off loses a ban
+        the owner may want, while one wrongly on puts a car this lane let in
+        on the banned list. Once per held vend: the first crossing after it is
+        the one that may be its car, and a second is not."""
+        if (
+            self.transit_state != TransitState.HELD.value
+            or self.last_decision is None
+            or not self.last_decision.should_vend
+            or self._late_taken_for == self.transit_since
+        ):
+            return False
+        held = plate_read(self.last_decision.identity, self.config.confidence_threshold)
+        if held and identity.plate and held.upper() != identity.plate.upper():
+            return False
+        self._late_taken_for = self.transit_since
+        return True
 
     def _banned(self, identity) -> str | None:
         """The ban an arriving car matches, at an entry; None for every other car.
@@ -1551,6 +1666,9 @@ class LaneController:
         entry's open, which its pictures are kept against; None at an exit."""
         lane = self.config.lane_id
         if self.config.direction == "entry":
+            # What this lane stands behind, and nothing it does not: a plate
+            # read below its confidence is "unreadable" on the stay.
+            identity = self._stay_identity(identity)
             return self.events.record(
                 SESSION_OPEN,
                 lane,
@@ -1558,8 +1676,9 @@ class LaneController:
                 **self._session_descriptor(identity),
                 at=at,
                 entry_confirmation=confirmation,
-                # A car through the gate that no vend let in (U7f). Only when
-                # true, so every other open is the record it always was.
+                # A car through the gate that no open command let in (U7f).
+                # Only when true, so every other open is the record it always
+                # was.
                 **({"tailgater": True} if tailgater else {}),
             )
         # WHICH SESSION THIS IS is asked of the platform when the close is

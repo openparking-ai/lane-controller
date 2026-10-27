@@ -415,6 +415,10 @@ def _last_send(runner: LaneRunner) -> None:
     in the outbox file when there is one. Guarded like every drain turn, and a
     platform it cannot reach costs one client timeout, not one per item: the
     flush stops at the first part it cannot deliver."""
+    # And before it, the disk thread catches up -- bounded -- so what was
+    # recorded just before the stop is in the outbox file whatever the send
+    # does: the lane thread hands its writes over and never waits on them.
+    runner.controller.events.wait_written()
     if runner.controller.events.transport is not None:
         runner.drain_turn()
 

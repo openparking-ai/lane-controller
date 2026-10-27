@@ -16,7 +16,26 @@ arming loops ─▶ grab frames ─▶ identify ─▶ decide ─▶ vend ─▶
 
           (idle) ─────────────────────────────────────────────▶ closing loop(s)
                                                                     └─▶ occupied / A→B with nothing pending → entry_unadmitted
+                                                                                                             + session (tailgater)
 ```
+
+**The entry, as the owner set it (2026-10-26).** The activation loop, the
+closing loop and the pictures make the entry; the barrier plays no part in the
+record. So **every car that crosses the arming loop and then the closing loop
+is a stay**, with or without the lane's open command, and the car is
+identified by what was seen: the plate when it was read at the lane's
+confidence, or `plate_unreadable` -- a value of the car's identity, never a
+reason to leave it out of the record. **A garage that takes transients opens
+for every car** (`transient_available: true`): a plate read low, no plate, an
+unknown car, an engine that did not answer and rules past their age all open,
+and the stay carries what was seen. Only the garage full (`closed: full`, which
+still lets in a car a register covers), the owner's closing to everyone, a car
+on the banned list, an owner's rule against a plate, and nothing there keep the
+gate shut. **A monthly/pass-only garage** (`transient_available: false`) opens
+for a car its registers cover today and **denies every other car**, the gate
+shut -- not a person's case -- whatever its default. A garage that has not said
+which it is decides as it always did. `tests/test_entry_always_a_stay.py` holds
+each, and `scripts/entry_stay_fail_control.py` breaks each.
 
 **The ticket is not the entry.** A driver can pull up, take a ticket and drive
 away; a vend with nothing behind it is not an arrival. So the vend creates a
@@ -49,25 +68,36 @@ record at all. The lane now polls those loops on every idle turn, and the closin
 loop occupied (or, with two loops, a forward crossing) found with nothing pending
 is an `entry_unadmitted` event: an entry,
 because a vehicle is inside; a different one, because nothing admitted it. It
-opens no session, moves no transit state, and is never folded into
-`entry_confirmed`. A stream of them on `GET /v1/lane/events` is what a broken
-boom looks like from here; what broke it is not measured in this package.
+moves no transit state and is never folded into `entry_confirmed`. A stream of
+them on `GET /v1/lane/events` is what a broken boom looks like from here; what
+broke it is not measured in this package. **And the car is a stay**: a
+`session_open` follows, `confirmed` (the loops saw it) and `tailgater: true` (no
+open command let it in), with its closing-loop pictures and the identity read
+from them, a plate or `plate_unreadable`; the event's `stay_opened` says so. The
+one crossing that opens nothing is one the camera says no car made
+(`presence: false` against the lane's reference view). A held vend -- an open
+command with nothing crossing in time -- is still no stay.
 
 **Pictures, the tailgater, and banned cars (U7f).**
-- **Pictures.** A few are taken between the vend and the closing loop, and a few
-  at it, from the lane's camera. They are kept with the entry record: the stay's
-  open when the closing loop confirms it, or the `entry_unadmitted` record. They
-  go to the platform on their own route, `POST /api/v1/lane/pictures`, and never
-  onto `GET /v1/lane/events`, because a picture shows the plate. The platform
-  keeps them one week after the car leaves. A held entry keeps none, and the
-  arming read's frames are still read and never kept.
+- **Pictures.** The arming read's own frames -- the ones the car was identified
+  from, where its colour, shape and damage were seen -- and a few between the
+  vend and the closing loop, and a few at it, from the lane's camera. They are
+  kept with the entry record: the stay's open (at a lane with no closing loop,
+  the arming read's are its pictures), or the `entry_unadmitted` record of a
+  crossing no car made. They go to the platform on their own route, `POST
+  /api/v1/lane/pictures`, one at a time, each retried until it is taken, and
+  never onto `GET /v1/lane/events`, because a picture shows the plate. **With an
+  outbox file they are kept on disk** beside the stays they belong to (0600, in
+  the cache's 0700 directory), not bounded and not dropped, so a restart in an
+  outage loses none; a memory-only lane keeps the newest 200. The platform keeps
+  them one week after the car leaves. A held entry keeps none.
 - **The tailgater.** A crossing found by the idle poll is pictured and its car
-  identified. Read as a regular entry needs it read (a plate, at the lane's
-  confidence), it opens a stay with `tailgater: true`, which pays at the exit.
-  Not read, it is `entry_unadmitted` as before, with its pictures. Either way
-  the `entry_unadmitted` event is recorded, with `identified` saying which. The
-  car this lane admitted and held, reaching the loop late with the same plate,
-  is a stay but not a tailgater.
+  identified, and it is a stay with `tailgater: true`, which pays at the exit --
+  read or not: a car nobody could read is a stay with `plate_unreadable`. The
+  `entry_unadmitted` event is recorded beside it, `identified` saying whether
+  the plate was read. The car this lane admitted and held, reaching the loop
+  late -- with the same plate, or with a plate nobody could compare -- is a stay
+  but not a tailgater, once per held vend.
 - **Banned cars.** The platform sends the bans that reach this garage on
   `GET /lane/rules` as `banned: [{id, descriptor}]`. A car the lane would admit
   whose descriptor matches one is refused instead: no vend, reason `banned`,
@@ -149,10 +179,16 @@ cut with the platform still unreachable decides from what it last held, and a
 lane that comes back after two days holds a cache it does not trust and says
 so. Without a path the cache is memory only, as it always was. **The
 outbox's stay opens and closes are kept beside it** (`decision-cache.outbox.sqlite`
-beside `decision-cache.sqlite`, same directory rule, 0600), written as each is
-recorded and removed once the platform has taken or refused it, so a restart
-during an outage loses none of them; the lane sends them first thing, in the
-order they happened. They are not cache: each is held until the platform has
+beside `decision-cache.sqlite`, same directory rule, 0600), with the pictures
+kept with the entries, written as each is recorded and removed once the platform
+has taken or refused it, so a restart during an outage loses none of them; the
+lane sends them first thing, in the order they happened. **The writes are made
+by the outbox's own disk thread, never by the lane thread** (`events.DiskWriter`):
+a stay is recorded on the thread that decides the next car, and a disk that is
+slow or hung used to hold that car on SQLite's write; now it holds nothing on the
+barrier's path. What that costs, stated: an item is on disk milliseconds after it
+is recorded, and a process killed inside those milliseconds loses it -- the same
+class of window as the one between the vend and the stay's record. They are not cache: each is held until the platform has
 it, not for `rules_max_age_seconds`. Log events are not kept there; they are
 bounded and dropped first, as before. `serve` stopped by Ctrl-C or SIGTERM
 makes one last send on the way out.
@@ -164,18 +200,25 @@ does not reach that file; the lane's own rule does, and it is
 `rules_max_age_seconds` — the age past which the lane stops trusting the cache
 is the age past which it stops holding it, wiped from memory and disk on start
 and on every refresh tick, and the file is replaced whole on every refresh so a
-plate that left the register is gone at the next read. **The directory must be
+plate that left the register is gone at the next read. **The garage's entry
+settings outlive it** -- whether it takes transients, its default, and this
+lane's closing -- because they name no car and no person and the entry is
+decided on them: a garage that takes transients still opens for every car two
+days into an outage, and a lane closed `full` stays closed. **The directory must be
 the process's own** — a row in that file is `plate → allow`, and a line
 written by hand opens the barrier — so a path in a directory anyone else can
 write refuses to start, before the port opens, by the same rule Vehicle ID
 applies to its queue. `scripts/durable_fail_control.py` breaks each property in turn.
 
 When identification is not confident enough, the
-lane takes an explicit fallback path — the `Fallback` members in
-`decision.py` — each of which is a named outcome with an
-event behind it. It does not pick the most likely plate and open the gate.
-Confidence is checked *before* the plate is used to look anything up, so a
-low-confidence read cannot match a rule by accident.
+lane never picks the most likely plate: confidence is checked *before* the
+plate is used to look anything up, so a low-confidence read cannot match a
+rule or a register by accident, and it never becomes a stay's plate --
+"unreadable" does. What the lane then DOES depends on the garage: at one that
+takes transients the car is let in and the stay records what was seen; at a
+pass-only garage it is denied; at a garage that has not said, it takes an
+explicit fallback path — the `Fallback` members in `decision.py` — each of
+which is a named outcome with an event behind it.
 
 ## The lane's contract
 
@@ -238,11 +281,11 @@ neither on the path between a car arriving and a barrier opening.
 | `sync_rules()` | the SLOW cadence: `GET /lane/rules` — the garage's rate plans whole, its space class, each entitlement module's register (verbatim; a module the platform could not read is NOT replaced with nothing) and the full set of open stays with a cursor. On failure it keeps the cache it had — a failed request is not a reason to forget good rules. |
 | `sync_stays()` | the FAST cadence: `GET /lane/stays?since=<cursor>` — every stay opened or closed since, closed rows included so the exit lane drops a car that left, paged and followed at once. A refusal drops the cursor so the next read takes the full set. It also carries this lane's closing and the owner's board, so a closing acts within one fast interval. |
 | `decide()` at a closed lane | closed to everyone: no car opens by itself, `fallback` / `lane_closed`. Closed `full` at an entry: a car a register covers today (the exit's own lookup, `register_cover`) gets in, every other identified car is `lane_closed`. A person's word through `POST /v1/lane/vend` opens it; a display code does not. |
-| `decide()` and the garage's settings | the garage's default (`allow`, `deny`) is an ENTRY rule: at an exit a car with no rule is let out, and `price_exit()` says covered, priced or not priceable here. **Pass holders only** (`transient_available: false` on the rules), at a garage whose default is `allow`: at an entry, a car a register covers today gets in and every other car takes the fallback path. A garage whose default is `deny` refuses every car without a rule at the entry, and one with no default sends it to the fallback path, both as before; a payload without the field is the lane as it was. |
+| `decide()` and the garage's settings | **At an entry, what the garage takes decides** (`garage_admits`). `transient_available: true`: every car opens -- unread, unknown, engine down, rules stale -- except full (a register-covered car still opens), closed to everyone, banned, an owner's rule against the plate, or nothing there. `transient_available: false` (**pass holders only**), at ANY default: a car a register covers today opens, every other car is `deny` (`REASON_NOT_REGISTERED`, where a scanned registration QR will be presented, not built). `true` with a default of `deny` is read as pass-only, the stricter reading. A payload without the field is the lane as it was: the default (`allow`, `deny`) and the fallback path. The default is an ENTRY rule: at an exit a car with no rule is let out, and `price_exit()` says covered, priced or not priceable here. Only a plate read at the lane's confidence is ever looked up, in a rule or a register (`plate_read`). |
 | `board_items()` | the board on `GET /v1/lane/state`: the owner's messages in force on this lane's clock, then — when switched on — the price for 1, 2, 3 and 24 hours entering now, from `charge`, the same quote-and-tax call the exit charges with. |
 | `price_exit()` | the exit's local decision, from the cache alone: `covered`, `priced` (the engine in-process), `no_cached_entry`, or the engine's own refusal verbatim. Reads the registers with the garage's local day, and a monthly agreement's own days when its register carries them (start, pauses, the owner's block, the first day unpaid past grace); folds the plate and the registrar's identity to letters and digits, with O read as 0 and I as 1 because the plate reader outputs neither letter (an assumption, stated in `normalise_identity`). A stay whose close the lane records leaves its list, so a car that pulls forward again is not priced twice. |
 | `LaneRunner` | the production loop. The lane thread calls `run_once` for ever; the refresh thread runs the two cadences (`[lane] rules_refresh_seconds`, `stays_refresh_seconds`), the slow one first at start. A refresh that could not run is counted and said on `RunnerState`, never hidden; a turn that raises is logged and the loop goes round again. **The fast interval is the size of the class of cars that entered too recently to be priced at the barrier** — `config/lane.example.toml` says so where the number is set. **The outbox drains on a third thread**: the controller's `deliver()` is a signal under the runner, so the lane thread never waits on the network after the vend either — against a platform that black-holes, the client's timeout per queued action is the drain thread's cost, not the next car's; an outbox the platform refused is retried every `DRAIN_RETRY_S` without waiting for a car. A bare controller (the tests, the demo) drains inline, and `run_once` returns delivered. |
-| `EventQueue` | one outbox holding both the activity log and the session actions, so a lane that was offline replays what happened in the order it happened. Safe to record into from the lane thread while a drain is mid-send on another: a flush removes what it sent, never what was recorded meanwhile. **Session actions are never dropped**; only log events are, and a drop is counted. With `[lane] cache_path` the session actions are also kept on disk until the platform has them (`durable.OutboxStore`). A flush goes part by part -- each session action, then the log in chunks of 200 -- and each part leaves as soon as it is delivered or refused; the first part the platform cannot be reached for stops the flush, and the next one starts there. |
+| `EventQueue` | one outbox holding both the activity log and the session actions, so a lane that was offline replays what happened in the order it happened. Safe to record into from the lane thread while a drain is mid-send on another: a flush removes what it sent, never what was recorded meanwhile. **Session actions are never dropped**; only log events are, and a drop is counted. With `[lane] cache_path` the session actions and the pictures are also kept on disk until the platform has them (`durable.OutboxStore`), written by the outbox's own disk thread so the lane thread never waits on the disk. A flush goes part by part -- each session action, then the log in chunks of 200 -- and each part leaves as soon as it is delivered or refused; the first part the platform cannot be reached for stops the flush, and the next one starts there. |
 | `PlatformTransport` | delivers one part at a time. A part is all or nothing, because every platform endpoint it calls is idempotent. A log post over 256 KB, or one the platform answers 413, goes again in halves; only one event too large to post alone is refused for its size. |
 
 **Session times come from the lane, never the server.** A car arrives when it
@@ -310,7 +353,10 @@ python -m lane_controller.demo --credentials ../platform/.demo-credentials.json
     FEE          10.00 USD
 ```
 
-Pass `--confidence 0.40` to watch the lane refuse to guess instead.
+Pass `--confidence 0.40` to watch a read the lane will not stand behind: at
+the demo's garage, which takes transients, the car is let in and its stay's
+plate is unreadable (the platform needs migration 0036) -- and the exit, which
+matches nothing to an unread stay yet, hands the car to a person.
 
 ## Runs with no hardware
 
@@ -329,6 +375,7 @@ python scripts/drain_fail_control.py         # breaks the drain thread, requires
 python scripts/confirmation_fail_control.py  # breaks the confirmation, same requirement
 python scripts/contract_fail_control.py      # breaks the read contract, same requirement
 python scripts/deactivate_fail_control.py    # breaks the deactivate loop's hold, same requirement
+python scripts/entry_stay_fail_control.py    # breaks the owner's entry rule, same requirement
 ```
 
 ## Vehicle ID

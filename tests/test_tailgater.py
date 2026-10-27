@@ -3,14 +3,16 @@
 His answers, 2026-10-11: pictures at the closing loop and a few between the
 vend and it; a tailgater whose identity is read is a stay like any other and
 pays at the exit; a car on the garage's banned list is refused at the entry,
-the gate shut; the arming loop's pictures stay as they are -- read, never kept.
+the gate shut. And 2026-10-26: every car through the activation loop and the
+closing loop is a stay, read or not, and the arming read's pictures are kept
+with it (tests/test_entry_always_a_stay.py holds that round's guarantees).
 
-  1  a confirmed entry's pictures go with its stay: between the vend and the
-     closing loop, and at it. A held entry keeps none; nor does an ordinary
-     arrival's arming read
+  1  a confirmed entry's pictures go with its stay: the arming read's, between
+     the vend and the closing loop, and at it. A held entry keeps none; nor
+     does a refused car's arming read -- it opened no stay
   2  a tailgater read at the closing loop is a stay, `tailgater: true`; not
-     read, it is `entry_unadmitted` as before, with its pictures. The car this
-     lane admitted and held, crossing late, is a stay but not a tailgater
+     read, it is a stay too, `plate_unreadable`, with its pictures. The car
+     this lane admitted and held, crossing late, is a stay but not a tailgater
   4  a car whose descriptor matches the banned list: no vend, reason `banned`,
      its pictures with the decision. No match, no comparison wired, or a
      comparison that fails: the car is decided as before
@@ -132,15 +134,16 @@ def test_a_confirmed_entry_keeps_its_pictures_with_its_stay():
     [opened] = platform.opened
     assert opened["entry_confirmation"] == CONFIRMED
     assert opened["tailgater"] is False
-    # Two between the vend and the closing loop, two at it: all with the stay.
-    assert pictures_of(platform, opened["event_id"]) == 4
-    assert len(platform.pictures) == 4
+    # The arming read's one frame, two between the vend and the closing loop,
+    # two at it: all with the stay.
+    assert pictures_of(platform, opened["event_id"]) == 5
+    assert len(platform.pictures) == 5
     assert all(p["image"] for p in platform.pictures.values())
 
 
 def test_a_held_entry_and_an_ordinary_refusal_keep_no_picture():
     """The control: pictures belong to an entry record. A vend nothing
-    confirmed has none, and an arrival's arming read is never kept."""
+    confirmed has none, and a refused car's arming read opened no stay."""
     held, vend, platform = build(crossings=[])
     held.run_once()
     assert vend.vend_count == 1
@@ -150,7 +153,7 @@ def test_a_held_entry_and_an_ordinary_refusal_keep_no_picture():
     refused, vend, platform = build(identities=(REFUSED,))
     assert refused.run_once().outcome is Outcome.DENY
     assert vend.vend_count == 0
-    assert platform.pictures == {}, "the arming read is not kept"
+    assert platform.pictures == {}, "a refused car's arming read has no stay to go with"
 
 
 # --- 2 the tailgater -------------------------------------------------------------
@@ -174,22 +177,31 @@ def test_a_tailgater_read_at_the_closing_loop_is_a_stay_like_any_other():
     assert pictures_of(platform, opened["event_id"]) == 2
 
 
-def test_a_tailgater_not_read_stays_an_entry_nothing_admitted_with_its_pictures():
+def test_a_tailgater_not_read_is_a_stay_with_an_unreadable_plate_and_its_pictures():
+    """2026-10-26: the plate unreadable is a value of the car's identity, not a
+    reason to leave the car out of the record. It used to be no stay at all."""
     controller, vend, platform = build(identities=(REFUSED, UNREAD), crossings=[(OCC, 3.0)])
     controller.run_once()
     controller.run_once()
-    assert platform.opened == [], "nothing read, no stay"
     unadmitted = event_id_of(platform, ENTRY_UNADMITTED)
     assert platform.events[unadmitted]["detail"]["identified"] is False
-    assert pictures_of(platform, unadmitted) == 2
+    assert platform.events[unadmitted]["detail"]["stay_opened"] is True
+    [opened] = platform.opened
+    assert (opened["plate"], opened["plate_unreadable"], opened["tailgater"]) == (
+        None, True, True)
+    assert opened["entry_confirmation"] == CONFIRMED
+    assert pictures_of(platform, opened["event_id"]) == 2
 
 
 def test_a_read_below_the_lanes_confidence_is_not_a_read():
+    """The stay is opened, and the plate read below the lane's confidence is
+    not its plate: "unreadable", never TAIL-2."""
     unsure = VehicleIdentity(plate="TAIL-2", confidence=0.5, presence=True)
     controller, _, platform = build(identities=(REFUSED, unsure), crossings=[(OCC, 3.0)])
     controller.run_once()
     controller.run_once()
-    assert platform.opened == []
+    [opened] = platform.opened
+    assert (opened["plate"], opened["plate_unreadable"]) == (None, True)
 
 
 def test_the_car_this_lane_admitted_and_held_crossing_late_is_a_stay_but_not_a_tailgater():
@@ -335,7 +347,7 @@ def test_the_thresholds_are_stated_together_or_not_at_all():
 def test_a_picture_leaves_on_its_own_route_and_never_on_the_read_window():
     controller, _, platform = build(crossings=[(OCC, 3.0)])
     controller.run_once()
-    assert len(platform.pictures) == 4
+    assert len(platform.pictures) == 5
     window = json.dumps([e.as_dict() for _, e in controller.events._history], default=str)
     assert "image" not in window and "picture" not in window
 
@@ -388,11 +400,11 @@ def test_pictures_wait_out_an_outage_and_go_when_it_ends():
     platform.online = False
     controller.run_once()
     assert platform.pictures == {}
-    assert controller.events.pending_pictures == 4
+    assert controller.events.pending_pictures == 5
     platform.online = True
     controller.events.flush()
     controller.events.flush_pictures()
-    assert len(platform.pictures) == 4
+    assert len(platform.pictures) == 5
     assert controller.events.pending_pictures == 0
 
 

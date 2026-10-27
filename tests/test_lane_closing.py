@@ -8,21 +8,25 @@ requires this file to go red:
      covered car, not a priced one, not a car a rule allows, not a display code
   2  full, at an entry: a car a register covers today gets in; an uncovered
      car does not; a car the lane cannot identify goes to a person as today
+     at a garage that has not said what it takes (one that has is
+     tests/test_entry_always_a_stay.py's)
   3  a person's word -- either human authority -- opens a closed entry, for
      both reasons
   4  an exit closed to everyone shows no fee on the reader and asks for no
      money
   5  a closing reaches the lane on the FAST read, inside one stays cadence
   6  offline and across a restart, the lane keeps the last closing it was told
+     -- past the cache's bound too: the closing is not personal data
   11 one event per refused arrival, with the reason, and no plate in it
   13 a board message shows only inside its times, offline too
   14 a price on the board is what the lane would charge for that stay at that
      moment, tax and an event window included
   15 pass holders only, at an entry: a car a register covers today gets in;
-     every other car takes the fallback path; the exit still lets cars out;
-     a garage that has not said so is the lane as it was; and it narrows an
-     `allow` default only -- a garage whose default is deny, or that has
-     none, decides at the entry as it did
+     every other car is DENIED, the gate shut (the owner's rule, 2026-10-26,
+     not the fallback path it used to take); the exit still lets cars out;
+     a garage that has not said so is the lane as it was; and it is one rule
+     whatever the garage's default -- it used to be read only where the
+     default was `allow`
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ from fake_platform import FakePlatform
 from lane_controller import DecisionCache
 from lane_controller.board import BOARD_STAY_MINUTES, board_items, in_force, price_lines
 from lane_controller.contract import VendAuthority, VendRefusal
-from lane_controller.decision import Fallback, Outcome
+from lane_controller.decision import REASON_NOT_REGISTERED, Fallback, Outcome
 from lane_controller.durable import DurableStore
 from lane_controller.exit_pricing import price_exit
 from lane_controller.interfaces import ClosingSequence, VehicleIdentity
@@ -336,7 +340,12 @@ def test_the_last_closing_holds_offline_and_across_a_restart(cache_dir):  # noqa
     assert DecisionCache(max_age_seconds=3600).lane["state"] == "open"
 
 
-def test_past_the_bound_the_closing_goes_with_the_rest_of_the_cache(cache_dir):  # noqa: F811
+def test_past_the_bound_the_closing_outlives_the_personal_data(cache_dir):  # noqa: F811
+    """The closing names no car and no person, so the bound that wipes the
+    personal data does not reach it: a lane closed `full` two days into an
+    outage does not reopen itself (`DecisionCache.clear`). It used to go with
+    the rest, and the lane then let every car into a garage its owner had
+    said was full. The platform's next answer replaces it as always."""
     path = cache_dir / "cache.sqlite"
     platform = FakePlatform()
     platform.lane = dict(EVERYONE)
@@ -344,8 +353,11 @@ def test_past_the_bound_the_closing_goes_with_the_rest_of_the_cache(cache_dir): 
     sync_rules(platform, first)
     assert first.lane == EVERYONE, "the premise: the closing was held"
     assert first.expire_if_past_bound(now=first._refreshed_at + 61) is True
-    assert first.lane["state"] == "open"
-    assert DecisionCache(max_age_seconds=60, store=DurableStore(path)).lane["state"] == "open"
+    assert first.lane == EVERYONE
+    assert DecisionCache(max_age_seconds=60, store=DurableStore(path)).lane == EVERYONE
+    platform.lane = dict(OPEN)
+    sync_rules(platform, first)
+    assert first.lane["state"] == "open", "the platform reopens it as before"
 
 
 # ---------------------------------------------------------------------------
@@ -556,17 +568,26 @@ def test_pass_holders_only_lets_in_a_car_a_register_covers_today():
     assert controller.vend.vend_count == 1
 
 
-def test_pass_holders_only_sends_every_other_car_to_the_fallback_path():
+def test_pass_holders_only_keeps_the_gate_shut_for_every_other_car():
+    """The owner's rule (2026-10-26): a monthly/pass-only garage opens for the
+    cars its registers cover today and for no other -- the gate stays shut,
+    the car is DENIED, and nobody is handed the case as if the lane could not
+    decide. A person's word is still the way past it (`human_open_now`)."""
     controller = pass_only_lane([SEEN])
     decision = controller.run_once()
-    assert decision.outcome is Outcome.FALLBACK
-    assert decision.fallback is Fallback.UNKNOWN_VEHICLE
+    assert decision.outcome is Outcome.DENY
+    assert decision.reason == REASON_NOT_REGISTERED
     assert controller.vend.vend_count == 0
-    assert details(controller, "fallback_needs_human")[0]["fallback"] == "unknown_vehicle"
+    assert details(controller, "fallback_needs_human") == [], "not handed to a person"
     # and a holder whose registration has ended is every other car
     ended = closed_lane(OPEN, [HOLDER_SEEN], register=gp_register(gp_row(HOLDER, end="2026-06-01")))
     ended.cache.transient_available = False
-    assert ended.run_once().fallback is Fallback.UNKNOWN_VEHICLE
+    assert ended.run_once().outcome is Outcome.DENY
+    assert ended.vend.vend_count == 0
+    # and so is a car nobody could read: it cannot be matched to a register
+    unclear = pass_only_lane([UNCLEAR])
+    assert unclear.run_once().outcome is Outcome.DENY
+    assert unclear.vend.vend_count == 0
 
 
 def test_the_control_a_garage_that_takes_any_driver_lets_the_same_car_in():
@@ -576,26 +597,23 @@ def test_the_control_a_garage_that_takes_any_driver_lets_the_same_car_in():
         assert controller.vend.vend_count == 1
 
 
-def test_pass_holders_only_changes_nothing_where_the_default_is_not_allow():
-    # The README and the change's own description say "pass holders only" for
-    # a garage whose default is allow. Where the default is deny, the entry
-    # still refuses every car without a rule -- a covered holder included --
-    # and where there is none it still sends that car to the fallback path.
-    for default, outcome, fallback in (
-        ("deny", Outcome.DENY, None),
-        (None, Outcome.FALLBACK, Fallback.UNKNOWN_VEHICLE),
-    ):
-        for seen in (HOLDER_SEEN, SEEN):
-            told = closed_lane(OPEN, [seen], register=a_register(), default_action=default)
-            told.cache.transient_available = False
-            decision = told.run_once()
-            assert (decision.outcome, decision.fallback) == (outcome, fallback), (
-                default, seen.plate)
-            assert told.vend.vend_count == 0, (default, seen.plate)
-            # the control: the same garage, with the flag unsaid, decides the same
-            unsaid = closed_lane(OPEN, [seen], register=a_register(), default_action=default)
-            before = unsaid.run_once()
-            assert (before.outcome, before.fallback) == (decision.outcome, decision.fallback)
+def test_pass_holders_only_is_the_same_rule_whatever_the_default():
+    """The quirk is gone: "pass holders only" used to be read only where the
+    garage's default was `allow`, so the same garage with a default of `deny`
+    refused its own monthlies at the entry, and with none sent every car to a
+    person. `transient_available: false` is the owner's word on who comes in,
+    and it is one rule at every default."""
+    for default in ("allow", "deny", None):
+        holder = closed_lane(OPEN, [HOLDER_SEEN], register=a_register(), default_action=default)
+        holder.cache.transient_available = False
+        assert holder.run_once().outcome is Outcome.ALLOW, default
+        assert holder.vend.vend_count == 1, default
+        stranger = closed_lane(OPEN, [SEEN], register=a_register(), default_action=default)
+        stranger.cache.transient_available = False
+        decision = stranger.run_once()
+        assert (decision.outcome, decision.reason) == (Outcome.DENY, REASON_NOT_REGISTERED), (
+            default)
+        assert stranger.vend.vend_count == 0, default
 
 
 def test_pass_holders_only_still_lets_every_car_out_at_the_exit():

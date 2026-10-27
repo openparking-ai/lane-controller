@@ -2,19 +2,119 @@
 
 The lane never waits on the network to make a decision, so reporting is a queue
 that drains when it can and holds when it cannot.
+
+AND IT NEVER WAITS ON A DISK EITHER. With an outbox file, every stay open and
+close, and every picture kept with an entry, is written to disk -- by a thread
+of its own (`DiskWriter`), never by the thread that records it. That thread is
+the lane's: the open of one car is recorded after its crossing, and the next
+car is decided on the same thread, so a write there was the next car waiting
+on the disk -- up to SQLite's five-second lock timeout on a busy file, and for
+as long as the disk hung on a failing one. What the lane thread does now is
+append to memory and hand the write over; what the outbox delivers is read
+from memory, so a hung disk costs the restart copy, never the delivery.
 """
 
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
 log = logging.getLogger(__name__)
+
+#: How long a DRAIN waits for the disk thread to catch up before it sends the
+#: pictures (which it sends from the disk) and before `serve` makes its last
+#: send. Never waited on the lane thread: a drain runs on its own thread under
+#: `LaneRunner`, and inline only on a bare controller (the tests, the demo).
+DISK_WAIT_S = 5.0
+
+#: How many pictures one flush reads from the disk at a time. A picture is up
+#: to a few megabytes, and an outage's worth of them must never be read into
+#: memory at once.
+PICTURE_BATCH = 8
+
+
+class DiskWriter:
+    """One thread that does the outbox file's writes, in the order handed in.
+
+    `submit` appends a job and returns at once -- it waits on nothing a disk
+    can hold -- and the thread runs each job in turn, so an open's write always
+    lands before the removal of the same open once it is delivered. A job that
+    raises is logged and the next one runs: a disk that fails costs the restart
+    copy of one item, never the thread. `wait_idle` is how a drain, or `serve`
+    on its way out, waits until everything handed in has been tried.
+
+    THE WINDOW THIS LEAVES, STATED: an item is on disk once this thread has
+    written it -- milliseconds after it was recorded on a healthy disk -- and a
+    process killed inside those milliseconds loses it. It is the same class of
+    window as the one between the vend and the record of the stay, which the
+    lane already states (docs/CONTRACT.md, "What is NOT here"), and it is what
+    keeping the disk off the barrier's thread costs.
+    """
+
+    def __init__(self, name: str = "lane-outbox-disk") -> None:
+        self._jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self._idle = threading.Condition()
+        self._pending = 0
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def submit(self, job: Callable[[], None]) -> None:
+        with self._idle:
+            self._pending += 1
+        self._jobs.put(job)
+
+    def _run(self) -> None:
+        while True:
+            job = self._jobs.get()
+            try:
+                job()
+            except Exception:  # noqa: BLE001 -- one failed write never stops the next
+                log.exception("the outbox file could not be written; the item stays in memory")
+            finally:
+                with self._idle:
+                    self._pending -= 1
+                    if self._pending == 0:
+                        self._idle.notify_all()
+
+    @property
+    def pending(self) -> int:
+        with self._idle:
+            return self._pending
+
+    def wait_idle(self, timeout: float) -> bool:
+        """Wait, at most `timeout`, until every job handed in has been run."""
+        with self._idle:
+            return self._idle.wait_for(lambda: self._pending == 0, timeout)
+
+    def call(self, fn: Callable[[], Any], timeout: float) -> tuple[bool, Any]:
+        """Run `fn` on this thread, after everything handed in before it, and
+        wait at most `timeout` for its answer: `(True, result)`, or `(False,
+        None)` when the disk did not answer in time and the caller goes on
+        without it. What `fn` raises is raised here."""
+        answered = threading.Event()
+        box: dict[str, Any] = {}
+
+        def job() -> None:
+            try:
+                box["result"] = fn()
+            except Exception as err:  # noqa: BLE001 -- handed back to the caller
+                box["error"] = err
+            finally:
+                answered.set()
+
+        self.submit(job)
+        if not answered.wait(timeout):
+            return False, None
+        if "error" in box:
+            raise box["error"]
+        return True, box.get("result")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,11 +135,11 @@ class LaneEvent:
 
 @dataclass(frozen=True)
 class Picture:
-    """A picture kept with an entry record (U7f): taken between the vend and the
-    closing loop, or at the closing loop, and kept against the lane's event id
-    of the entry record it belongs to -- a stay's open, a tailgater nobody
-    identified, a banned car refused. The platform keeps it one week after the
-    car left.
+    """A picture kept with an entry record (U7f): the arming read's frames,
+    taken between the vend and the closing loop, or at the closing loop, and
+    kept against the lane's event id of the entry record it belongs to -- a
+    stay's open, a crossing the camera said no car made, a banned car refused.
+    The platform keeps it one week after the car left.
 
     NEVER a log event and never on the read window: a picture of a car shows
     its plate, and `GET /v1/lane/events` publishes no identity. It goes to the
@@ -106,9 +206,15 @@ class EventQueue:
         store=None,
     ) -> None:
         self._log: deque[LaneEvent] = deque(maxlen=max_events)
-        # The pictures kept with an entry (U7f), bounded like the log: a lane
-        # offline for a day keeps the newest, and a drop is counted.
+        # The pictures kept with an entry (U7f). WITHOUT a store: in memory,
+        # bounded like the log -- a lane offline for a day keeps the newest,
+        # and a drop is counted. WITH one: on disk beside the stays they belong
+        # to, not bounded and not dropped, and in memory only until the disk
+        # thread has written them (`_unwritten`); a picture whose write failed
+        # waits there, bounded the same way, and is sent from there.
         self._pictures: deque[Picture] = deque(maxlen=max_pictures)
+        self._max_pictures = max_pictures
+        self._unwritten: dict[str, Picture] = {}
         self.pictures_dropped = 0
         self._sessions: deque[LaneEvent] = deque()
         self._transport = transport
@@ -121,7 +227,11 @@ class EventQueue:
         # cars it opened left free (their close found no stay) and the stays
         # it closed stayed open for ever. What the store held when the process
         # stopped is queued again here, in the order it happened.
+        #
+        # WRITTEN BY `_disk`, NEVER BY THE THREAD THAT RECORDS. See the module
+        # docstring: the recording thread is the lane's.
         self._store = store
+        self._disk = DiskWriter() if store is not None else None
         if store is not None:
             self._sessions.extend(store.held())
         # TWO THREADS MEET HERE. The lane thread records; the outbox drains on
@@ -232,20 +342,28 @@ class EventQueue:
             queue.clear()
             queue.extend(kept)
         if self._store is not None and queue is self._sessions:
-            try:
-                self._store.remove([event.event_id for event in part])
-            except Exception:  # noqa: BLE001 -- a disk that fails never costs the record
-                # Left on disk, it is sent again after a restart, and the
-                # platform deduplicates on its event id.
-                log.exception(
-                    "a delivered session action could not be removed from the outbox file"
-                )
+            ids = [event.event_id for event in part]
+            # On the disk thread, after the write of the same action: one queue,
+            # in order, so a removal can never land before the add it undoes.
+            self._disk.submit(lambda: self._store_remove(ids))
+
+    def _store_remove(self, ids: list[str]) -> None:
+        try:
+            self._store.remove(ids)
+        except Exception:  # noqa: BLE001 -- a disk that fails never costs the record
+            # Left on disk, it is sent again after a restart, and the
+            # platform deduplicates on its event id.
+            log.exception("a delivered session action could not be removed from the outbox file")
 
     def _keep(self, event: LaneEvent) -> None:
-        """Write a session action to the store, when there is one. A write that
-        fails is logged and the action stays queued in memory, as it always was."""
+        """Hand a session action to the disk thread, when there is a store, and
+        return at once: the caller is the lane thread. A write that fails is
+        logged and the action stays queued in memory, as it always was."""
         if self._store is None:
             return
+        self._disk.submit(lambda: self._store_add(event))
+
+    def _store_add(self, event: LaneEvent) -> None:
         try:
             self._store.add(event)
         except Exception:  # noqa: BLE001 -- a disk that fails never costs the record
@@ -254,52 +372,176 @@ class EventQueue:
                 event.kind,
             )
 
+    def wait_written(self, timeout: float = DISK_WAIT_S) -> bool:
+        """Wait, at most `timeout`, for the disk thread to write what it was
+        handed. True at once with no store. For a drain and for `serve` on its
+        way out -- never for the lane thread."""
+        return self._disk is None or self._disk.wait_idle(timeout)
+
     def queue_pictures(self, event_id: str, frames) -> int:
         """Keep these frames as pictures of the entry record `event_id`.
 
         Only frames that hold a picture are kept; the platform takes a JPEG or
         a PNG and nothing else. Returns how many were queued.
+
+        With a store, each is held in memory until the disk thread has written
+        it, and handed to that thread -- and this returns at once, whatever
+        the disk is doing.
         """
         pictures = [
             Picture(event_id=event_id, taken_at=frame.captured_at, image_bytes=frame.image_bytes)
             for frame in frames
             if frame.image_bytes
         ]
+        if self._store is None:
+            with self._state:
+                for picture in pictures:
+                    full = self._pictures.maxlen is not None
+                    if full and len(self._pictures) == self._pictures.maxlen:
+                        self.pictures_dropped += 1
+                    self._pictures.append(picture)
+            return len(pictures)
         with self._state:
             for picture in pictures:
-                full = self._pictures.maxlen is not None
-                if full and len(self._pictures) == self._pictures.maxlen:
-                    self.pictures_dropped += 1
-                self._pictures.append(picture)
+                self._hold_unwritten(picture)
+        for picture in pictures:
+            # The job carries the REF, not the picture: what memory holds for a
+            # disk that is behind is `_unwritten`, and that is bounded.
+            self._disk.submit(lambda ref=picture.picture_ref: self._write_picture(ref))
         return len(pictures)
+
+    def _hold_unwritten(self, picture: Picture) -> None:
+        """Into memory until the disk has it -- bounded at `max_pictures`, so a
+        disk that has stopped taking writes cannot take the lane's memory with
+        it: past that, the oldest picture not on disk is dropped and counted.
+        A disk that keeps up never comes near it: a car's pictures are written
+        before the next car's are taken. Under `_state`."""
+        while len(self._unwritten) >= self._max_pictures:
+            self._unwritten.pop(next(iter(self._unwritten)))
+            self.pictures_dropped += 1
+        self._unwritten[picture.picture_ref] = picture
+
+    def _write_picture(self, ref: str) -> None:
+        """On the disk thread. Written, the picture leaves memory; not written,
+        it stays there and the drain sends it from there. A picture already
+        sent from memory, or dropped for room, is not written."""
+        with self._state:
+            picture = self._unwritten.get(ref)
+        if picture is None:
+            return
+        try:
+            self._store.add_picture(picture)
+        except Exception:  # noqa: BLE001 -- a disk that fails never costs the picture
+            log.exception("a picture could not be kept in the outbox file; it waits in memory")
+            return
+        with self._state:
+            self._unwritten.pop(ref, None)
+
+    def _remove_pictures(self, refs: list[str]) -> None:
+        """On the disk thread: pictures the platform has taken or refused."""
+        try:
+            self._store.remove_pictures(refs)
+        except Exception:  # noqa: BLE001 -- left on disk, it is sent again, idempotently
+            log.exception("a delivered picture could not be removed from the outbox file")
 
     @property
     def pending_pictures(self) -> int:
+        """Every picture not yet sent: in memory and -- with a store -- on
+        disk, read on the disk thread, waiting at most `DISK_WAIT_S`. For a
+        drain, a test or an operator, never for the lane thread."""
         with self._state:
-            return len(self._pictures)
+            in_memory = len(self._pictures) + len(self._unwritten)
+        if self._store is None:
+            return in_memory
+        answered, on_disk = self._disk.call(self._store.picture_count, DISK_WAIT_S)
+        return in_memory + (on_disk if answered else 0)
 
     def flush_pictures(self) -> int:
-        """Send the queued pictures, all or nothing, as `flush` sends events.
+        """Send the kept pictures, ONE AT A TIME, oldest first. Returns how
+        many left: taken by the platform, or refused by it (counted and logged
+        by the transport, and not sent again).
 
-        A transport that cannot carry pictures (a lane with no platform, or one
-        written before them) keeps none: there is nowhere for them to go.
+        A PICTURE LEAVES AS SOON AS IT IS DONE, and the first one the platform
+        cannot be reached for stops the flush -- it and everything after it wait
+        for the next try. It used to be all or nothing: every picture in one
+        go, kept whole on the first failure, so on a poor link a backlog never
+        emptied and pictures already taken were sent again on every try.
+
+        With a store the pictures are read from the disk a few at a time, and
+        removed from it as each is done -- both ON THE DISK THREAD, after
+        everything handed to it before, and waited for at most `DISK_WAIT_S`:
+        a disk that does not answer costs this flush its disk part, never the
+        drain thread, which the stays' delivery runs on too. Then the pictures
+        not on disk -- the disk could not take them, or has not yet -- go from
+        memory. A transport that cannot carry pictures (a lane with no
+        platform, or one written before them) keeps none: there is nowhere for
+        them to go.
         """
         with self._flushing:
-            with self._state:
-                batch = list(self._pictures)
             send = getattr(self._transport, "send_pictures", None)
             if send is None:
                 with self._state:
                     self._pictures.clear()
+                    self._unwritten.clear()
                 return 0
-            if not batch or not send(batch):
-                return 0
-            delivered = {id(p) for p in batch}
+            if self._store is None:
+                return self._flush_memory_pictures(send)
+            sent, stopped = self._flush_disk_pictures(send)
+            if stopped:
+                return sent
             with self._state:
-                kept = [p for p in self._pictures if id(p) not in delivered]
+                waiting = list(self._unwritten.values())
+            for picture in waiting:
+                if not send([picture]):
+                    return sent
+                with self._state:
+                    self._unwritten.pop(picture.picture_ref, None)
+                sent += 1
+            return sent
+
+    def _flush_disk_pictures(self, send) -> tuple[int, bool]:
+        """The pictures on disk, oldest first, a batch at a time, each removed
+        once done. Returns (how many left, whether the platform stopped it)."""
+        sent = 0
+        done: set[str] = set()
+        while True:
+            try:
+                answered, held = self._disk.call(
+                    lambda: self._store.held_pictures(PICTURE_BATCH), DISK_WAIT_S
+                )
+            except Exception:  # noqa: BLE001 -- a disk that fails never costs the drain
+                log.exception("the pictures in the outbox file could not be read")
+                return sent, False
+            if not answered:
+                log.warning(
+                    "the outbox file did not answer in %.1fs; its pictures wait", DISK_WAIT_S
+                )
+                return sent, False
+            batch = [p for p in held if p.picture_ref not in done]
+            if not batch:
+                return sent, False
+            for picture in batch:
+                if not send([picture]):
+                    return sent, True
+                done.add(picture.picture_ref)
+                # Removed on the disk thread, ahead of the next read there.
+                self._disk.submit(lambda ref=picture.picture_ref: self._remove_pictures([ref]))
+                sent += 1
+
+    def _flush_memory_pictures(self, send) -> int:
+        """The memory-only lane's pictures, one at a time, as above."""
+        with self._state:
+            batch = list(self._pictures)
+        sent = 0
+        for picture in batch:
+            if not send([picture]):
+                break
+            with self._state:
+                kept = [p for p in self._pictures if p is not picture]
                 self._pictures.clear()
                 self._pictures.extend(kept)
-            return len(batch)
+            sent += 1
+        return sent
 
     @property
     def pending(self) -> int:

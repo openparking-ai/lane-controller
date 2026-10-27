@@ -3,6 +3,21 @@
 A lane with no internet still has to work. Every decision below is made from
 rules already on the box; the server is how the cache gets refreshed and where
 events are reported afterwards, never something the barrier waits on.
+
+THE ENTRY, BY WHAT THE GARAGE TAKES. The owner's rule, 2026-10-26: a garage
+that takes transients opens for every car -- the pictures and what was seen
+are the record, and there is no reason not to open -- and a garage that is
+monthly and pass only opens for the cars its registers cover today and keeps
+the gate shut for every other. So at an entry lane whose garage has STATED
+which it is (`transient_available`, `garage_admits`), the decision is
+`_decide_entry`: low confidence, no plate read, an unknown vehicle, an engine
+that did not answer and rules past their age are not reasons to call a person
+any more. What still keeps the gate shut is the garage full (`closed: full`,
+which still lets in a car a register covers), the owner's closing to everyone,
+a car on the banned list (`controller._banned`), an owner's per-plate deny
+rule, and -- at a pass-only garage -- a car no register covers. Nothing
+present is still no open. A garage that has not stated it, and every exit,
+decide exactly as before.
 """
 
 from __future__ import annotations
@@ -194,6 +209,76 @@ def _register_heads(module: str, register: dict) -> dict[str, dict]:
 #: Full, in basis points: how full a garage can be, and no fuller.
 FULL_BP = 10_000
 
+#: What a garage takes at its entry, as `garage_admits` reads the cache: every
+#: car (transients), or only the cars its pass and monthly registers cover.
+ADMITS_TRANSIENTS = "transients"
+ADMITS_PASSES_ONLY = "passes_only"
+
+#: THE QR SEAM (Phase 1b). The reason a monthly/pass-only garage keeps the gate
+#: shut for a car: no register covers it today. This is the one entry decision
+#: a scanned registration QR will turn into an open -- the driver scans it at
+#: the lane's scanner, the lane presents it to the pass module's enrolment
+#: (`redeem-enrolment`: valid today, for this garage, spent once, one car), and
+#: a QR it accepts registers this car and opens. Not built: no scanner seam
+#: exists in this package yet, so today this DENY is final at the lane and a
+#: person's `human_open_now` is the one way past it (`vend.py`, as for any
+#: deny). Named here, once, so the scanner path has one place to plug in.
+REASON_NOT_REGISTERED = "pass or monthly only; no pass or monthly register covers this car"
+
+
+def garage_admits(cache: DecisionCache) -> str | None:
+    """What this garage takes at its entry, or None when it has not said.
+
+    `transient_available: false` is a monthly/pass-only garage. `true` is a
+    garage that takes transients -- unless its default for a car with no rule
+    is `deny`, which is an operator saying in so many words that strangers are
+    not let in; read as pass-only, so a covered car still opens and no other
+    car does (the stricter of the two readings, and the one that never opens a
+    gate the owner set to deny). None -- a lane that has never been told, a
+    platform older than the field -- decides exactly as before.
+    """
+    if cache.transient_available is False:
+        return ADMITS_PASSES_ONLY
+    if cache.transient_available is True:
+        return ADMITS_PASSES_ONLY if cache.default_action == "deny" else ADMITS_TRANSIENTS
+    return None
+
+
+def plate_read(identity: VehicleIdentity, confidence_threshold: float) -> str | None:
+    """The plate this lane stands behind, or None.
+
+    A plate read at the lane's confidence, from a read that happened, of a car
+    that was there. Nothing else is looked up -- not a rule, not a register --
+    and nothing else becomes a stay's plate: a read below the threshold is
+    "unreadable", a value of the car's identity, never a plate that could match
+    another car's stay or a pass by accident.
+    """
+    if (
+        identity.presence is False
+        or identity.unavailable is not None
+        or identity.confidence < confidence_threshold
+        or not identity.plate
+    ):
+        return None
+    return identity.plate
+
+
+def _seen(identity: VehicleIdentity, confidence_threshold: float, *, stale: bool) -> str:
+    """What was seen of an admitted car, in words, for the decision's reason.
+    Never the plate: the reason goes into `events.detail`, which no purge reaches."""
+    if identity.unavailable is not None:
+        seen = f"plate unreadable: no read was obtained ({identity.unavailable})"
+    elif not identity.plate:
+        seen = "plate unreadable: no plate was read"
+    elif identity.confidence < confidence_threshold:
+        seen = (
+            f"plate unreadable: confidence {identity.confidence:.2f} below threshold "
+            f"{confidence_threshold:.2f}"
+        )
+    else:
+        seen = "plate read"
+    return f"{seen}; cached rules are stale" if stale else seen
+
 
 def spaces_from_payload(raw) -> int | None:
     """The garage's number of spaces as the payload (or the disk) holds it:
@@ -377,17 +462,33 @@ class DecisionCache:
         if self._store is not None:
             self._store.write(self.state())
 
+    def _take_settings(self, state: dict) -> None:
+        """The garage's entry settings from a stored state, each through the
+        validator its payload field goes through. See `clear`."""
+        if state.get("default_action") in ("allow", "deny"):
+            self.default_action = state["default_action"]
+        self.transient_available = transient_from_payload(state.get("transient_available"))
+        self.lane = lane_from_payload(state.get("lane")) or dict(OPEN_LANE)
+
     def _restore(self, *, now: float | None = None) -> bool:
         """What the store holds, into memory -- unless it is past the bound,
-        in which case it is wiped rather than loaded. True if restored."""
+        in which case it is wiped rather than loaded. True if restored.
+
+        The garage's entry settings are taken first and whatever the age
+        (`clear` says why): they are not personal data, and a lane restarted
+        two days into an outage still knows whether its garage takes
+        transients."""
         state = self._store.read()
-        if not state or state.get("refreshed_at") is None:
+        if not state:
+            return False
+        self._take_settings(state)
+        if state.get("refreshed_at") is None:
             return False
         current = time.time() if now is None else now
         if (current - float(state["refreshed_at"])) > self._max_age:
             # Personal data past its bound is not held, and not even read
             # back into memory on the way to being discarded.
-            self._store.wipe()
+            self.clear()
             return False
         self._rules = {
             r["plate"].upper(): Rule(
@@ -417,12 +518,22 @@ class DecisionCache:
         return True
 
     def clear(self) -> None:
-        """Hold nothing: memory and disk. The empty cache is the one this
-        object started as -- stale, no rules, falling back on every plate."""
+        """Hold no personal data: memory and disk. Stale, no rules, no
+        registers, no stays, no banned list -- the empty cache this object
+        started as, with one exception.
+
+        THE GARAGE'S ENTRY SETTINGS ARE KEPT: whether it takes transients
+        (`transient_available`), its default for a car with no rule, and this
+        lane's closing. None of them names a car or a person, so the bound that
+        exists for personal data does not reach them -- and the entry is
+        decided on them. Wiped with the rest, a garage that takes transients
+        would start sending every car to a person a day into an outage, which
+        is the one thing its owner said it must not do, and a lane closed
+        `full` would reopen itself. They are written back to the store alone,
+        so a restart finds them too; the platform's next answer replaces them
+        as it always did."""
         self._rules = {}
         self._refreshed_at = None
-        self.default_action = None
-        self.transient_available = None
         self.plans = []
         self.space_class = None
         self.spaces = None
@@ -436,12 +547,13 @@ class DecisionCache:
         self.stays_refreshed_at = None
         self.timezone = None
         self.currency = None
-        self.lane = dict(OPEN_LANE)
         self.board = {"prices": False, "messages": []}
         self.banned = []
         self._coverage_index = {}
         if self._store is not None:
             self._store.wipe()
+            # What is left -- the settings above and nothing else -- goes back.
+            self._persist()
 
     def expire_if_past_bound(self, *, now: float | None = None) -> bool:
         """THE RETENTION BOUND. A cache older than `max_age_seconds` -- the age
@@ -449,9 +561,15 @@ class DecisionCache:
         memory and from disk. Called on every refresh tick and at start; a
         cache that is refreshed never reaches it. True if something was wiped.
 
-        Wiping changes no decision: past the bound every plate already falls
-        back `stale_rules`, so what goes is only the personal data the box was
-        holding for no one."""
+        What goes is the personal data -- rules, registers, stays, the banned
+        list -- and the garage's entry settings stay (`clear`). At a garage
+        that has not said what it takes, past the bound every plate already
+        falls back `stale_rules`. At one that has, a garage that takes
+        transients still opens for every car; what the wipe costs is the
+        registers, so a car a register covered is no longer recognised as
+        covered -- turned away at a lane closed `full`, and at a pass-only
+        garage like any car no register covers, until the platform answers
+        again."""
         if self._refreshed_at is None:
             return False
         current = time.time() if now is None else now
@@ -676,6 +794,21 @@ def decide(
             fallback=Fallback.LANE_CLOSED,
         )
 
+    if direction != "exit":
+        admits = garage_admits(cache)
+        if admits is not None:
+            # THE OWNER'S ENTRY RULE, at a garage that has said what it takes.
+            # Every path below is the old one, kept for a garage that has not.
+            return _decide_entry(
+                identity,
+                cache,
+                admits=admits,
+                full=closed == CLOSED_FULL,
+                confidence_threshold=confidence_threshold,
+                stale=cache.is_stale(now=now),
+                day_at=day_at if day_at is not None else (time.time() if now is None else now),
+            )
+
     if identity.unavailable is not None:
         # BEFORE the confidence comparison, and that position is the whole
         # fix. Below this line `identity.confidence` is a number the engine
@@ -765,31 +898,10 @@ def decide(
                 identity=identity,
             )
         if cache.default_action == "allow":
-            if direction != "exit" and cache.transient_available is False:
-                # "PASS HOLDERS ONLY": the owner said this garage takes no other
-                # driver, so "allow" admits a car a pass or monthly register
-                # covers today -- the same lookup, on the same local day, as a
-                # lane closed `full` -- and every other car takes the fallback
-                # path it takes when a garage admits nobody it does not know.
-                from .exit_pricing import local_day, register_cover
-
-                current = day_at if day_at is not None else (time.time() if now is None else now)
-                covered_by, _ = register_cover(
-                    identity.plate, cache, local_day(current, cache.timezone)[0]
-                )
-                if covered_by:
-                    return Decision(
-                        outcome=Outcome.ALLOW,
-                        reason="pass holders only; a pass or monthly register covers this car",
-                        identity=identity,
-                    )
-                return Decision(
-                    outcome=Outcome.FALLBACK,
-                    reason="no rule for plate; pass holders only, and no pass or monthly "
-                    "register covers this car",
-                    identity=identity,
-                    fallback=Fallback.UNKNOWN_VEHICLE,
-                )
+            # "Pass holders only" is no longer decided here: a garage that has
+            # said `transient_available: false` is decided by `_decide_entry`
+            # above, whatever its default -- this branch only ever saw it where
+            # the default was `allow`, and sent the uncovered car to a person.
             return Decision(
                 outcome=Outcome.ALLOW,
                 reason="no rule for plate; garage default is allow",
@@ -821,4 +933,89 @@ def decide(
         reason="plate allowed by rule",
         identity=identity,
         rate_plan=rule.rate_plan,
+    )
+
+
+def _decide_entry(
+    identity: VehicleIdentity,
+    cache: DecisionCache,
+    *,
+    admits: str,
+    full: bool,
+    confidence_threshold: float,
+    stale: bool,
+    day_at: float,
+) -> Decision:
+    """The entry at a garage that has said what it takes. Presence and a
+    closing to everyone were decided before this, as for every lane.
+
+    WHAT THE LANE STANDS BEHIND is `plate_read`: only a plate read at the
+    lane's confidence is looked up, in the rules or the registers, so a car
+    nobody could read is never matched to someone else's pass. Reading it is
+    no longer a condition of getting in.
+
+    1. FULL (`closed: full`): a car a register covers today gets in, every other
+       car does not -- a person's word is the way past it, as on any closing.
+    2. AN OWNER'S RULE for this plate: a deny keeps the gate shut, an allow
+       opens it with its rate plan. (The platform serves none today; a lane
+       given one honours it, as it always has.)
+    3. MONTHLY / PASS ONLY: a car a register covers today opens; every other
+       car is DENIED, the gate shut -- not handed to a person
+       (`REASON_NOT_REGISTERED`, the QR seam).
+    4. TAKES TRANSIENTS: open. What was seen goes in the reason, and the stay
+       the car gets carries it (`LaneController._stay_identity`).
+    """
+    read = plate_read(identity, confidence_threshold)
+    covered = False
+    if read:
+        from .exit_pricing import local_day, register_cover
+
+        covered_by, _ = register_cover(read, cache, local_day(day_at, cache.timezone)[0])
+        covered = bool(covered_by)
+
+    if full:
+        if covered:
+            return Decision(
+                outcome=Outcome.ALLOW,
+                reason="this lane is closed full; a pass or monthly register covers this car",
+                identity=identity,
+            )
+        return Decision(
+            outcome=Outcome.FALLBACK,
+            reason="this lane is closed full; no pass or monthly register covers this car",
+            identity=identity,
+            fallback=Fallback.LANE_CLOSED,
+        )
+
+    rule = cache.lookup(read) if read else None
+    if rule is not None and not rule.allow:
+        return Decision(
+            outcome=Outcome.DENY,
+            reason="plate is denied by rule",
+            identity=identity,
+            rate_plan=rule.rate_plan,
+        )
+    if rule is not None:
+        return Decision(
+            outcome=Outcome.ALLOW,
+            reason="plate allowed by rule",
+            identity=identity,
+            rate_plan=rule.rate_plan,
+        )
+
+    if admits == ADMITS_PASSES_ONLY:
+        if covered:
+            return Decision(
+                outcome=Outcome.ALLOW,
+                reason="pass or monthly only; a pass or monthly register covers this car",
+                identity=identity,
+            )
+        # THE QR SEAM: see `REASON_NOT_REGISTERED`.
+        return Decision(outcome=Outcome.DENY, reason=REASON_NOT_REGISTERED, identity=identity)
+
+    return Decision(
+        outcome=Outcome.ALLOW,
+        reason="garage takes transients; "
+        + _seen(identity, confidence_threshold, stale=stale),
+        identity=identity,
     )
