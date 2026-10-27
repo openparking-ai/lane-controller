@@ -278,10 +278,20 @@ class PlatformClient:
         descriptor: str | None = None,
         local_decision: dict | None = None,
         reader_shown: dict | None = None,
+        exit_id: str | None = None,
     ) -> dict:
+        # A SETTLED EXIT CASE is named on the close (platform 0037): the case
+        # holds the stay it was decided on, or none, the close writes the
+        # case's own figures, and the identity beside it is not consulted. A
+        # car the lane could not read has only the case.
+        if exit_id and not plate and not ticket_ref:
+            identity = {}
+        else:
+            identity = self._identity(plate, ticket_ref)
         body = {
             "event_id": event_id,
-            **self._identity(plate, ticket_ref),
+            **({"exit_id": exit_id} if exit_id else {}),
+            **identity,
             "exit_at": exit_at,
             "exit_confirmation": exit_confirmation,
         }
@@ -323,6 +333,60 @@ class PlatformClient:
             {"phone": phone, "local_decision": local_decision},
         )
         return answer.get("validation") if isinstance(answer, dict) else None
+
+    # -- the exit case (platform 0037, 0038) -----------------------------------
+    #
+    # A car at this exit the lane could not let out on its own copy. Each call
+    # answers the case as `{exit: {...}}`; these return the case. ON THE
+    # BARRIER'S PATH, and the one place an exit waits on the network: the
+    # barrier stays down until the case is settled, so there is nothing faster
+    # to fall back to -- an unreachable platform is a person's decision.
+
+    def open_exit(
+        self,
+        *,
+        event_id: str,
+        exit_at: str,
+        session_id: str | None = None,
+        id_fields: dict | None = None,
+    ) -> dict:
+        """The case for this car, opened or, for the same `event_id`, found."""
+        body = {"event_id": event_id, "exit_at": exit_at, **(id_fields or {})}
+        if session_id:
+            body["session_id"] = session_id
+        return self._exit(self._request("POST", "/api/v1/lane/exits", body))
+
+    def get_exit(self, exit_id: str) -> dict:
+        """The case as it stands: settled, or what it needs."""
+        return self._exit(self._request("GET", self._exit_path(exit_id)))
+
+    def exit_word(self, exit_id: str, entry_at: str) -> dict:
+        """The driver's stated entry time, priced by the platform, once."""
+        return self._exit(
+            self._request("POST", f"{self._exit_path(exit_id)}/word", {"entry_at": entry_at})
+        )
+
+    def exit_pay(self, exit_id: str) -> tuple[dict, object]:
+        """The case's fee handed to the reader bound to this lane: the case and
+        `sent` (`True`, `False` or `"unknown"`)."""
+        answer = self._request("POST", f"{self._exit_path(exit_id)}/pay", {})
+        return self._exit(answer), answer.get("sent") if isinstance(answer, dict) else None
+
+    def exit_receipt(self, exit_id: str, phone: str) -> None:
+        """A text receipt for a paid case. The number goes in this request
+        body and nowhere else; nothing here keeps or logs it."""
+        self._request("POST", f"{self._exit_path(exit_id)}/receipt", {"phone": phone})
+
+    @staticmethod
+    def _exit_path(exit_id: str) -> str:
+        return f"/api/v1/lane/exits/{urllib.parse.quote(exit_id, safe='')}"
+
+    @staticmethod
+    def _exit(answer) -> dict:
+        case = answer.get("exit") if isinstance(answer, dict) else None
+        if not isinstance(case, dict) or not case.get("id"):
+            raise PlatformRejected(None, "the platform answered no exit case")
+        return case
 
 
 def _refusal_code(body: str) -> str | None:

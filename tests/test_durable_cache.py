@@ -121,9 +121,11 @@ def test_the_whole_cache_survives_a_restart_with_the_platform_unreachable(cache_
     assert platform.stays_reads[-1] == "2" and list(second.stays) == ["s-2"]
 
 
-def test_a_car_with_a_rule_still_exits_after_the_restart(cache_dir):
+def test_a_car_with_a_rule_still_gets_in_after_the_restart(cache_dir):
     """End to end through the lane: a plate rule written by the platform,
-    the platform gone, the process restarted, the barrier vends. The stub
+    the platform gone, the process restarted, the barrier vends. An entry
+    lane: an exit opens only for a settled car, and a car a plate rule allows
+    is not settled by the rule alone (`exit_case`). The stub
     identifier stands in for Vehicle ID here -- the socket-counter control
     with the real one on loopback belongs to the exit-decision round."""
     from conftest import build_lane
@@ -140,7 +142,7 @@ def test_a_car_with_a_rule_still_exits_after_the_restart(cache_dir):
         cache = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
         identity = VehicleIdentity(plate="MEMBER-1", plate_region="FL", make=None, model=None,
                                    color=None, confidence=0.99)
-        return build_lane(a_config(direction="exit"), cache, [identity], arrivals=1)
+        return build_lane(a_config(direction="entry"), cache, [identity], arrivals=1)
 
     controller, vend = restarted_lane()
     decision = controller.run_once()

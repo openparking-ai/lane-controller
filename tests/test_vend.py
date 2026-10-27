@@ -74,6 +74,7 @@ def a_lane(
     events=None,
     clock=None,
     window=10.0,
+    exits=None,
     **config_kwargs,
 ):
     """The standard installation, wired to the simulated seams."""
@@ -105,6 +106,7 @@ def a_lane(
         closing_loops=ScriptedClosingLoops(crossings or []),
         cache=cache,
         events=events or EventQueue(),
+        exits=exits,
         **({"clock": clock} if clock is not None else {}),
     )
 

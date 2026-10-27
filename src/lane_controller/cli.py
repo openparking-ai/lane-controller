@@ -264,6 +264,16 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
     seams["barrier"] = (
         "SIMULATED (this package ships no relay driver: nothing here vends a barrier)"
     )
+    if config.direction == "exit":
+        seams["exit_case"] = (
+            "the platform: a car not covered or free here waits for its case to be settled"
+            if platform is not None
+            else "NONE (no platform): a car not covered or free here waits for a person"
+        )
+        seams["exit_display"] = (
+            "NONE (this package ships no display driver): no driver's word; such a car "
+            "waits for a person"
+        )
     controller = LaneController(
         config,
         loop=SimulatedLoopInput(arrivals=0),
@@ -276,6 +286,7 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
         cache=cache,
         events=events,
         banned_matcher=banned_matcher,
+        exits=platform,
     )
     return WiredLane(controller, platform, seams)
 

@@ -516,7 +516,10 @@ class PlatformTransport(EventTransport):
         """
         declared = event.detail["exit_confirmation"]
         descriptor = event.detail.get("descriptor")
-        session_id = event.detail.get("session_id") or self._open_session_id(event)
+        exit_id = event.detail.get("exit_id")
+        session_id = event.detail.get("session_id") or (
+            None if exit_id else self._open_session_id(event)
+        )
         result = self._client.close_session(
             event_id=event.event_id,
             plate=event.detail.get("plate"),
@@ -536,7 +539,20 @@ class PlatformTransport(EventTransport):
             # What the reader showed, when a screen said (A2.2); absent, the
             # close is the one this lane sent before it existed.
             **_reader_shown(event),
+            # The settled exit case this car left on (platform 0037), named
+            # instead of the car.
+            exit_id=exit_id,
         )
+        if exit_id and (result or {}).get("session") is None:
+            # A CASE WITH NO STAY -- the driver's word, or a person who let a
+            # car out that no stay was found for -- is closed on the case
+            # itself, and that is the whole echo there is.
+            case = (result or {}).get("exit") or {}
+            if case.get("id") != exit_id or case.get("closed") is not True:
+                raise PlatformRejected(
+                    None, "the close named an exit case and the platform did not close it"
+                )
+            return result
         require_confirmation_echo(result, declared, end="exit", action="close")
         require_descriptor_echo(result, descriptor, end="exit", action="close")
         return result

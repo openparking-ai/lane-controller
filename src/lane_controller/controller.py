@@ -55,9 +55,11 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
+from . import exit_case
 from .config import LaneConfig
 from .contract import TransitState
 from .decision import (
@@ -71,12 +73,13 @@ from .decision import (
     plate_read,
 )
 from .events import EventQueue, LaneEvent
-from .exit_pricing import price_exit
+from .exit_pricing import COVERED, PRICED, price_exit
 from .interfaces import (
     BannedMatcher,
     CameraFeed,
     ClosingLoops,
     ClosingSequence,
+    ExitDisplay,
     LoopInput,
     VehicleIdentifier,
     VehicleIdentity,
@@ -215,8 +218,21 @@ class LaneController:
         clock: Callable[[], float] = time.time,
         reader: ReaderScreen | None = None,
         banned_matcher: BannedMatcher | None = None,
+        exits=None,
+        exit_display: ExitDisplay | None = None,
     ) -> None:
         self.config = config
+        # THE EXIT CASE (platform 0037, 0038): who is asked about a car at
+        # this exit the lane could not settle on its own copy -- the platform
+        # client -- and the driver's screen for it. No `exits`: such a car
+        # waits for a person, and the gate stays down (`exit_case`).
+        self.exits = exits
+        self.exit_display = exit_display
+        #: The one car at this exit whose case is not settled, or None.
+        self._exit_case: exit_case.ExitCase | None = None
+        #: Who takes the case to open the barrier: the lane's turn when the
+        #: case settles, or a person's vend at the lane. Exactly one does.
+        self._exit_lock = threading.Lock()
         # The banned-car comparison (U7f). None: this lane refuses no car as
         # banned, whatever list it holds.
         self.banned_matcher = banned_matcher
@@ -526,6 +542,9 @@ class LaneController:
     def handle_arrival(self) -> Decision:
         """One vehicle, from arming to vend. Assumes the loop has already armed."""
         lane = self.config.lane_id
+        # A loop reports one arrival per vehicle: a new one is a new car, and
+        # the one before it left with its case unsettled.
+        self._leave_exit_case("a new car arrived before the exit was settled")
 
         frames = self.camera.grab(self.config.camera.frames_per_read)
         self.events.record("frames_captured", lane, count=len(frames), camera=self.camera.camera_id)
@@ -586,6 +605,13 @@ class LaneController:
             decision = replace(
                 decision, exit_pricing=price_exit(identity.plate, self.cache, now=self.now())
             )
+        case = None
+        if self.config.direction == "exit":
+            # THE GATE OPENS ONLY WHEN SETTLED: covered or a fee of zero, here
+            # and now; every other car at an exit is a case (`exit_case`),
+            # opened before the decision is recorded so the decision says
+            # whether the barrier moved on it.
+            decision, case = self._exit_settlement(decision, identity, frames)
         decided = self.events.record(
             "decision",
             lane,
@@ -598,6 +624,8 @@ class LaneController:
                 if decision.exit_pricing is not None
                 else {}
             ),
+            # The platform's case for a car this exit could not settle alone.
+            **({"exit_id": case.exit_id} if case is not None and case.exit_id else {}),
             # A CAR LET IN WITH NO READ AT ALL -- the engine not reached, no
             # frames -- says which failure, as `fallback_needs_human` does for
             # one that was not let in: somebody has to go and fix it, and the
@@ -641,7 +669,16 @@ class LaneController:
                 decision.exit_pricing.to_detail() if decision.exit_pricing is not None else None
             )
 
+        if case is not None and not decision.should_vend:
+            # WAITING: the barrier stays down, and the case is moved on at the
+            # lane's idle turns while the car is on the arming loop.
+            self._tell_exit_case(case)
+            self.deliver()
+            return decision
+
         if decision.should_vend:
+            if case is not None and self.exits is not None:
+                exit_case.send_receipt(case, self.exits, self.exit_display)
             self.vend.vend(decision.reason)
             self.events.record("vended", lane, reason=decision.reason)
 
@@ -660,7 +697,9 @@ class LaneController:
             # two differed by the relay's time, and the platform's reconciler,
             # which compares them to the millisecond, flagged nearly every
             # lane-priced close `inputs_disagree` with the fee right.
-            exit_at = getattr(decision.exit_pricing, "exit_at", None)
+            exit_at = case.exit_at if case is not None else getattr(
+                decision.exit_pricing, "exit_at", None
+            )
             at = exit_at if exit_at else to_iso(self._clock())
             # The arming read's frames ride with the transit, to be kept with
             # the stay it opens -- and with nothing if it opens none.
@@ -669,6 +708,7 @@ class LaneController:
                 at,
                 exit_pricing=decision.exit_pricing,
                 arming=frames if self.config.direction == "entry" else (),
+                exit_id=case.exit_id if case is not None else None,
             )
 
         elif decision.outcome is Outcome.NO_VEHICLE:
@@ -765,6 +805,10 @@ class LaneController:
         whatever time anything else eventually hears about it.
         """
         lane = self.config.lane_id
+        # A PERSON AT THE LANE DECIDED: a car whose exit case was waiting is
+        # theirs now, and the lane's turn will not open for it as well.
+        with self._exit_lock:
+            self._exit_case = None
         # FIRST, and before anything moves. Held on the controller as well as
         # recorded, because the record is what an operator reads and this is
         # what the session action is built from.
@@ -799,6 +843,173 @@ class LaneController:
         # `tests/test_vend.py` and stated in `docs/CONTRACT.md`.
         self.deliver()
         return at
+
+    # ------------------------------------------------------------------
+    # The exit case: a car this lane could not settle on its own copy.
+    # ------------------------------------------------------------------
+
+    #: The fallbacks at an exit that are a case: a car is there and the lane
+    #: could not settle it from what it holds. A lane closed, a banned car, a
+    #: plate an owner's rule denies and nothing there are not.
+    _CASE_FALLBACKS = frozenset({
+        Fallback.LOW_CONFIDENCE,
+        Fallback.NO_PLATE_READ,
+        Fallback.UNKNOWN_VEHICLE,
+        Fallback.STALE_RULES,
+        Fallback.ENGINE_UNREACHABLE,
+    })
+
+    def _exit_settlement(
+        self, decision: Decision, identity, frames
+    ) -> tuple[Decision, exit_case.ExitCase | None]:
+        """The exit's decision, and its case when it has one.
+
+        Settled here: covered, or priced at a fee of zero -- the barrier opens
+        now, as before, and there is no case. Every other car that would have
+        opened, and every car this lane could not read or price, is a case,
+        opened now: settled on its first answer, the barrier opens on it;
+        otherwise the decision is `exit_not_settled` and the barrier stays
+        down until the case is settled.
+        """
+        if decision.should_vend:
+            pricing = decision.exit_pricing
+            if pricing is not None and (
+                pricing.status == COVERED or (pricing.status == PRICED and pricing.fee_minor == 0)
+            ):
+                return decision, None
+            why = pricing.status if pricing is not None else "no plate to price"
+        elif decision.outcome is Outcome.FALLBACK and decision.fallback in self._CASE_FALLBACKS:
+            why = decision.reason
+        else:
+            return decision, None
+        pricing = decision.exit_pricing
+        confident = (
+            identity.unavailable is None
+            and identity.confidence >= self.config.confidence_threshold
+        )
+        case = exit_case.ExitCase(
+            event_id=str(uuid.uuid4()),
+            exit_at=getattr(pricing, "exit_at", None) or to_iso(self._clock()),
+            identity=identity,
+            pricing=pricing,
+            fields=exit_case.id_fields(identity, plate_confident=confident),
+            session_id=exit_case.named_stay(pricing),
+        )
+        # THE PICTURES THE PICKER IS SHOWN of this car at this exit, kept
+        # under the case's own event and sent before the case is opened.
+        self.events.queue_pictures(case.event_id, frames)
+        self.deliver()
+        if self._step(case) == exit_case.SETTLED:
+            if not decision.should_vend:
+                decision = replace(
+                    decision,
+                    outcome=Outcome.ALLOW,
+                    reason=f"the exit is settled: {case.why}",
+                    fallback=None,
+                )
+            return decision, case
+        with self._exit_lock:
+            self._exit_case = case
+        return replace(
+            decision,
+            outcome=Outcome.FALLBACK,
+            reason=f"the exit is not settled: {why}",
+            fallback=Fallback.EXIT_NOT_SETTLED,
+        ), case
+
+    def _step(self, case: exit_case.ExitCase) -> str:
+        """One step of a case: `exit_case.advance`, or UNANSWERED with no platform."""
+        if self.exits is None:
+            case.outcome = exit_case.UNANSWERED
+            if self.exit_display is not None:
+                self.exit_display.show_exit({"needs": exit_case.NEEDS_PERSON, "fee": None})
+        else:
+            case.outcome = exit_case.advance(
+                case, self.exits, self.exit_display, now=self._clock()
+            )
+        return case.outcome
+
+    def _advance_exit_case(self, case: exit_case.ExitCase) -> None:
+        """One step of the waiting case; the barrier opens when it is settled."""
+        if self._step(case) == exit_case.SETTLED:
+            self._let_out(case)
+            return
+        self._tell_exit_case(case)
+
+    def _tell_exit_case(self, case: exit_case.ExitCase) -> None:
+        """A case that needs a person -- or that cannot be asked, or that the
+        platform refused -- says so, once for each. Paying and the driver's
+        word are the driver's to do, and say nothing here."""
+        if case.outcome == exit_case.UNANSWERED:
+            need = "unanswered"
+        elif case.refused and case.needs != exit_case.NEEDS_DRIVER_WORD:
+            need = "refused"
+        else:
+            need = case.needs
+        if need in ("unanswered", "refused", exit_case.NEEDS_PERSON) and need != case.told:
+            case.told = need
+            self.events.record(
+                "fallback_needs_human",
+                self.config.lane_id,
+                reason=f"the exit is not settled: {need}",
+                fallback=Fallback.EXIT_NOT_SETTLED.value,
+                exit_id=case.exit_id,
+                needs=need,
+                **({"refused": case.refused} if need == "refused" else {}),
+            )
+            self.deliver()
+
+    def _let_out(self, case: exit_case.ExitCase) -> None:
+        """The case is settled: the barrier opens, and the close names the case."""
+        with self._exit_lock:
+            if self._exit_case is not case:
+                # A person at the lane opened for this car first.
+                return
+            self._exit_case = None
+            self.last_decision_completed_at = to_iso(self._clock())
+        if self.exits is not None:
+            exit_case.send_receipt(case, self.exits, self.exit_display)
+        lane = self.config.lane_id
+        reason = f"the exit is settled: {case.why}"
+        self.vend.vend(reason)
+        self.events.record("vended", lane, reason=reason, exit_id=case.exit_id)
+        if self.exit_display is not None:
+            self.exit_display.show_exit(None)
+        self._settle_transit(
+            case.identity, case.exit_at, exit_pricing=case.pricing, exit_id=case.exit_id
+        )
+        self.deliver()
+
+    def observe_exit_case(self) -> None:
+        """On an idle turn: the waiting case, while its car is on the arming
+        loop. A car that has left leaves its case to a person."""
+        case = self._exit_case
+        if case is None:
+            return
+        if not self.loop.is_occupied():
+            self._leave_exit_case("the car left the exit before it was settled")
+            return
+        self._advance_exit_case(case)
+
+    def _leave_exit_case(self, reason: str) -> None:
+        """Drop the waiting case, if any, and say so: the platform keeps it for
+        a person, and nothing opens for it here."""
+        with self._exit_lock:
+            case, self._exit_case = self._exit_case, None
+        if case is None:
+            return
+        self.events.record(
+            "fallback_needs_human",
+            self.config.lane_id,
+            reason=reason,
+            fallback=Fallback.EXIT_NOT_SETTLED.value,
+            exit_id=case.exit_id,
+            needs="left",
+        )
+        if self.exit_display is not None:
+            self.exit_display.show_exit(None)
+        self.show_reader(None)
+        self.deliver()
 
     # ------------------------------------------------------------------
     # From the vend to the session, or to one of the three other answers.
@@ -919,7 +1130,9 @@ class LaneController:
             return "ticket"
         return "plate" if identity.plate else "unread"
 
-    def _settle_transit(self, identity, at: str, *, exit_pricing=None, arming=()) -> None:
+    def _settle_transit(
+        self, identity, at: str, *, exit_pricing=None, arming=(), exit_id=None
+    ) -> None:
         """Record the pending entry, then let the closing loops decide its fate.
 
         Two halves, called as one here and separately by the assisted vend --
@@ -935,7 +1148,9 @@ class LaneController:
         arming read, handed down for the same reason, to be kept with its stay.
         """
         self.begin_transit(identity, at)
-        self.resolve_transit(identity, at, exit_pricing=exit_pricing, arming=arming)
+        self.resolve_transit(
+            identity, at, exit_pricing=exit_pricing, arming=arming, exit_id=exit_id
+        )
 
     def begin_transit(self, identity, at: str) -> None:
         """The vend created a PENDING entry. Nothing has decided its fate yet."""
@@ -964,7 +1179,7 @@ class LaneController:
         self._transit(TransitState.PENDING, at)
 
     def resolve_transit(
-        self, identity, at: str, *, claim=None, exit_pricing=None, arming=()
+        self, identity, at: str, *, claim=None, exit_pricing=None, arming=(), exit_id=None
     ) -> None:
         """What the loops after the barrier made of the pending entry.
 
@@ -1007,7 +1222,8 @@ class LaneController:
             )
             self._transit(TransitState.UNCONFIRMABLE, at)
             opened = self._record_session(
-                identity, at, confirmation=UNCONFIRMABLE, exit_pricing=exit_pricing
+                identity, at, confirmation=UNCONFIRMABLE, exit_pricing=exit_pricing,
+                exit_id=exit_id,
             )
             if opened is not None and arming:
                 # No closing loop to picture the car at: the arming read's
@@ -1052,7 +1268,7 @@ class LaneController:
             )
             self._transit(TransitState.CONFIRMED, at)
             opened = self._record_session(
-                identity, at, confirmation=CONFIRMED, exit_pricing=exit_pricing
+                identity, at, confirmation=CONFIRMED, exit_pricing=exit_pricing, exit_id=exit_id
             )
             if opened is not None:
                 # The arming read's frames, and at the closing loop the car
@@ -1102,7 +1318,9 @@ class LaneController:
             # are for. It closes, it bills, and it says `held` with the
             # `exit_held` event above beside it: a flag for a human, not a hole
             # in the ledger.
-            self._record_session(identity, at, confirmation=HELD, exit_pricing=exit_pricing)
+            self._record_session(
+                identity, at, confirmation=HELD, exit_pricing=exit_pricing, exit_id=exit_id
+            )
 
     def transit_timed_out(self, identity, at: str, deadline: float) -> None:
         """The loop driver did not return inside this lane's own deadline.
@@ -1825,6 +2043,7 @@ class LaneController:
         exit_pricing=None,
         tailgater: bool = False,
         no_open_command: bool = False,
+        exit_id: str | None = None,
     ) -> LaneEvent | None:
         """Put the session action on the queue, saying what confirmed it -- and,
         at an exit, what the barrier decided (`local_decision`). Returns the
@@ -1880,6 +2099,9 @@ class LaneController:
             # recorded (A2.2): the platform records a held validation only
             # when this is its discounted fee.
             **self._reader_shown(exit_pricing),
+            # THE SETTLED CASE this car left on (platform 0037): the close
+            # names it, and the platform writes the case's own figures.
+            **({"exit_id": exit_id} if exit_id else {}),
             at=at,
             session_id=session_id,
             exit_confirmation=confirmation,
@@ -1969,6 +2191,9 @@ class LaneController:
                 elif not self.held_by_deactivate_loop(self.deactivate_loop):
                     self._release_arming(SUPPRESSION_ENDED_ARMED, geometry)
                     return self._arm(geometry)
+            # THE CAR WAITING AT THE EXIT, on the idle turns: its case is
+            # asked about and moved on while it is still on the arming loop.
+            self.observe_exit_case()
             # THE LOOPS AFTER THE GATE, on the idle turns. Every turn that
             # serves no arrival asks them whether anything crossed since they
             # were last read, and a lane with its barrier up is a lane where

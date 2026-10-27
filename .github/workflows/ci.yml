@@ -303,6 +303,16 @@ jobs:
           # one of them in the reassuring direction, and requires the contract
           # suite to go red.
           - measured_codes
+          # Exit-settled fail-control
+          # Breaks the exit that opens only when settled -- a priced car let
+          # out unpaid, an unreachable platform or no platform taken as
+          # settled, the plate text or an unsure plate in the case, the case
+          # opened before its pictures, the fee sent every turn or never again
+          # after a decline, a car that left let out, a person asked for every
+          # turn, the barrier opened twice, the close not naming the case, the
+          # receipt never sent -- and requires the exit-case suite to fail each
+          # time.
+          - exit_settled
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }

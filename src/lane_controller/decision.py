@@ -78,6 +78,13 @@ class Fallback(StrEnum):
     #: code does not complete it (`vend.py`), because a ticket is a driver
     #: serving themselves and a closing is the owner saying they may not.
     LANE_CLOSED = "lane_closed"
+    #: A CAR AT AN EXIT THAT IS NOT SETTLED: a fee above zero not yet paid, a
+    #: stay this lane could not price or find, or a car it could not read.
+    #: The barrier opens when the platform's exit case says settled -- paid at
+    #: the lane's reader, covered, a fee of zero, or a person who let the car
+    #: out -- and on nothing else (`exit_case`). Never "open and collect
+    #: nothing".
+    EXIT_NOT_SETTLED = "exit_not_settled"
 
 
 #: A lane nobody has closed. What a cache holds until the platform says

@@ -3564,3 +3564,162 @@ def _break_the_entry_stay(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_ENTRY_STAY mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the exit-settled fail-control (the owner's rule for
+# the exit, 2026-10-27: the gate opens only when settled).
+#
+# scripts/exit_settled_fail_control.py sets BREAK_EXIT_SETTLED and requires
+# tests/test_exit_case.py to FAIL. An exit nobody has seen open for an unpaid
+# car is not known to stay down for one.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_settled_exit(monkeypatch):
+    mode = os.environ.get("BREAK_EXIT_SETTLED")
+    if not mode:
+        return
+
+    from lane_controller import exit_case as case_module
+    from lane_controller.controller import LaneController
+    from lane_controller.exit_pricing import PRICED
+
+    if mode == "priced_opens":
+        # A car with a fee to pay is let out on the lane's copy, unpaid.
+        original = LaneController._exit_settlement
+
+        def priced_settles(self, decision, identity, frames):
+            pricing = decision.exit_pricing
+            if decision.should_vend and pricing is not None and pricing.status == PRICED:
+                return decision, None
+            return original(self, decision, identity, frames)
+
+        monkeypatch.setattr(LaneController, "_exit_settlement", priced_settles)
+
+    elif mode == "unanswered_opens":
+        # A platform that cannot be reached is taken as a settled case.
+        original = case_module.advance
+
+        def hopeful(case, platform, display, *, now):
+            outcome = original(case, platform, display, now=now)
+            return case_module.SETTLED if outcome == case_module.UNANSWERED else outcome
+
+        monkeypatch.setattr(case_module, "advance", hopeful)
+
+    elif mode == "no_platform_opens":
+        # A lane with no platform wired opens for the car it could not settle.
+        def settles_alone(self, case):
+            case.outcome = case_module.SETTLED
+            return case.outcome
+
+        original = LaneController._step
+
+        def step(self, case):
+            return settles_alone(self, case) if self.exits is None else original(self, case)
+
+        monkeypatch.setattr(LaneController, "_step", step)
+
+    elif mode == "plate_in_case":
+        # The case carries the plate text.
+        original = case_module.id_fields
+
+        def with_plate(identity, *, plate_confident):
+            return {**original(identity, plate_confident=plate_confident), "plate": identity.plate}
+
+        monkeypatch.setattr(case_module, "id_fields", with_plate)
+
+    elif mode == "unsure_plate_sent":
+        # A plate read below the lane's confidence is sent as the car's ID.
+        original = case_module.id_fields
+        monkeypatch.setattr(
+            case_module, "id_fields",
+            lambda identity, *, plate_confident: original(identity, plate_confident=True),
+        )
+
+    elif mode == "pictures_after_case":
+        # The case is opened before its pictures are sent.
+        original = LaneController._exit_settlement
+
+        def case_first(self, decision, identity, frames):
+            self.deliver = lambda: None
+            try:
+                return original(self, decision, identity, frames)
+            finally:
+                del self.deliver
+
+        monkeypatch.setattr(LaneController, "_exit_settlement", case_first)
+
+    elif mode == "polled_too_fast":
+        # The case is asked about on every turn, faster than Stripe is read.
+        monkeypatch.setattr(case_module, "EXIT_POLL_SECONDS", 0.0)
+
+    elif mode == "pay_every_turn":
+        # The fee is handed to the reader again on every answer.
+        original = case_module._act
+
+        def again(case, platform, display):
+            case.paid_after = case_module._NOT_SENT
+            return original(case, platform, display)
+
+        monkeypatch.setattr(case_module, "_act", again)
+
+    elif mode == "decline_not_resent":
+        # After a decline the fee is never handed to the reader again.
+        original = case_module._act
+
+        def once(case, platform, display):
+            sent = case.paid_after is not case_module._NOT_SENT
+            if case.needs == case_module.NEEDS_PAYMENT and sent:
+                return None
+            return original(case, platform, display)
+
+        monkeypatch.setattr(case_module, "_act", once)
+
+    elif mode == "left_case_opens":
+        # A car that left the loop keeps its case, and the barrier opens for nobody.
+        def regardless(self):
+            if self._exit_case is not None:
+                self._advance_exit_case(self._exit_case)
+
+        monkeypatch.setattr(LaneController, "observe_exit_case", regardless)
+
+    elif mode == "person_said_every_turn":
+        # A case that needs a person says so on every turn.
+        original = LaneController._tell_exit_case
+
+        def again(self, case):
+            case.told = None
+            return original(self, case)
+
+        monkeypatch.setattr(LaneController, "_tell_exit_case", again)
+
+    elif mode == "person_and_case_both_open":
+        # A person opens for the car and its case opens the barrier again.
+        original = LaneController.complete_vend
+
+        def keeps_case(self, identity, **kwargs):
+            case = self._exit_case
+            at = original(self, identity, **kwargs)
+            self._exit_case = case
+            return at
+
+        monkeypatch.setattr(LaneController, "complete_vend", keeps_case)
+
+    elif mode == "close_not_named":
+        # The close does not name the case the car left on.
+        original = LaneController._settle_transit
+
+        def unnamed(self, identity, at, **kwargs):
+            kwargs.pop("exit_id", None)
+            return original(self, identity, at, **kwargs)
+
+        monkeypatch.setattr(LaneController, "_settle_transit", unnamed)
+
+    elif mode == "no_receipt":
+        # The text receipt the driver asked for is never sent.
+        monkeypatch.setattr(case_module, "send_receipt", lambda case, platform, display: False)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_EXIT_SETTLED mode: {mode}")

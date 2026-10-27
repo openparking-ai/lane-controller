@@ -164,7 +164,9 @@ cannot sit under the tail of the very car it is meant to protect.
 
 **It works with the internet down.** Every decision is made from a local cache
 of allow and pricing rules. The server refreshes that cache and receives events
-afterwards; the barrier never waits on a network call. If the rules go stale
+afterwards; the barrier never waits on a network call to let a car in, or to
+let out a car it settles on its copy (an exit case waits on the platform by
+design: see below). If the rules go stale
 past their configured age, the lane falls back rather than acting on pricing it
 no longer trusts.
 
@@ -176,13 +178,24 @@ engine in-process — `rate_engine.contract.run_quote`, the one function behind
 the platform's `/v1/quote`, so the lane's number and the platform's are one
 computation; and a transient whose entry the cache does not hold yet — it
 entered inside one stays interval, or during an outage — is said to be
-**`no_cached_entry`**: the barrier opens as it always has, the platform settles
-the stay at the close — covered if a module it asks there covers it, priced
-through the engine if none does — nothing is collected at the reader, and the
-record says so (`exit_pricing.py`, on the `decision` event). Nothing on that
-path opens a socket to the platform: `tests/test_exit_decision.py` runs the
-real Vehicle ID service on loopback, counts every connection the turn makes up
-to the vend, and times it — a Mac number, a floor for a Jetson. **And the close carries that
+**`no_cached_entry`** (`exit_pricing.py`, on the `decision` event).
+
+**The gate opens only when the exit is settled** (the owner's rule,
+2026-10-27). Covered, or priced at a fee of zero, the lane settles the car
+itself and opens with nothing on the network: `tests/test_exit_decision.py`
+runs the real Vehicle ID service on loopback, counts every connection the turn
+makes up to the vend, and times it — a Mac number, a floor for a Jetson. Every
+other car is a **case** on the platform (`exit_case.py`): a fee above zero, no
+stay in the lane's copy, facts too old to price from, a refused engine, a plate
+the lane cannot stand behind. The case is opened with the car's ID (positioned
+plate characters, colour code, size; never the plate text) and its pictures;
+the barrier stays down, the lane hands the fee to its card reader or passes on
+the driver's entry time from the exit display, and the barrier opens when the
+platform says the case is settled — paid, priced on the driver's word, or let
+out by a person. A car that leaves the loop unsettled, and every case with the
+platform down, is a person's (`fallback_needs_human`). `tests/test_exit_case.py`
+holds it and `scripts/exit_settled_fail_control.py` breaks it fourteen ways.
+**And the close carries that
 decision** (`local_decision` on the session close, the whole of the `decision`
 event's `exit_pricing`, unedited, handed down from the car's own decision and
 never read back from "the last one"): a platform at migration 0017 or later

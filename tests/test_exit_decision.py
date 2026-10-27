@@ -33,7 +33,7 @@ import pytest
 from fake_platform import FakePlatform
 from lane_controller import CameraConfig, DecisionCache, GateConfig, LaneConfig
 from lane_controller.controller import LaneController
-from lane_controller.decision import normalise_identity
+from lane_controller.decision import Fallback, normalise_identity
 from lane_controller.events import EventQueue
 from lane_controller.exit_pricing import (
     COVERED,
@@ -378,8 +378,11 @@ def test_more_than_one_open_stay_under_one_identity_prices_the_newest_and_says_s
 
 
 def lane(
-    cache, plate, *, direction="exit", confidence=0.99, transport=None, identifier=None, clock=None
+    cache, plate, *, direction="exit", confidence=0.99, transport=None, identifier=None, clock=None,
+    exits=None,
 ):
+    """An exit lane; its cases go to `exits`, by default a platform that
+    settles every case at once (paid)."""
     identity = VehicleIdentity(plate=plate, plate_region="FL", make=None, model=None, color=None,
                                confidence=confidence)
     vend = RecordingVendOutput()
@@ -392,6 +395,7 @@ def lane(
         cache=cache,
         events=EventQueue(transport) if transport else EventQueue(),
         clock=clock or (lambda: NOW),
+        exits=exits if exits is not None else FakePlatform(),
     )
     return controller, vend
 
@@ -429,7 +433,9 @@ def test_an_entry_lane_and_a_fallback_carry_no_exit_pricing():
     decision = controller.run_once()
     assert decision.should_vend and decision.exit_pricing is None
     assert "exit_pricing" not in recorded(controller, "decision")[0].detail
-    controller, _ = lane(cache, "PASS-1", confidence=0.10)
+    waiting = FakePlatform()
+    waiting.exit_answer = {"settled": False, "needs": "person"}
+    controller, _ = lane(cache, "PASS-1", confidence=0.10, exits=waiting)
     decision = controller.run_once()
     assert not decision.should_vend and decision.exit_pricing is None
 
@@ -587,7 +593,23 @@ def test_no_platform_call_on_the_barriers_path_with_vehicle_id_live_on_loopback(
     cache = a_cache(a_platform(gp=gp_register(gp_row("PASS-1")), stays=[("s-7", "TRNS-7", ENTRY)]))
     allowed = ("127.0.0.1", port)
     measured = {}
-    for plate, expected in (("PASS-1", COVERED), ("TRNS-7", PRICED), ("NEW-1", NO_CACHED_ENTRY)):
+    # Only a settled car opens on the lane's own copy: a covered one (or a fee
+    # of zero). A priced car and one the cache does not hold are cases, which
+    # wait on the platform by design (`exit_case`), so the barrier stays down
+    # for them here, with the platform dead, and their pricing is still recorded.
+    for plate, expected in (("TRNS-7", PRICED), ("NEW-1", NO_CACHED_ENTRY)):
+        reader.plate = plate
+        vend = RecordingVendOutput()
+        controller = LaneController(
+            a_config(), loop=SimulatedLoopInput(arrivals=1), camera=CannedCameraFeed(),
+            vend=vend, identifier=VehicleIdClient(f"http://127.0.0.1:{port}"), cache=cache,
+            events=EventQueue(PlatformTransport(dead_platform)), clock=lambda: NOW,
+        )
+        decision = controller.run_once()
+        assert not decision.should_vend and not vend.vends, plate
+        assert decision.fallback is Fallback.EXIT_NOT_SETTLED, plate
+        assert decision.exit_pricing.status == expected, (plate, decision.exit_pricing)
+    for plate, expected in (("PASS-1", COVERED),):
         reader.plate = plate
         with ConnectionCounter() as counter:
             vend = TimedVend(counter)

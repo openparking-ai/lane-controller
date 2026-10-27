@@ -111,6 +111,7 @@ def exit_lane(cache, plate, *, reader, transport=None, vend=None):
         events=EventQueue(transport) if transport else EventQueue(),
         clock=lambda: NOW,
         reader=reader,
+        exits=FakePlatform(),
     )
     return controller, vend
 

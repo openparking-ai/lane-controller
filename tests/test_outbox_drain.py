@@ -171,8 +171,20 @@ class AskingLookup:
 
 
 def an_exit_lane(transport, plates):
+    """An exit lane whose cars are covered, so each leaves on the lane's own
+    copy and its close goes out without a case: the close the lookup is for."""
+    from test_offline import cover
+
     cache = DecisionCache()
     cache.load([], default_action="allow")
+    covering = FakePlatform()
+    cover(covering, plates[0])
+    register = covering.entitlements["garage_pass"]["register"]
+    register["registrations"] = [
+        {**register["registrations"][0], "vehicle_identity": plate} for plate in plates
+    ]
+    cache.entitlements["garage_pass"] = covering.entitlements["garage_pass"]
+    cache._reindex_coverage()
     config = a_config()
     config = LaneConfig(lane_id=config.lane_id, site_id=config.site_id, camera=config.camera,
                         gate=config.gate, direction="exit")
@@ -187,6 +199,7 @@ def an_exit_lane(transport, plates):
         ),
         cache=cache,
         events=EventQueue(transport),
+        exits=FakePlatform(),
     )
     return controller, vend
 

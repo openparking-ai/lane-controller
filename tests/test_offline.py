@@ -35,6 +35,7 @@ from lane_controller import (
     VehicleIdentity,
     sync_rules,
 )
+from lane_controller.decision import Fallback
 from lane_controller.durable import OutboxStore
 from lane_controller.events import LOG_CHUNK
 from lane_controller.platform_client import PlatformRejected, PlatformUnreachable
@@ -58,6 +59,19 @@ def lane_config(direction="entry"):
     )
 
 
+def cover(platform, plate="OFF-1"):
+    """Put `plate` on the garage-pass register the lane syncs: a car the exit
+    settles on its own copy, with no platform call."""
+    from test_exit_decision import gp_register, gp_row
+
+    platform.entitlements["garage_pass"] = {"consulted": True, "register": gp_register(
+        gp_row(plate),
+        passes=[{"pass": "p-1", "state": "active", "valid_from": "2026-01-01",
+                 "valid_to": "2099-12-31", "unreadable": None}],
+    )}
+    return platform
+
+
 def build(platform, *, direction="entry", arrivals=1, identities=None):
     cache = DecisionCache()
     sync_rules(platform, cache)  # platform stands in for PlatformClient
@@ -73,6 +87,7 @@ def build(platform, *, direction="entry", arrivals=1, identities=None):
         ),
         cache=cache,
         events=EventQueue(transport),
+        exits=platform,
     )
     return controller, vend, transport
 
@@ -523,7 +538,8 @@ def test_low_confidence_offline_still_falls_back_rather_than_guessing(caplog):
 
 @pytest.mark.parametrize("direction", ["entry", "exit"])
 def test_both_directions_work_offline(direction):
-    platform = FakePlatform()
+    """At the exit, for a car the lane settles on its own copy: covered."""
+    platform = cover(FakePlatform())
     platform.reject_close_without_open = False
     controller, vend, _ = build(platform, direction=direction)
     platform.online = False
@@ -531,6 +547,25 @@ def test_both_directions_work_offline(direction):
     assert controller.run_once().outcome is Outcome.ALLOW
     assert vend.vend_count == 1
     assert controller.events.pending > 0
+
+
+def test_an_offline_exit_the_lane_cannot_settle_waits_for_a_person():
+    """A car with a fee to pay, or one the lane has no stay for, is a case on
+    the platform; with the platform down it cannot be opened, the barrier
+    stays down, and a person is asked for."""
+    platform = FakePlatform()
+    controller, vend, _ = build(platform, direction="exit")
+    platform.online = False
+
+    decision = controller.run_once()
+
+    assert decision.fallback is Fallback.EXIT_NOT_SETTLED and vend.vend_count == 0
+    asked = [e for e in controller.events._queue if e.kind == "fallback_needs_human"]
+    assert [e.detail["needs"] for e in asked] == ["unanswered"]
+    # CONTROL: the same car, the platform up, is let out on its settled case.
+    platform.online = True
+    controller, vend, _ = build(platform, direction="exit")
+    assert controller.run_once().outcome is Outcome.ALLOW and vend.vend_count == 1
 
 
 def test_an_entry_replayed_after_the_car_left_does_not_double_open():
@@ -607,7 +642,7 @@ def test_the_exit_names_the_session_when_the_platform_is_reachable():
     (`tests/test_outbox_drain.py` holds which thread): a close delivered late
     is matched as one sent on the plate alone would be, and the platform's
     order check refuses an exit that precedes the open stay's entry."""
-    platform = FakePlatform()
+    platform = cover(FakePlatform())
     entry, _, _ = build(platform, direction="entry")
     entry.run_once()
 
@@ -619,9 +654,25 @@ def test_the_exit_names_the_session_when_the_platform_is_reachable():
     assert platform.closed[0]["session_id"] is not None, "the close must name the session"
 
 
+def test_a_close_on_a_settled_case_names_the_case_and_asks_no_lookup():
+    """The platform matched the car to its stay when it opened the case; the
+    close names the case, and the lane does not ask a second time."""
+    platform = FakePlatform()
+    entry, _, _ = build(platform, direction="entry")
+    entry.run_once()
+
+    exit_lane, _, transport = build(platform, direction="exit")
+    asked = []
+    transport.session_lookup = lambda plate: asked.append(plate)
+    exit_lane.run_once()
+
+    assert len(platform.closed) == 1 and asked == []
+    assert platform.closed[0]["exit_id"] == "exit-1"
+
+
 def test_an_offline_exit_still_closes_without_a_session_id():
     """The lookup is best effort: a lane with no network must still open its gate."""
-    platform = FakePlatform()
+    platform = cover(FakePlatform())
     platform.reject_close_without_open = False
     exit_lane, vend, transport = build(platform, direction="exit")
     transport.session_lookup = lambda plate: platform.find_open_session(plate=plate)

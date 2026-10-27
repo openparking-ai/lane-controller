@@ -394,7 +394,8 @@ not change; how often each member appears does.
   **`display_code_confirmed` is refused `not_completable`**, as at a closed lane:
   a display code is a driver serving themselves, and this garage takes no
   stranger.
-- **A garage that has not stated it**, and **every exit**, decide as before.
+- **A garage that has not stated it** decides as before. Exits: see the next
+  section.
 
 Whatever was decided, every car the loops see go in -- the one the lane opened
 for, a second car through the same opening, a refused car that drove in anyway
@@ -402,6 +403,46 @@ for, a second car through the same opening, a refused car that drove in anyway
 (with what was read below the confidence kept beside it, never as an identity),
 and a car no open command let in is marked `no_open_command`. None of it is on
 this contract: session actions never are.
+
+### What an exit decides: the gate opens only when settled
+
+The owner's exit rule (2026-10-27). An EXIT lane opens on its own copy for a
+car that is **settled there**: covered by a register today, or priced at a fee
+of zero. Nothing on that path touches the network. **Every other car at an
+exit is a case on the platform**, and the barrier opens only when the platform
+says the case is settled: paid at this lane's card reader, priced on the
+driver's word for when they came in, or let out by a person.
+
+- **The decision** for a car the lane could not settle is `fallback`, with
+  `fallback` `exit_not_settled`, and its `decision` event names the case
+  (`exit_id`). That covers a stay priced above zero, a stay the lane's copy does
+  not hold (`no_cached_entry`), rules or facts too old to price from, an engine
+  that refused, and a plate read below the lane's confidence or not read. A
+  case the platform settles on its first answer is decided `allow`, its reason
+  `the exit is settled: <why>`. **There is no "open and collect nothing" at an
+  exit any more.**
+- **While the case waits**, the lane asks the platform how it stands on its
+  idle turns, at most every two seconds, for as long as the car is on the
+  arming loop: it hands the fee to the reader once (again after a decline), and
+  passes on the entry time the driver gives at the exit display.
+  `fallback_needs_human` is recorded once each time the case needs a person
+  (`needs`: `person`, `unanswered` when the platform could not be reached,
+  `refused` when it would not act, `left` when the car left the loop
+  unsettled). A car that left is let out by nobody here.
+- **When it is settled**, the barrier opens, `vended` names the case, and the
+  stay's close names it too. A text receipt goes to the phone the driver gave,
+  once, best effort.
+- **A person can always open it**: `POST /v1/lane/vend` at the lane, or the
+  case's let-out on the platform. The lane drops the case when a person opens
+  for the car, and the barrier moves once.
+- **Offline**, a covered car still leaves; every other car waits for a person.
+
+What the case carries about the car is its ID -- the plate's positioned
+characters, the colour code and the size -- and never the plate text; a plate
+read below the confidence sends no characters at all. The car's pictures at
+the exit are sent before the case is opened, under the case's own event.
+`tests/test_exit_case.py` holds this, and `scripts/exit_settled_fail_control.py`
+breaks it fourteen ways.
 
 ### The transit
 

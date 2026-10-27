@@ -25,6 +25,7 @@ belong to:
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 
@@ -58,6 +59,18 @@ F = ClosingSequence.FORWARD
 R = ClosingSequence.REVERSE
 
 
+class SettlesEveryExit:
+    """The exit's platform, settling every case at once (paid): this matrix
+    holds the exit side still. Handed only to a tree whose lane takes one, so
+    the script still runs against a `main` that has no exit case."""
+
+    def open_exit(self, **_):
+        return {"id": "exit-matrix", "settled": True, "why": "paid"}
+
+    def get_exit(self, exit_id):
+        return {"id": exit_id, "settled": True, "why": "paid"}
+
+
 def build(*, direction="entry", closing_loops=2, crossings=(), identities=(), arrivals=1):
     config = LaneConfig(
         lane_id="lane-matrix",
@@ -83,6 +96,11 @@ def build(*, direction="entry", closing_loops=2, crossings=(), identities=(), ar
         identifier=StubVehicleIdentifier(list(identities) or [ALLOWED]),
         closing_loops=ScriptedClosingLoops(list(crossings)) if closing_loops == 2 else None,
         cache=cache,
+        **(
+            {"exits": SettlesEveryExit()}
+            if "exits" in inspect.signature(LaneController).parameters
+            else {}
+        ),
     )
     return controller, vend
 
