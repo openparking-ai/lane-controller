@@ -15,11 +15,21 @@ import json
 
 from fake_platform import FakePlatform
 from lane_controller import EventQueue, LaneController
+from lane_controller.contract import VendAuthority, VendRefusal
 from lane_controller.decision import Fallback, Outcome
-from lane_controller.exit_case import EXIT_POLL_SECONDS, fold, id_fields
+from lane_controller.exit_case import (
+    EXIT_LEFT_SECONDS,
+    EXIT_PAY_ATTEMPTS,
+    EXIT_POLL_SECONDS,
+    EXIT_RESEND_SECONDS,
+    fold,
+    id_fields,
+)
 from lane_controller.exit_pricing import COVERED, NO_CACHED_ENTRY, PRICED
 from lane_controller.interfaces import PlateCharacters, VehicleIdentity
-from lane_controller.platform_client import PlatformRejected
+from lane_controller.platform_client import PlatformClient, PlatformRejected
+from lane_controller.reader import StripeCartScreen
+from lane_controller.service import LaneService
 from lane_controller.simulated import (
     CannedCameraFeed,
     RecordingVendOutput,
@@ -28,6 +38,8 @@ from lane_controller.simulated import (
     StubVehicleIdentifier,
 )
 from lane_controller.sync import PlatformTransport
+from lane_controller.vend import AssistedVend
+from lane_controller.vend import parse as parse_vend
 from test_exit_decision import (
     ENTRY,
     NOW,
@@ -39,8 +51,13 @@ from test_exit_decision import (
     gp_row,
 )
 
-PAYMENT = {"settled": False, "needs": "payment", "fee": 900, "payment": None}
+#: The fee as the platform answers it on a case (`exits.presentFee`).
+FEE = {"outcome": "transient", "covered_by": [], "fee_minor": 900, "subtotal_minor": 900,
+       "currency": "USD", "breakdown": [{"kind": "base", "delta_minor": 900, "text": "3 h"}],
+       "refused": False}
+PAYMENT = {"settled": False, "needs": "payment", "fee": FEE, "payment": None}
 PAID = {"settled": True, "why": "paid"}
+DECLINED = "card_declined:insufficient_funds"
 
 #: The flat plan with its first hour free: a car out inside it owes nothing.
 FIRST_HOUR_FREE = copy.deepcopy(PLAN)
@@ -144,7 +161,7 @@ def test_a_priced_car_waits_on_its_case_and_leaves_when_it_is_paid():
     assert order[0][1] == order[1][1] == opened[1]
     # The fee to the lane's reader, once.
     assert exits.exit_requests[1:] == [("pay", "exit-1")]
-    assert display.shown[-1] == {"needs": "payment", "fee": 900}
+    assert display.shown[-1] == {"needs": "payment", "fee": FEE}
 
     # Asked again no faster than the platform reads Stripe.
     clock.tick(EXIT_POLL_SECONDS / 2)
@@ -154,8 +171,9 @@ def test_a_priced_car_waits_on_its_case_and_leaves_when_it_is_paid():
     controller.observe_exit_case()
     assert exits.exit_requests[-1] == ("get", "exit-1"), "no decline: the fee is not sent again"
 
-    # A DECLINE: the fee goes to the reader again, once for that decline.
-    exits.exit_answer = {**PAYMENT, "payment": {"status": "open", "last_failure": "card_declined"}}
+    # A DECLINE: the fee goes to the reader again at once, and only once for
+    # that decline until the resend interval has passed.
+    exits.exit_answer = {**PAYMENT, "payment": {"status": "open", "last_failure": DECLINED}}
     clock.tick()
     controller.observe_exit_case()
     clock.tick()
@@ -270,6 +288,8 @@ def test_a_car_that_leaves_the_loop_unsettled_leaves_its_case_to_a_person():
     controller.loop.clear()
     clock.tick()
     controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
     left = logged(controller, "fallback_needs_human")[-1]
     assert left["detail"]["needs"] == "left" and left["detail"]["exit_id"] == "exit-1"
     # settled afterwards: nothing opens here for a car that has gone
@@ -297,3 +317,362 @@ def test_with_no_platform_wired_an_unsettled_exit_stays_down():
     controller.exits = None
     decision = controller.run_once()
     assert decision.fallback is Fallback.EXIT_NOT_SETTLED and vend.vend_count == 0
+
+
+# ---------------------------------------------------------------------------
+# The reader is the platform's once the case has handed its fee to it.
+# ---------------------------------------------------------------------------
+
+
+def a_reader(controller, exits):
+    """The lane's own Stripe reader screen, and one list of what reached the
+    reader in order: the lane's carts and clears, and the platform's /pay."""
+    calls: list[str] = []
+    controller.reader = StripeCartScreen(
+        "tmr_lane", lambda path, form: calls.append(path.rsplit("/", 1)[-1]))
+    pay, cancel = exits.exit_pay, exits.exit_pay_cancel
+
+    def paying(exit_id):
+        calls.append("platform:pay")
+        return pay(exit_id)
+
+    def cancelling(exit_id):
+        calls.append("platform:pay_cancel")
+        return cancel(exit_id)
+
+    exits.exit_pay, exits.exit_pay_cancel = paying, cancelling
+    return calls
+
+
+def test_a_case_whose_fee_is_on_the_reader_never_has_the_reader_driven_after_it():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    calls = a_reader(controller, exits)
+    controller.run_once()
+    # The platform's PaymentIntent went to the reader, and nothing of the
+    # lane's followed it: no cart, no clear.
+    assert calls == ["platform:pay"]
+    exits.exit_answer = dict(PAID)
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 1
+    controller.events.flush()
+    assert exits.closed[-1]["exit_id"] == "exit-1"
+    assert calls == ["platform:pay"], "the lane drove the reader after the intent was on it"
+
+
+def test_the_control_a_covered_car_still_has_the_reader_driven():
+    controller, vend, exits, _, _ = an_exit("PASS-1")
+    calls = a_reader(controller, exits)
+    controller.run_once()
+    assert vend.vend_count == 1 and calls and "platform:pay" not in calls
+
+
+# ---------------------------------------------------------------------------
+# A case the lane lets go of has its payment taken off the reader.
+# ---------------------------------------------------------------------------
+
+
+def test_a_car_that_leaves_has_its_payment_taken_off_the_reader():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    calls = a_reader(controller, exits)
+    controller.run_once()
+    controller.loop.clear()
+    controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
+    assert calls == ["platform:pay", "platform:pay_cancel"]
+    assert ("pay_cancel", "exit-1") in exits.exit_requests and vend.vend_count == 0
+
+
+def test_a_new_car_takes_the_last_cars_payment_off_the_reader_before_its_own_goes_on():
+    rules = a_platform(gp=gp_register(gp_row("PASS-1")),
+                       stays=[("s-7", "TRNS-7", ENTRY), ("s-8", "TRNS-8", ENTRY)])
+    exits = FakePlatform()
+    exits.reject_close_without_open = False
+    exits.exit_answer = dict(PAYMENT)
+    controller = LaneController(
+        a_config(), loop=SimulatedLoopInput(arrivals=2), camera=CannedCameraFeed(),
+        vend=RecordingVendOutput(),
+        identifier=StubVehicleIdentifier([
+            VehicleIdentity(plate=p, plate_region="FL", make=None, model=None, color=None,
+                            confidence=0.99)
+            for p in ("TRNS-7", "TRNS-8")]),
+        cache=a_cache(rules), events=EventQueue(PlatformTransport(exits)), clock=Clock(),
+        exits=exits)
+    controller.run_once()
+    controller.run_once()
+    asked = [r[:2] for r in exits.exit_requests if r[0] in ("pay", "pay_cancel")]
+    assert asked == [("pay", "exit-1"), ("pay_cancel", "exit-1"), ("pay", "exit-2")]
+
+
+def test_a_case_whose_fee_never_reached_the_reader_asks_nothing_to_be_taken_off():
+    controller, _, exits, clock, _ = an_exit(answer={"settled": False, "needs": "person"})
+    controller.run_once()
+    controller.loop.clear()
+    controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
+    assert not [r for r in exits.exit_requests if r[0] == "pay_cancel"]
+
+
+def person_opens(service, controller, key="KEY-EXIT-1"):
+    """`POST /v1/lane/vend` as the route takes it, a person's word."""
+    body = {"authorised_by": VendAuthority.HUMAN_OPEN_NOW.value,
+            "identity": {"kind": "ticket", "ticket_ref": "TKT-4RS9WQ2M"},
+            "decision_at": controller.last_decision_at}
+    answer = service.assisted.complete(parse_vend(body, key))
+    if service.assisted.settling is not None:
+        service.assisted.settling.join(timeout=5)
+    return answer
+
+
+def test_a_person_who_opens_names_the_case_on_the_close_and_takes_its_payment_off_the_reader():
+    controller, vend, exits, _, _ = an_exit(answer=PAYMENT)
+    service = LaneService(controller)
+    controller.run_once()
+    status, answer = person_opens(service, controller)
+    assert status == 202 and vend.vend_count == 1, answer
+    assert ("pay_cancel", "exit-1") in exits.exit_requests
+    controller.events.flush()
+    assert exits.closed[-1]["exit_id"] == "exit-1", "the person's close did not name the case"
+
+
+def test_a_case_that_settles_while_a_persons_vend_is_judged_moves_the_barrier_once():
+    """The route checks `completed` without the lane's exit lock; the case
+    settles and opens between that check and the vend. The vend is refused
+    `already_completed` and the barrier moves once."""
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    service = LaneService(controller)
+    controller.run_once()
+    judged = AssistedVend._refuse
+
+    def settles_in_between(request):
+        refusal = judged(service.assisted, request)
+        if refusal is None:
+            exits.exit_answer = dict(PAID)
+            clock.tick()
+            controller.observe_exit_case()
+        return refusal
+
+    service.assisted._refuse = settles_in_between
+    status, answer = person_opens(service, controller)
+    assert status == 409 and answer["code"] == VendRefusal.ALREADY_COMPLETED.value
+    assert vend.vend_count == 1
+
+
+def test_a_person_who_opens_while_the_case_is_being_asked_is_the_only_one_who_opens():
+    """The other order: a person's vend lands while the lane's turn is asking
+    the platform, and the answer is settled. The turn opens nothing."""
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    decision = controller.run_once()
+    step = type(controller)._step
+
+    def person_first(case):
+        controller.complete_vend(decision.identity, authorised_by="attendant",
+                                 assisted={"authorised_by": "attendant"})
+        exits.exit_answer = dict(PAID)
+        return step(controller, case)
+
+    controller._step = person_first
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 1, "the case opened the barrier a person had already opened"
+
+
+# ---------------------------------------------------------------------------
+# The fee is offered again while it waits for a card, and attempts are counted.
+# ---------------------------------------------------------------------------
+
+
+def pays(exits):
+    return [r for r in exits.exit_requests if r[0] == "pay"]
+
+
+def told(controller, need):
+    return [e for e in logged(controller, "fallback_needs_human") if e["detail"]["needs"] == need]
+
+
+def test_two_identical_declines_are_offered_again_and_a_person_is_told_after_the_attempts():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    assert len(pays(exits)) == 1
+    # The first card: declined. Offered again at once.
+    exits.exit_answer = {**PAYMENT, "payment": {"status": "open", "last_failure": DECLINED}}
+    clock.tick()
+    controller.observe_exit_case()
+    assert len(pays(exits)) == 2
+    # The second card: declined the same way. The answer is the same as
+    # before, and the fee is still offered again once the interval passes.
+    clock.tick(EXIT_RESEND_SECONDS)
+    controller.observe_exit_case()
+    assert len(pays(exits)) == EXIT_PAY_ATTEMPTS == 3
+    assert [e["detail"]["attempts"] for e in told(controller, "payment_attempts")] == [3]
+    # Said once; the fee is still offered; the barrier stays down.
+    clock.tick(EXIT_RESEND_SECONDS)
+    controller.observe_exit_case()
+    assert len(pays(exits)) == 4 and len(told(controller, "payment_attempts")) == 1
+    assert vend.vend_count == 0
+
+
+def test_a_driver_who_never_taps_is_offered_the_fee_again_when_the_reader_is_idle():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    exits.exit_answer = {**PAYMENT, "payment": {"status": "open", "last_failure": None}}
+    controller.run_once()
+    assert len(pays(exits)) == 1
+    # Still on the reader: the platform answers reader_busy. Not an attempt,
+    # and not a refusal a person is told about.
+    exits.exit_pay_refusal = "reader_busy"
+    clock.tick(EXIT_RESEND_SECONDS)
+    controller.observe_exit_case()
+    assert len(pays(exits)) == 2
+    # The reader timed out with no tap and went idle: no failure on the
+    # intent, and the fee goes back on the reader.
+    exits.exit_pay_refusal = None
+    clock.tick(EXIT_RESEND_SECONDS)
+    controller.observe_exit_case()
+    assert len(pays(exits)) == 3
+    assert controller._exit_case.attempts == 2
+    assert not told(controller, "refused") and vend.vend_count == 0
+
+
+# ---------------------------------------------------------------------------
+# What only the platform's settled answer for THIS case can open.
+# ---------------------------------------------------------------------------
+
+
+def test_a_platform_refusal_keeps_the_barrier_down():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    exits.get_exit = lambda exit_id: (_ for _ in ()).throw(
+        PlatformRejected(409, "{}", "exit_on_another_lane"))
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 0
+    assert [e["detail"]["refused"] for e in told(controller, "refused")] == [
+        "exit_on_another_lane"]
+
+
+def test_a_platform_refusal_of_the_open_keeps_the_barrier_down():
+    controller, vend, exits, _, _ = an_exit(answer=PAID)
+    exits.open_exit = lambda **kwargs: (_ for _ in ()).throw(
+        PlatformRejected(400, "{}", "bad_identity"))
+    decision = controller.run_once()
+    assert decision.fallback is Fallback.EXIT_NOT_SETTLED and vend.vend_count == 0
+
+
+def test_settled_is_only_settled_when_it_is_true():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    for almost in (1, "true", "yes", [1]):
+        exits.exit_answer = {"settled": almost, "why": "paid"}
+        clock.tick()
+        controller.observe_exit_case()
+    assert vend.vend_count == 0
+
+
+def test_a_settled_answer_for_another_case_opens_nothing():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    exits.get_exit = lambda exit_id: {"id": "exit-9", "settled": True, "why": "paid"}
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 0
+    assert [e["detail"]["refused"] for e in told(controller, "refused")] == ["another_exit_case"]
+
+
+# ---------------------------------------------------------------------------
+# The driver's entry time carries its offset.
+# ---------------------------------------------------------------------------
+
+
+def test_an_entry_time_without_an_offset_is_refused_at_the_lane_and_never_sent():
+    display = SimulatedExitDisplay("2026-06-10T09:00:00")
+    controller, vend, exits, clock, _ = an_exit(
+        "NEW-1", answer={"settled": False, "needs": "driver_word"}, display=display)
+    controller.run_once()
+    assert not [r for r in exits.exit_requests if r[0] == "word"]
+    assert display.shown[-1]["refused"] == "entry_time_without_offset"
+    # The control: the same time with its offset goes, and so does UTC's Z.
+    display.give_entry_time("2026-06-10T09:00:00Z")
+    clock.tick()
+    controller.observe_exit_case()
+    assert ("word", "exit-1", "2026-06-10T09:00:00Z") in exits.exit_requests
+
+
+# ---------------------------------------------------------------------------
+# A paid car waits on nothing it does not have to.
+# ---------------------------------------------------------------------------
+
+
+def in_order(vend, exits):
+    order: list[str] = []
+    pulse, receipt = vend.vend, exits.exit_receipt
+
+    def vending(reason):
+        order.append("vend")
+        return pulse(reason)
+
+    def receipting(exit_id, phone):
+        order.append("receipt")
+        return receipt(exit_id, phone)
+
+    vend.vend, exits.exit_receipt = vending, receipting
+    return order
+
+
+def test_the_barrier_opens_before_the_receipt_is_sent():
+    display = SimulatedExitDisplay(receipt_phone="+15555550123")
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT, display=display)
+    order = in_order(vend, exits)
+    controller.run_once()
+    exits.exit_answer = dict(PAID)
+    clock.tick()
+    controller.observe_exit_case()
+    assert order == ["vend", "receipt"]
+
+
+def test_the_barrier_opens_before_the_receipt_on_a_case_settled_at_once():
+    display = SimulatedExitDisplay(receipt_phone="+15555550123")
+    controller, vend, exits, _, _ = an_exit(answer=PAID, display=display)
+    order = in_order(vend, exits)
+    controller.run_once()
+    assert order == ["vend", "receipt"]
+
+
+def test_a_loop_that_flickers_clear_does_not_drop_a_paid_cars_case():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.run_once()
+    controller.loop.clear()
+    clock.tick(EXIT_LEFT_SECONDS / 2)
+    controller.observe_exit_case()
+    assert vend.vend_count == 0, "nothing opens for a car the loop does not see"
+    controller.loop._occupied = True
+    exits.exit_answer = dict(PAID)
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 1 and not told(controller, "left")
+
+
+def test_the_platform_client_takes_the_payment_off_the_reader_on_the_cases_own_route():
+    seen = []
+
+    class Answer:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def opener(request, timeout):
+        seen.append((request.get_method(), request.full_url, request.data))
+        return Answer(json.dumps({"exit": {"id": "e 1", "settled": False}}).encode())
+
+    client = PlatformClient("http://platform.test", "tok", opener=opener)
+    assert client.exit_pay_cancel("e 1")["id"] == "e 1"
+    assert seen == [("POST", "http://platform.test/api/v1/lane/exits/e%201/pay/cancel", b"{}")]

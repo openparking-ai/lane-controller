@@ -3659,9 +3659,9 @@ def _break_the_settled_exit(monkeypatch):
         # The fee is handed to the reader again on every answer.
         original = case_module._act
 
-        def again(case, platform, display):
-            case.paid_after = case_module._NOT_SENT
-            return original(case, platform, display)
+        def again(case, platform, display, *, now):
+            case.sent_at = None
+            return original(case, platform, display, now=now)
 
         monkeypatch.setattr(case_module, "_act", again)
 
@@ -3669,13 +3669,109 @@ def _break_the_settled_exit(monkeypatch):
         # After a decline the fee is never handed to the reader again.
         original = case_module._act
 
-        def once(case, platform, display):
-            sent = case.paid_after is not case_module._NOT_SENT
-            if case.needs == case_module.NEEDS_PAYMENT and sent:
+        def once(case, platform, display, *, now):
+            if case.needs == case_module.NEEDS_PAYMENT and case.sent_at is not None:
                 return None
-            return original(case, platform, display)
+            return original(case, platform, display, now=now)
 
         monkeypatch.setattr(case_module, "_act", once)
+
+    elif mode == "reader_driven_after_intent":
+        # The lane drives its reader screen for a car whose case has handed
+        # its fee to the reader, taking the PaymentIntent off it.
+        original = LaneController._note_exit_screen
+
+        def drives(self, record):
+            original(self, record)
+            if self.reader is not None:
+                self.reader.present_exit(record)
+
+        monkeypatch.setattr(LaneController, "_note_exit_screen", drives)
+
+    elif mode == "left_payment_stays_on_reader":
+        # A case the lane lets go of keeps its payment on the reader.
+        monkeypatch.setattr(case_module, "cancel_on_reader", lambda case, platform: False)
+
+    elif mode == "person_close_unnamed":
+        # A person's vend leaves its case off the car's close.
+        monkeypatch.setattr(LaneController, "take_completion_exit_id", lambda self, at: None)
+
+    elif mode == "same_decline_not_resent":
+        # The fee goes back on the reader only on a new failure code: a second
+        # identical decline, or a reader that timed out, is never offered again.
+        monkeypatch.setattr(case_module, "EXIT_RESEND_SECONDS", float("inf"))
+
+    elif mode == "attempts_not_counted":
+        # The fee reaching the reader is never counted, so a person is never
+        # told the driver has tried and failed.
+        monkeypatch.setattr(case_module, "EXIT_PAY_ATTEMPTS", 10**9)
+
+    elif mode == "busy_reader_refused":
+        # A reader still showing the fee is taken as the platform refusing it.
+        monkeypatch.setattr(case_module, "_PAY_NOT_REFUSED", frozenset())
+
+    elif mode == "vend_claims_outside_lock":
+        # `complete_vend` takes the case without checking `completed` under the
+        # exit lock: a case that settled between the route's check and the
+        # vend has moved the barrier, and the person's vend moves it again.
+        original = LaneController.complete_vend
+
+        def unclaimed(self, identity, **kwargs):
+            self.last_decision_completed_at = None
+            return original(self, identity, **kwargs)
+
+        monkeypatch.setattr(LaneController, "complete_vend", unclaimed)
+
+    elif mode == "entry_without_offset_sent":
+        # The driver's entry time goes to the platform without its offset.
+        monkeypatch.setattr(case_module, "has_offset", lambda entry_at: True)
+
+    elif mode == "refusal_settles":
+        # A platform refusal (4xx) of the case is taken as settled.
+        original = case_module.advance
+
+        def refused_opens(case, platform, display, *, now):
+            outcome = original(case, platform, display, now=now)
+            return case_module.SETTLED if case.refused else outcome
+
+        monkeypatch.setattr(case_module, "advance", refused_opens)
+
+    elif mode == "settled_truthy":
+        # `settled` is read as truthy, not as `True`.
+        monkeypatch.setattr(
+            case_module.ExitCase, "settled",
+            property(lambda self: bool(self.answer and self.answer.get("settled"))),
+        )
+
+    elif mode == "let_out_ignores_person":
+        # `_let_out` opens whether or not a person took the case first.
+        original = LaneController._let_out
+
+        def regardless(self, case):
+            with self._exit_lock:
+                self._exit_case = case
+            return original(self, case)
+
+        monkeypatch.setattr(LaneController, "_let_out", regardless)
+
+    elif mode == "other_case_answer":
+        # An answer naming another case is taken for this one.
+        monkeypatch.setattr(case_module, "_own", lambda case, answer: answer)
+
+    elif mode == "receipt_before_vend":
+        # The text receipt goes before the barrier opens, adding its network
+        # call to a paid car's wait.
+        original = LaneController._let_out
+
+        def receipt_first(self, case):
+            case_module.send_receipt(case, self.exits, self.exit_display)
+            return original(self, case)
+
+        monkeypatch.setattr(LaneController, "_let_out", receipt_first)
+
+    elif mode == "loop_flicker_drops":
+        # One clear sample of the arming loop drops the waiting car's case.
+        monkeypatch.setattr(case_module, "EXIT_LEFT_SECONDS", 0.0)
 
     elif mode == "left_case_opens":
         # A car that left the loop keeps its case, and the barrier opens for nobody.

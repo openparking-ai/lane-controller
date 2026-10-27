@@ -372,6 +372,14 @@ class PlatformClient:
         answer = self._request("POST", f"{self._exit_path(exit_id)}/pay", {})
         return self._exit(answer), answer.get("sent") if isinstance(answer, dict) else None
 
+    def exit_pay_cancel(self, exit_id: str) -> dict:
+        """The case's payment taken off the reader bound to this lane: the car
+        left, or a person opened for it. The platform keeps the intent; a card
+        already being authorised cannot be stopped (409 `reader_busy`)."""
+        return self._exit(
+            self._request("POST", f"{self._exit_path(exit_id)}/pay/cancel", {})
+        )
+
     def exit_receipt(self, exit_id: str, phone: str) -> None:
         """A text receipt for a paid case. The number goes in this request
         body and nowhere else; nothing here keeps or logs it."""

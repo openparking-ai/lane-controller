@@ -423,26 +423,49 @@ driver's word for when they came in, or let out by a person.
   exit any more.**
 - **While the case waits**, the lane asks the platform how it stands on its
   idle turns, at most every two seconds, for as long as the car is on the
-  arming loop: it hands the fee to the reader once (again after a decline), and
-  passes on the entry time the driver gives at the exit display.
-  `fallback_needs_human` is recorded once each time the case needs a person
-  (`needs`: `person`, `unanswered` when the platform could not be reached,
-  `refused` when it would not act, `left` when the car left the loop
-  unsettled). A car that left is let out by nobody here.
+  arming loop: it hands the fee to the reader (at once after a new decline,
+  and again every six seconds while the intent waits for a card, since a
+  second identical decline or a reader that timed out with no tap looks the
+  same in the answer; a reader still showing the fee answers `reader_busy`,
+  which is not an attempt), and passes on the entry time the driver gives at
+  the exit display. That time must carry a timezone offset: one without is
+  refused at the lane (`entry_time_without_offset`) and never sent; in the
+  hour the clocks go back, the offset the display sends decides which of the
+  two local times it was. `fallback_needs_human` is recorded once each time
+  the case needs a person (`needs`: `person`, `unanswered` when the platform
+  could not be reached, `refused` when it would not act or answered for
+  another case (`another_exit_case`), `payment_attempts` with `attempts` once
+  the fee has reached the reader three times unpaid, `left` when the car left
+  the loop unsettled). A car counts as gone when the arming loop has read
+  clear for two seconds; while it reads clear the case is not moved on, and a
+  car that left is let out by nobody here.
+- **The reader is the platform's** once it has handed the case's PaymentIntent
+  to it: the lane does not drive its own reader screen for that car, before or
+  after the vend. A case the lane lets go of without opening for it (the car
+  left, the next car arrived, a person opened at the lane) has its payment
+  taken off the reader through the platform (`POST
+  /api/v1/lane/exits/:id/pay/cancel`), best effort.
 - **When it is settled**, the barrier opens, `vended` names the case, and the
-  stay's close names it too. A text receipt goes to the phone the driver gave,
-  once, best effort.
+  stay's close names it too. Then a text receipt goes to the phone the driver
+  gave, once, best effort: after the barrier, never before it.
 - **A person can always open it**: `POST /v1/lane/vend` at the lane, or the
   case's let-out on the platform. The lane drops the case when a person opens
-  for the car, and the barrier moves once.
+  for the car, the close of that car names the case, and the barrier moves
+  once: the vend claims the decision under the lock the case's own opening
+  takes, and one that finds it already completed is refused
+  `already_completed` with nothing moved.
 - **Offline**, a covered car still leaves; every other car waits for a person.
 
 What the case carries about the car is its ID -- the plate's positioned
 characters, the colour code and the size -- and never the plate text; a plate
 read below the confidence sends no characters at all. The car's pictures at
 the exit are sent before the case is opened, under the case's own event.
+Today the identity service fills none of those three, so a plate the lane
+cannot stand behind opens a case with no ID fields: that excludes no stay, and
+the platform's picker or the driver's word decides. The positioned characters
+are passed on unchecked until the identity service's contract for them lands.
 `tests/test_exit_case.py` holds this, and `scripts/exit_settled_fail_control.py`
-breaks it fourteen ways.
+breaks it twenty-eight ways.
 
 ### The transit
 

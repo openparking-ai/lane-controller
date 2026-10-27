@@ -19,6 +19,20 @@ not known to stay down for one.
   person_and_case_both_open  a person opens, and the case opens the barrier again.
   close_not_named            the close does not name the case the car left on.
   no_receipt                 the text receipt the driver asked for is never sent.
+  reader_driven_after_intent the lane drives its reader after the case's fee is on it.
+  left_payment_stays_on_reader  a case let go of keeps its payment on the reader.
+  person_close_unnamed       a person's vend leaves its case off the car's close.
+  same_decline_not_resent    a second identical decline or a no-tap timeout is never re-sent.
+  attempts_not_counted       a person is never told the driver has tried and failed.
+  busy_reader_refused        a reader still showing the fee is taken as a refusal.
+  vend_claims_outside_lock   a person's vend racing a settled case moves the barrier twice.
+  entry_without_offset_sent  the driver's entry time goes without its timezone offset.
+  refusal_settles            a platform refusal (4xx) is taken as settled.
+  settled_truthy             `settled` is read as truthy rather than as `True`.
+  let_out_ignores_person     the case opens though a person took it first.
+  other_case_answer          a settled answer for another case opens this gate.
+  receipt_before_vend        the text receipt is sent before the barrier opens.
+  loop_flicker_drops         one clear sample of the loop drops the waiting car's case.
 """
 
 from __future__ import annotations
@@ -43,6 +57,23 @@ BREAKAGES = [
     ("person_and_case_both_open", "a person opens for the car and its case opens again"),
     ("close_not_named", "the close does not name the case the car left on"),
     ("no_receipt", "the text receipt the driver asked for is never sent"),
+    ("reader_driven_after_intent",
+     "the lane drives its reader screen after the case's fee is on the reader"),
+    ("left_payment_stays_on_reader", "a case the lane lets go of keeps its payment on the reader"),
+    ("person_close_unnamed", "a person's vend leaves its case off the car's close"),
+    ("same_decline_not_resent",
+     "a second identical decline, or a reader that timed out, is never offered the fee again"),
+    ("attempts_not_counted", "a person is never told the driver has tried and failed"),
+    ("busy_reader_refused", "a reader still showing the fee is taken as the platform refusing it"),
+    ("vend_claims_outside_lock",
+     "a person's vend racing a case that settled moves the barrier a second time"),
+    ("entry_without_offset_sent", "the driver's entry time goes without its timezone offset"),
+    ("refusal_settles", "a platform refusal (4xx) of the case is taken as settled"),
+    ("settled_truthy", "`settled` is read as truthy rather than as `True`"),
+    ("let_out_ignores_person", "the case opens the barrier though a person took it first"),
+    ("other_case_answer", "a settled answer naming another case opens this gate"),
+    ("receipt_before_vend", "the text receipt is sent before the barrier opens"),
+    ("loop_flicker_drops", "one clear sample of the arming loop drops the waiting car's case"),
 ]
 
 

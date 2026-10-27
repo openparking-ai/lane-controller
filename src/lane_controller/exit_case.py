@@ -35,12 +35,28 @@ WHAT TRAVELS. The case carries the car's ID fields (`id_fields`) and nothing
 of the plate text. A low-confidence plate gives no characters at all: an ID
 the lane cannot stand behind is not sent as one. The driver's entry time and
 receipt phone go in one request each, and the phone is kept nowhere here.
+
+AN EMPTY ID. The identity service does not fill the positioned characters,
+colour code or size yet (its contract for them has not landed), so a plate
+the lane could not stand behind opens a case with no ID fields at all. That
+excludes no stay: every open stay of the garage is a candidate, and the case
+goes to the picker (10 or fewer) or to the driver's word.
+
+THE READER IS THE PLATFORM'S ONCE THE FEE IS ON IT. The platform hands the
+case's PaymentIntent to the reader bound to this lane; from then until the
+car's close the lane's own reader screen is not driven for it, since a cart
+or a clear it put up would take the intent off the reader. A case the lane
+lets go of without opening for it -- the car left, a new car arrived, a
+person opened at the lane -- has its payment taken off the reader through
+the platform (`cancel_on_reader`), so the next car is never shown this
+car's fee.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 from .exit_pricing import PRICED, ExitPricing
 from .interfaces import ExitDisplay, VehicleIdentity
@@ -51,6 +67,27 @@ log = logging.getLogger(__name__)
 #: How often a case is asked about while it waits. The platform reads Stripe
 #: at most once every 2 seconds per payment; asking faster learns nothing.
 EXIT_POLL_SECONDS = 2.0
+
+#: How long a fee handed to the reader is left before it is handed over again
+#: with nothing new from the platform. The answer carries no reader state and
+#: a second decline with the same code looks like the first, so a fee waiting
+#: for a card is offered again on this interval; a reader still showing it
+#: answers `reader_busy`, which is not an attempt.
+EXIT_RESEND_SECONDS = 6.0
+
+#: How many times the fee may reach the reader before a person is told. The
+#: lane goes on offering it after that; the person decides.
+EXIT_PAY_ATTEMPTS = 3
+
+#: How long the arming loop must read clear before the waiting car is taken
+#: to have left. One clear sample is a loop flicker as often as a car gone,
+#: and a paid car whose case is dropped needs a person to get out.
+EXIT_LEFT_SECONDS = 2.0
+
+#: The platform's refusals of a `/pay` that are not refusals of the case: the
+#: reader still has the intent (`reader_busy`), or it was paid since the case
+#: was last asked about (`exit_settled`).
+_PAY_NOT_REFUSED = frozenset({"reader_busy", "exit_settled"})
 
 #: The positioned-characters rule a whole plate read at the lane's confidence
 #: is sent under, folded as the platform folds it (platform `exitMatch.js`).
@@ -63,10 +100,18 @@ NEEDS_PAYMENT = "payment"
 NEEDS_DRIVER_WORD = "driver_word"
 NEEDS_PERSON = "person"
 
+#: What a person is told when the fee reached the reader `EXIT_PAY_ATTEMPTS`
+#: times and the case is still not paid.
+NEEDS_PAY_ATTEMPTS = "payment_attempts"
+
 #: What `advance` answers.
 SETTLED = "settled"
 WAITING = "waiting"
 UNANSWERED = "unanswered"
+
+#: The refusals the lane makes itself.
+OTHER_CASE = "another_exit_case"
+ENTRY_WITHOUT_OFFSET = "entry_time_without_offset"
 
 
 def fold(plate: str) -> str:
@@ -127,9 +172,14 @@ class ExitCase:
     #: The case as the platform last answered it.
     answer: dict | None = None
     asked_at: float | None = None
-    #: The decline the payment was last sent after (None: sent before any), or
-    #: the sentinel `_NOT_SENT`.
-    paid_after: object = None
+    #: When the fee was last handed to the reader, or None: never.
+    sent_at: float | None = None
+    #: The decline the payment was last sent after (None: sent before any).
+    paid_after: str | None = None
+    #: How many times the reader took the fee (`sent` true or unknown).
+    attempts: int = 0
+    #: When the arming loop first read clear under the waiting car, or None.
+    clear_since: float | None = None
     word_given: bool = False
     receipt_sent: bool = False
     #: Whether the last ask went unanswered, so it is said once per outage.
@@ -140,9 +190,6 @@ class ExitCase:
     told: str | None = None
     #: What the last step answered (`SETTLED`, `WAITING`, `UNANSWERED`).
     outcome: str | None = None
-
-    def __post_init__(self) -> None:
-        self.paid_after = _NOT_SENT
 
     @property
     def needs(self) -> str | None:
@@ -165,7 +212,23 @@ class ExitCase:
         return view
 
 
-_NOT_SENT = object()
+def _own(case: ExitCase, answer: dict) -> dict:
+    """The answer, when it is about this case. An answer naming another case
+    -- settled or not -- says nothing about this car, and opens nothing."""
+    if answer.get("id") != case.exit_id:
+        raise PlatformRejected(None, "the platform answered another exit case", OTHER_CASE)
+    return answer
+
+
+def has_offset(entry_at: str) -> bool:
+    """Whether the driver's entry time is ISO 8601 with a timezone offset. The
+    platform reads a time without one on its own clock, which is not the
+    garage's, and would charge for hours the car was not there."""
+    try:
+        parsed = datetime.fromisoformat(entry_at)
+    except (TypeError, ValueError):
+        return False
+    return parsed.utcoffset() is not None
 
 
 def advance(case: ExitCase, platform, display: ExitDisplay | None, *, now: float) -> str:
@@ -188,12 +251,12 @@ def advance(case: ExitCase, platform, display: ExitDisplay | None, *, now: float
         elif case.asked_at is not None and now - case.asked_at < EXIT_POLL_SECONDS:
             return SETTLED if case.settled else WAITING
         else:
-            case.answer = platform.get_exit(case.exit_id)
+            case.answer = _own(case, platform.get_exit(case.exit_id))
         case.asked_at = now
         case.unanswered = False
         if case.settled:
             return SETTLED
-        _act(case, platform, display)
+        _act(case, platform, display, now=now)
     except PlatformUnreachable as err:
         if not case.unanswered:
             log.warning("exit case unanswered; the gate stays down: %s", err)
@@ -211,31 +274,57 @@ def advance(case: ExitCase, platform, display: ExitDisplay | None, *, now: float
     return SETTLED if case.settled else WAITING
 
 
-def _act(case: ExitCase, platform, display: ExitDisplay | None) -> None:
+def _act(case: ExitCase, platform, display: ExitDisplay | None, *, now: float) -> None:
     """What the lane does for a case that is not settled: hand the fee to the
-    reader once (again after a decline), or pass on the driver's word."""
+    reader (at once after a new decline, otherwise again every
+    `EXIT_RESEND_SECONDS` while it waits for a card), or pass on the driver's
+    word."""
     needs = case.needs
     if needs == NEEDS_PAYMENT:
         payment = case.answer.get("payment") or {}
+        if payment.get("status") not in (None, "open"):
+            return
         failure = payment.get("last_failure")
-        live = payment.get("status") in (None, "open")
-        if live and (case.paid_after is _NOT_SENT or (failure and failure != case.paid_after)):
-            case.answer, sent = platform.exit_pay(case.exit_id)
-            case.paid_after = failure
-            log.info("exit case: the fee was handed to the lane's reader (sent=%s)", sent)
+        due = (
+            case.sent_at is None
+            or (failure is not None and failure != case.paid_after)
+            or now - case.sent_at >= EXIT_RESEND_SECONDS
+        )
+        if not due:
+            return
+        try:
+            answer, sent = platform.exit_pay(case.exit_id)
+        except PlatformRejected as err:
+            if err.code not in _PAY_NOT_REFUSED:
+                raise
+            case.sent_at = now
+            return
+        case.answer = _own(case, answer)
+        case.sent_at = now
+        case.paid_after = failure
+        if sent is True or sent == "unknown":
+            case.attempts += 1
+        log.info("exit case: the fee was handed to the lane's reader (sent=%s, attempt %d)",
+                 sent, case.attempts)
         return
     if needs == NEEDS_DRIVER_WORD and display is not None and not case.word_given:
         entry_at = display.entry_time()
         if entry_at is None:
             return
+        if not has_offset(entry_at):
+            # Refused here and never sent: the display asks again.
+            case.refused = ENTRY_WITHOUT_OFFSET
+            return
         try:
-            case.answer = platform.exit_word(case.exit_id, entry_at)
-            case.word_given = True
-            case.refused = None
+            answer = platform.exit_word(case.exit_id, entry_at)
         except PlatformRejected as err:
             # Not a time the platform takes (in the future, before the 90
             # days, not a time at all): the display asks again.
             case.refused = err.code or "entry_time_refused"
+            return
+        case.answer = _own(case, answer)
+        case.word_given = True
+        case.refused = None
 
 
 def send_receipt(case: ExitCase, platform, display: ExitDisplay | None) -> bool:
@@ -251,5 +340,22 @@ def send_receipt(case: ExitCase, platform, display: ExitDisplay | None) -> bool:
         platform.exit_receipt(case.exit_id, phone)
     except (PlatformUnreachable, PlatformRejected) as err:
         log.info("exit case: the text receipt was not sent: %s", getattr(err, "code", None))
+        return False
+    return True
+
+
+def cancel_on_reader(case: ExitCase, platform) -> bool:
+    """Take the case's payment off the lane's reader, through the platform
+    (`/exits/:id/pay/cancel`), when the lane lets the case go without opening
+    for it. Only a case whose fee was handed to the reader. Best effort: a
+    card already being authorised cannot be stopped (`reader_busy`), and the
+    platform records it paid if Stripe took it. True when cleared."""
+    if platform is None or case.exit_id is None or case.sent_at is None:
+        return False
+    try:
+        platform.exit_pay_cancel(case.exit_id)
+    except (PlatformUnreachable, PlatformRejected) as err:
+        log.warning("exit case: the payment could not be taken off the reader: %s",
+                    getattr(err, "code", None) or err.__class__.__name__)
         return False
     return True

@@ -78,6 +78,9 @@ class FakePlatform:
         self.exits: dict[str, dict] = {}
         self.exit_requests: list[tuple] = []
         self.exit_answer: dict = {"settled": True, "why": "paid"}
+        #: What `/pay` answers `sent` as, or the refusal code it raises (409).
+        self.exit_pay_sent: object = True
+        self.exit_pay_refusal: str | None = None
 
     def _lane_fields(self, *, fast: bool) -> dict:
         if fast and self.lane_on_slow_read_only:
@@ -381,7 +384,14 @@ class FakePlatform:
     def exit_pay(self, exit_id: str):
         self._check()
         self.exit_requests.append(("pay", exit_id))
-        return self._case(exit_id), True
+        if self.exit_pay_refusal is not None:
+            raise PlatformRejected(409, "{}", self.exit_pay_refusal)
+        return self._case(exit_id), self.exit_pay_sent
+
+    def exit_pay_cancel(self, exit_id: str) -> dict:
+        self._check()
+        self.exit_requests.append(("pay_cancel", exit_id))
+        return self._case(exit_id)
 
     def exit_receipt(self, exit_id: str, phone: str) -> None:
         self._check()

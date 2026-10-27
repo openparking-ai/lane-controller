@@ -201,6 +201,12 @@ CLOSING_PICTURES = 2
 REFUSED_PICTURES = 2
 
 
+class DecisionAlreadyCompleted(Exception):
+    """`complete_vend` found the decision already completed -- by an exit case
+    that settled, or by another completion -- and moved nothing. The assisted
+    vend answers it `already_completed`."""
+
+
 class LaneController:
     def __init__(
         self,
@@ -233,6 +239,9 @@ class LaneController:
         #: Who takes the case to open the barrier: the lane's turn when the
         #: case settles, or a person's vend at the lane. Exactly one does.
         self._exit_lock = threading.Lock()
+        #: The case whose fee the platform handed to this lane's reader: until
+        #: its car's close the lane does not drive the reader for it.
+        self._reader_case: str | None = None
         # The banned-car comparison (U7f). None: this lane refuses no car as
         # banned, whatever list it holds.
         self.banned_matcher = banned_matcher
@@ -528,6 +537,8 @@ class LaneController:
         #: (`take_completion_arming`).
         self._held_arming: tuple[str, list] | None = None
         self._completion_arming: tuple[str, list] | None = None
+        #: The exit case a person's completion took, as `(at, exit_id)`.
+        self._completion_exit: tuple[str, str] | None = None
 
     def now(self) -> float:
         """This lane's clock, which is the authority for WHEN.
@@ -664,10 +675,17 @@ class LaneController:
             # words the `decision` event above carries and the close will
             # carry as `local_decision`; a car this lane made no money
             # decision about hands `None`, which takes down whatever the
-            # reader was showing for the car before it.
-            self.show_reader(
+            # reader was showing for the car before it. A CAR WHOSE CASE HAS
+            # HANDED ITS FEE TO THE READER leaves the reader alone: the
+            # platform's PaymentIntent is on it, and a cart or a clear sent
+            # now would take that off.
+            record = (
                 decision.exit_pricing.to_detail() if decision.exit_pricing is not None else None
             )
+            if case is None or case.sent_at is None:
+                self.show_reader(record)
+            else:
+                self._note_exit_screen(record)
 
         if case is not None and not decision.should_vend:
             # WAITING: the barrier stays down, and the case is moved on at the
@@ -677,10 +695,11 @@ class LaneController:
             return decision
 
         if decision.should_vend:
-            if case is not None and self.exits is not None:
-                exit_case.send_receipt(case, self.exits, self.exit_display)
             self.vend.vend(decision.reason)
             self.events.record("vended", lane, reason=decision.reason)
+            if case is not None and self.exits is not None:
+                # After the barrier: the receipt is a network call.
+                exit_case.send_receipt(case, self.exits, self.exit_display)
 
             # The vend is where the ticket comes out, and the ticket is NOT the
             # entry. What goes on the queue here is a PENDING entry; the loops
@@ -806,9 +825,15 @@ class LaneController:
         """
         lane = self.config.lane_id
         # A PERSON AT THE LANE DECIDED: a car whose exit case was waiting is
-        # theirs now, and the lane's turn will not open for it as well.
+        # theirs now, and the lane's turn will not open for it as well. THE
+        # DECISION IS CLAIMED HERE, under the lock the case's own opening
+        # takes: the route checked `completed` without it, and a case that
+        # settled in between has already moved the barrier for this car.
         with self._exit_lock:
-            self._exit_case = None
+            if self.last_decision_completed_at is not None:
+                raise DecisionAlreadyCompleted(self.last_decision_completed_at)
+            self.last_decision_completed_at = to_iso(self._clock())
+            case, self._exit_case = self._exit_case, None
         # FIRST, and before anything moves. Held on the controller as well as
         # recorded, because the record is what an operator reads and this is
         # what the session action is built from.
@@ -824,8 +849,15 @@ class LaneController:
         # without consuming and nothing can consume without vending.
         arming = self._take_held_arming()
         self._completion_arming = (at, arming) if arming else None
+        # The case the person took is named on this car's close
+        # (`take_completion_exit_id`), and its payment comes off the reader.
+        self._completion_exit = (at, case.exit_id) if case is not None and case.exit_id else None
         self.last_decision_completed_at = at
         self.begin_transit(identity, at)
+        if case is not None:
+            exit_case.cancel_on_reader(case, self.exits)
+            if self.exit_display is not None:
+                self.exit_display.show_exit(None)
 
         # AND THE RECORD LEAVES THE BOX, exactly as `handle_arrival` ends.
         # `EventQueue.record` appends to two in-memory deques and nothing else;
@@ -927,6 +959,8 @@ class LaneController:
             case.outcome = exit_case.advance(
                 case, self.exits, self.exit_display, now=self._clock()
             )
+            if case.sent_at is not None:
+                self._reader_case = case.exit_id
         return case.outcome
 
     def _advance_exit_case(self, case: exit_case.ExitCase) -> None:
@@ -944,9 +978,15 @@ class LaneController:
             need = "unanswered"
         elif case.refused and case.needs != exit_case.NEEDS_DRIVER_WORD:
             need = "refused"
+        elif (
+            case.needs == exit_case.NEEDS_PAYMENT
+            and case.attempts >= exit_case.EXIT_PAY_ATTEMPTS
+        ):
+            need = exit_case.NEEDS_PAY_ATTEMPTS
         else:
             need = case.needs
-        if need in ("unanswered", "refused", exit_case.NEEDS_PERSON) and need != case.told:
+        told = ("unanswered", "refused", exit_case.NEEDS_PERSON, exit_case.NEEDS_PAY_ATTEMPTS)
+        if need in told and need != case.told:
             case.told = need
             self.events.record(
                 "fallback_needs_human",
@@ -956,6 +996,11 @@ class LaneController:
                 exit_id=case.exit_id,
                 needs=need,
                 **({"refused": case.refused} if need == "refused" else {}),
+                **(
+                    {"attempts": case.attempts}
+                    if need == exit_case.NEEDS_PAY_ATTEMPTS
+                    else {}
+                ),
             )
             self.deliver()
 
@@ -967,12 +1012,13 @@ class LaneController:
                 return
             self._exit_case = None
             self.last_decision_completed_at = to_iso(self._clock())
-        if self.exits is not None:
-            exit_case.send_receipt(case, self.exits, self.exit_display)
         lane = self.config.lane_id
         reason = f"the exit is settled: {case.why}"
         self.vend.vend(reason)
         self.events.record("vended", lane, reason=reason, exit_id=case.exit_id)
+        if self.exits is not None:
+            # After the barrier: the receipt is a network call.
+            exit_case.send_receipt(case, self.exits, self.exit_display)
         if self.exit_display is not None:
             self.exit_display.show_exit(None)
         self._settle_transit(
@@ -982,13 +1028,21 @@ class LaneController:
 
     def observe_exit_case(self) -> None:
         """On an idle turn: the waiting case, while its car is on the arming
-        loop. A car that has left leaves its case to a person."""
+        loop. A car that has left -- the loop clear for `EXIT_LEFT_SECONDS`
+        -- leaves its case to a person. While the loop reads clear and that
+        time has not passed, the case is not moved on: nothing opens for a
+        car the loop does not see."""
         case = self._exit_case
         if case is None:
             return
         if not self.loop.is_occupied():
-            self._leave_exit_case("the car left the exit before it was settled")
+            now = self._clock()
+            if case.clear_since is None:
+                case.clear_since = now
+            if now - case.clear_since >= exit_case.EXIT_LEFT_SECONDS:
+                self._leave_exit_case("the car left the exit before it was settled")
             return
+        case.clear_since = None
         self._advance_exit_case(case)
 
     def _leave_exit_case(self, reason: str) -> None:
@@ -1008,7 +1062,16 @@ class LaneController:
         )
         if self.exit_display is not None:
             self.exit_display.show_exit(None)
-        self.show_reader(None)
+        # A case that handed its fee to the reader has its payment taken off
+        # through the platform, before the next car's case can be sent to it;
+        # the lane drives the reader only when it never did.
+        if case.sent_at is None:
+            self.show_reader(None)
+        else:
+            self._note_exit_screen(None)
+            exit_case.cancel_on_reader(case, self.exits)
+            if self._reader_case == case.exit_id:
+                self._reader_case = None
         self.deliver()
 
     # ------------------------------------------------------------------
@@ -1962,6 +2025,15 @@ class LaneController:
                           self.config.lane_id)
             return False
 
+    def take_completion_exit_id(self, at: str) -> str | None:
+        """The exit case a person's completion took, for the close of the
+        transit that completion began at `at` -- taken once, like the arming
+        read. The assisted vend's settle hands it to `resolve_transit`."""
+        held, self._completion_exit = self._completion_exit, None
+        if held is None or held[0] != at:
+            return None
+        return held[1]
+
     def take_completion_arming(self, at: str) -> list:
         """The arming read of the car a person's completion let in, for the
         transit that completion began at `at` -- taken once (`complete_vend`
@@ -2114,8 +2186,14 @@ class LaneController:
             self.cache.drop_stay(exit_pricing.session_id)
         # The car this fee belonged to has gone through: the reader shows
         # nothing until the next exit decision, so the next driver never
-        # reads this one's fee.
-        self.show_reader(None)
+        # reads this one's fee. A car whose case handed its fee to the reader
+        # had nothing of the lane's on it, and a clear sent late would land
+        # on the next car's PaymentIntent.
+        if exit_id is not None and exit_id == self._reader_case:
+            self._reader_case = None
+            self._note_exit_screen(None)
+        else:
+            self.show_reader(None)
 
     def _reader_shown(self, exit_pricing) -> dict:
         """`{"reader_shown": ...}` from a screen that keeps what it showed, or {}."""
@@ -2125,6 +2203,17 @@ class LaneController:
             return {}
         shown = seal(session_id)
         return {"reader_shown": shown} if shown is not None else {}
+
+    def _note_exit_screen(self, record: dict | None) -> None:
+        """What this lane decided to put in front of the driver, for the read
+        contract, whether or not a reader is fitted or driven: an exit with a
+        display and no reader still has a fee. Alone -- the reader left
+        alone -- for a car whose exit case handed its fee to the reader."""
+        self.exit_screen = (
+            (self.last_decision_at, record)
+            if record is not None and self.last_decision_at is not None
+            else None
+        )
 
     def set_reader_hand(self, hand: Callable[[dict | None], None] | None) -> None:
         """Install who presents to the reader -- `LaneRunner` hands its own
@@ -2141,14 +2230,7 @@ class LaneController:
         a reader that raises costs its own screen and nothing else: the vend
         and the record go on without it.
         """
-        # RECORDED FIRST, and whether or not a reader is fitted: what goes on
-        # the read contract is what this lane decided to put in front of the
-        # driver, and an exit with a display and no reader still has a fee.
-        self.exit_screen = (
-            (self.last_decision_at, record)
-            if record is not None and self.last_decision_at is not None
-            else None
-        )
+        self._note_exit_screen(record)
         if self.reader is None:
             return
         if self._reader_hand is not None:

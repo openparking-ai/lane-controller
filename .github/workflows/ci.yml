@@ -310,8 +310,15 @@ jobs:
           # opened before its pictures, the fee sent every turn or never again
           # after a decline, a car that left let out, a person asked for every
           # turn, the barrier opened twice, the close not naming the case, the
-          # receipt never sent -- and requires the exit-case suite to fail each
-          # time.
+          # receipt never sent; the reader driven after the case's fee is on
+          # it, a dropped case's payment left on the reader, a person's close
+          # not naming the case, a repeated decline or a no-tap timeout never
+          # re-sent, attempts never counted, a busy reader taken as a refusal,
+          # a person's vend racing a settled case, an entry time with no
+          # offset, a refusal or a truthy `settled` or another case's answer
+          # taken as settled, the case opening after a person took it, the
+          # receipt before the barrier, one clear loop sample dropping the
+          # case -- and requires the exit-case suite to fail each time.
           - exit_settled
     steps:
       - uses: actions/checkout@v4

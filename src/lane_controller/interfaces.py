@@ -438,11 +438,17 @@ class ExitDisplay(Protocol):
 
     def show_exit(self, view: dict | None) -> None:
         """What to show: `{"needs", "fee", "refused"?}` from the case, or None
-        to clear the screen once the car has gone."""
+        to clear the screen once the car has gone. `fee` is the platform's
+        fee object as it answered it (`fee_minor`, `currency`, `breakdown`,
+        ...), or None."""
         ...
 
     def entry_time(self) -> str | None:
-        """The entry the driver gave, ISO 8601 with an offset, or None."""
+        """The entry the driver gave, ISO 8601 WITH A TIMEZONE OFFSET, or None.
+        A time without an offset is refused at the lane and never sent
+        (`entry_time_without_offset`): the platform would read it on its own
+        clock. In the hour the clocks go back a local time happens twice, and
+        the offset the display sends is what decides which one it was."""
         ...
 
     def receipt_phone(self) -> str | None:
