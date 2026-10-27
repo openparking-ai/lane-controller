@@ -209,6 +209,11 @@ def _register_heads(module: str, register: dict) -> dict[str, dict]:
     return {a.get("agreement"): a for a in register.get("agreements") or [] if a.get("agreement")}
 
 
+#: The default ceiling on a pass-only garage's registers kept past the cache's
+#: bound while the platform cannot be reached (`config` publishes it as
+#: `[lane] pass_registers_offline_days`, 7).
+PASS_REGISTERS_OFFLINE_S = 7 * 86_400.0
+
 #: Full, in basis points: how full a garage can be, and no fuller.
 FULL_BP = 10_000
 
@@ -335,10 +340,20 @@ class DecisionCache:
     number and not two.
     """
 
-    def __init__(self, *, max_age_seconds: float = 86_400.0, store=None) -> None:
+    def __init__(
+        self,
+        *,
+        max_age_seconds: float = 86_400.0,
+        store=None,
+        pass_registers_offline_s: float = PASS_REGISTERS_OFFLINE_S,
+    ) -> None:
         self._rules: dict[str, Rule] = {}
         self._refreshed_at: float | None = None
         self._max_age = max_age_seconds
+        #: THE CEILING on a pass-only garage's registers kept past the bound:
+        #: how long after the platform last confirmed them they may still be
+        #: held while it cannot be reached (`[lane] pass_registers_offline_days`).
+        self._registers_offline_max = pass_registers_offline_s
         #: `durable.DurableStore`, or None. Anything with `read() -> dict|None`,
         #: `write(dict)` and `wipe()`.
         self._store = store
@@ -409,6 +424,9 @@ class DecisionCache:
         #: pass-only garage (`clear`): kept while the lane cannot reach the
         #: platform, and wiped by the first rules read that answers.
         self._registers_past_bound = False
+        #: When the platform last confirmed the registers kept past the bound:
+        #: the refresh they came with. The ceiling counts from here.
+        self._registers_confirmed_at: float | None = None
         # THE TWO INDEXES THE EXIT READS ON THE BARRIER'S PATH, rebuilt whole
         # on every change so the read is one dict lookup and never a scan:
         # identity -> the register rows that name it, per module; identity ->
@@ -464,19 +482,42 @@ class DecisionCache:
             "board": self.board,
             "banned": self.banned,
             "registers_past_bound": self._registers_past_bound,
+            "registers_confirmed_at": self._registers_confirmed_at,
         }
 
     def _persist(self) -> None:
         if self._store is not None:
             self._store.write(self.state())
 
-    def _take_registers(self, state: dict) -> None:
-        """A stored state's registers, and the garage's day they are read on."""
+    def _take_registers(self, state: dict, *, confirmed_at) -> None:
+        """A stored state's registers, the garage's day they are read on, and
+        when the platform last confirmed them."""
         self.entitlements = dict(state.get("entitlements") or {})
         self.entitlements_complete = state.get("entitlements_complete")
         self.timezone = state.get("timezone")
         self._registers_past_bound = True
+        self._registers_confirmed_at = float(confirmed_at) if confirmed_at is not None else None
         self._reindex_coverage()
+
+    def wipe_registers(self) -> bool:
+        """Hold no register: memory and disk. For a platform that has refused
+        this lane outright, and for registers kept past the ceiling. True if
+        any was held."""
+        held = bool(self.entitlements)
+        self.entitlements = {}
+        self.entitlements_complete = None
+        self._registers_past_bound = False
+        self._registers_confirmed_at = None
+        self._coverage_index = {}
+        self._persist()
+        return held
+
+    def _registers_past_ceiling(self, current: float) -> bool:
+        """Whether registers kept past the bound have outlived the ceiling."""
+        return self._registers_past_bound and (
+            self._registers_confirmed_at is None
+            or current - self._registers_confirmed_at > self._registers_offline_max
+        )
 
     def _take_settings(self, state: dict) -> None:
         """The garage's entry settings from a stored state, each through the
@@ -498,20 +539,24 @@ class DecisionCache:
         if not state:
             return False
         self._take_settings(state)
+        current = time.time() if now is None else now
         if state.get("registers_past_bound"):
             # A pass-only garage's registers, kept past the bound while the
-            # platform could not be reached (`clear`): still held.
-            self._take_registers(state)
+            # platform could not be reached (`clear`): still held -- unless
+            # they have outlived the ceiling while the process was down.
+            self._take_registers(state, confirmed_at=state.get("registers_confirmed_at"))
+            if self._registers_past_ceiling(current):
+                self.wipe_registers()
         if state.get("refreshed_at") is None:
             return False
-        current = time.time() if now is None else now
         if (current - float(state["refreshed_at"])) > self._max_age:
             # Personal data past its bound is not held, and not even read
             # back into memory on the way to being discarded -- except a
-            # pass-only garage's registers, which `clear` keeps.
+            # pass-only garage's registers, which `clear` keeps, inside the
+            # ceiling.
             if garage_admits(self) == ADMITS_PASSES_ONLY:
-                self._take_registers(state)
-            self.clear()
+                self._take_registers(state, confirmed_at=state["refreshed_at"])
+            self.clear(now=current)
             return False
         self._rules = {
             r["plate"].upper(): Rule(
@@ -540,14 +585,17 @@ class DecisionCache:
         self._reindex_stays()
         return True
 
-    def clear(self) -> None:
+    def clear(self, *, now: float | None = None) -> None:
         """Hold no personal data: memory and disk. Stale, no rules, no
         registers, no stays, no banned list -- the empty cache this object
         started as, with two exceptions.
 
         A PASS-ONLY GARAGE'S REGISTERS ARE KEPT while the platform cannot be
         reached (and the garage's day they are read on), until the first rules
-        read that answers wipes them (`load_payload`) -- see below.
+        read that answers wipes them (`load_payload`), a platform that refuses
+        this lane outright wipes them (`sync.sync_rules`), or they reach the
+        CEILING -- `pass_registers_offline_s` after the platform last confirmed
+        them -- whichever comes first.
 
         THE GARAGE'S ENTRY SETTINGS ARE KEPT: whether it takes transients
         (`transient_available`), its default for a car with no rule, and this
@@ -559,13 +607,22 @@ class DecisionCache:
         `full` would reopen itself. They are written back to the store alone,
         so a restart finds them too; the platform's next answer replaces them
         as it always did."""
+        current = time.time() if now is None else now
+        confirmed = (
+            self._registers_confirmed_at if self._registers_past_bound else self._refreshed_at
+        )
         self._rules = {}
         self._refreshed_at = None
         self.plans = []
         self.space_class = None
         self.spaces = None
         self.tax_sets = []
-        keep_registers = garage_admits(self) == ADMITS_PASSES_ONLY and bool(self.entitlements)
+        keep_registers = (
+            garage_admits(self) == ADMITS_PASSES_ONLY
+            and bool(self.entitlements)
+            and confirmed is not None
+            and current - confirmed <= self._registers_offline_max
+        )
         if keep_registers:
             # A PASS-ONLY GARAGE'S REGISTERS ARE KEPT while the platform cannot
             # be reached: at such a garage they are the only way a car gets in,
@@ -573,10 +630,12 @@ class DecisionCache:
             # person. They are wiped by the first rules read that answers
             # (`load_payload`), which replaces them with the platform's.
             self._registers_past_bound = True
+            self._registers_confirmed_at = confirmed
         else:
             self.entitlements = {}
             self.entitlements_complete = None
             self._registers_past_bound = False
+            self._registers_confirmed_at = None
         with self._stays_lock:
             self.stays = {}
             self._stay_index = {}
@@ -608,12 +667,17 @@ class DecisionCache:
         for every car; what the wipe costs it is the registers, so a car a
         register covered is turned away at a lane closed `full` until the
         platform answers again."""
+        current = time.time() if now is None else now
+        if self._registers_past_ceiling(current):
+            # THE CEILING on a pass-only garage's kept registers: past it they
+            # go too, and a car whose pass cannot be confirmed goes to a person.
+            self.wipe_registers()
+            return True
         if self._refreshed_at is None:
             return False
-        current = time.time() if now is None else now
         if (current - self._refreshed_at) <= self._max_age:
             return False
-        self.clear()
+        self.clear(now=current)
         return True
 
     def load_payload(self, payload: dict, *, now: float | None = None) -> None:
@@ -633,6 +697,7 @@ class DecisionCache:
             self.entitlements = {}
             self.entitlements_complete = None
             self._registers_past_bound = False
+            self._registers_confirmed_at = None
         rules = [
             Rule(plate=r["plate"], allow=bool(r.get("allow", False)), rate_plan=r.get("rate_plan"))
             for r in payload.get("plate_rules", [])
@@ -1038,12 +1103,13 @@ def _decide_entry(
 
     A MONTHLY / PASS-ONLY GARAGE -- the interim rule until a registration QR
     can be scanned at the lane (Phase 1b):
-      1. no register held at all: no pass can be confirmed here -- a person;
-      2. a plate nobody could read, or read below the confidence: its pass
+      1. a plate nobody could read, or read below the confidence: its pass
          cannot be confirmed -- a person, the fallback naming why;
-      3. a car a register covers today: open, full or not;
-      4. full: every other car is DENIED, the gate shut;
-      5. an owner's rule, as above;
+      2. full: a car a register covers today opens; with no register held, a
+         person; every other car is DENIED, the gate shut;
+      3. an owner's rule, as above -- before the registers, as it always was;
+      4. no register held at all: no pass can be confirmed here -- a person;
+      5. a car a register covers today: open;
       6. every other car is DENIED (`REASON_NOT_REGISTERED`, the QR seam).
     """
     read = plate_read(identity, confidence_threshold)
@@ -1056,30 +1122,43 @@ def _decide_entry(
     rule = cache.lookup(read) if read and not stale else None
 
     if admits == ADMITS_PASSES_ONLY:
-        if not registers_held(cache):
-            return Decision(
-                outcome=Outcome.FALLBACK,
-                reason="pass or monthly only; no register is held here, so no pass can be "
-                "confirmed",
-                identity=identity,
-                fallback=Fallback.STALE_RULES,
-            )
+        no_register = Decision(
+            outcome=Outcome.FALLBACK,
+            reason="pass or monthly only; the pass could not be confirmed: no register "
+            "is held here",
+            identity=identity,
+            fallback=Fallback.STALE_RULES,
+        )
         if read is None:
             return _not_confirmed(identity, confidence_threshold)
+        if full:
+            # Full first, as it always came: a covered car still gets in.
+            if covered:
+                return Decision(
+                    outcome=Outcome.ALLOW,
+                    reason="this lane is closed full; a pass or monthly register covers this "
+                    "car",
+                    identity=identity,
+                )
+            if not registers_held(cache):
+                return no_register
+            return Decision(
+                outcome=Outcome.DENY,
+                reason="this lane is closed full; no pass or monthly register covers this car",
+                identity=identity,
+            )
+        # THE OWNER'S RULE FOR THIS PLATE BEFORE THE REGISTERS, in the order it
+        # always had: a plate the owner denied stays out even with a pass.
+        if rule is not None:
+            return _by_rule(rule, identity)
+        if not registers_held(cache):
+            return no_register
         if covered:
             return Decision(
                 outcome=Outcome.ALLOW,
                 reason="pass or monthly only; a pass or monthly register covers this car",
                 identity=identity,
             )
-        if full:
-            return Decision(
-                outcome=Outcome.DENY,
-                reason="this lane is closed full; no pass or monthly register covers this car",
-                identity=identity,
-            )
-        if rule is not None:
-            return _by_rule(rule, identity)
         # THE QR SEAM: see `REASON_NOT_REGISTERED`.
         return Decision(outcome=Outcome.DENY, reason=REASON_NOT_REGISTERED, identity=identity)
 

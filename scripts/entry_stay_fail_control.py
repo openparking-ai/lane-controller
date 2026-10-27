@@ -48,6 +48,15 @@ and the review's fixes:
   assisted_arming_dropped       a car a person lets in keeps none of its arming read
   refused_arming_dropped        a refused car that drives in keeps none of its arming read
   refused_arming_any_car        a refused car's arming read goes with another car's stay
+
+and the second review's:
+
+  refusal_keeps_registers       a platform that refuses the lane leaves the registers held
+  no_registers_ceiling          a pass-only garage's kept registers have no ceiling
+  refused_arming_no_age         a refused car's pictures wait for a crossing for ever
+  refused_arming_unsure_ignored two different unsure reads are taken for one car
+  refused_arming_look_ignored   the appearance descriptors are not compared
+  pass_only_cover_before_rule   a pass opens a plate the owner denied by rule
 """
 
 from __future__ import annotations
@@ -95,6 +104,12 @@ BREAKAGES = [
     ("assisted_arming_dropped", "a car a person lets in keeps none of its arming read"),
     ("refused_arming_dropped", "a refused car that drives in keeps none of its arming read"),
     ("refused_arming_any_car", "a refused car's arming read goes with another car's stay"),
+    ("refusal_keeps_registers", "a platform that refuses the lane leaves the registers held"),
+    ("no_registers_ceiling", "a pass-only garage's kept registers have no ceiling"),
+    ("refused_arming_no_age", "a refused car's pictures wait for a crossing for ever"),
+    ("refused_arming_unsure_ignored", "two different unsure reads are taken for one car"),
+    ("refused_arming_look_ignored", "the appearance descriptors are not compared"),
+    ("pass_only_cover_before_rule", "a pass opens a plate the owner denied by rule"),
 ]
 
 

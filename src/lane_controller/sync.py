@@ -154,6 +154,12 @@ def to_iso(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
 
 
+#: The answers to a rules read that refuse THIS LANE, not the request: an
+#: unknown or revoked device token (401), a token for something else (403), a
+#: lane or garage the platform no longer has (404).
+LANE_REFUSED = frozenset({401, 403, 404})
+
+
 def sync_rules(client: PlatformClient, cache: DecisionCache) -> dict | None:
     """Refresh the cache from the platform. Returns the payload, or None if offline.
 
@@ -166,6 +172,20 @@ def sync_rules(client: PlatformClient, cache: DecisionCache) -> dict | None:
     except PlatformUnreachable as err:
         log.warning("rule sync failed, keeping the cache we have: %s", err)
         return None
+    except PlatformRejected as err:
+        if err.status in LANE_REFUSED:
+            # THE PLATFORM REFUSED THIS LANE OUTRIGHT -- its token unknown or
+            # revoked, the lane or its garage gone. The registers it handed
+            # this lane are personal data the lane holds for nobody now: they
+            # go at once, from memory and disk, whatever the bound (a pass-only
+            # garage keeps them through an OUTAGE, never through a refusal).
+            if cache.wipe_registers():
+                log.error(
+                    "the platform refused this lane's rules read (HTTP %s); the pass and "
+                    "monthly registers it held were wiped",
+                    err.status,
+                )
+        raise
 
     cache.load_payload(payload)
     log.info(

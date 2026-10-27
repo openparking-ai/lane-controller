@@ -29,6 +29,19 @@ confidence_threshold = 0.85
 # back.
 rules_max_age_seconds = 86400
 
+# A pass-only garage's registers outlive the age above while the platform
+# cannot be reached -- there they are the only way a car gets in -- but not
+# for ever: this many days after the platform last confirmed them they go too,
+# and a car whose pass cannot be confirmed goes to a person. A platform that
+# refuses this lane outright (401, 403, 404) wipes them at once.
+pass_registers_offline_days = 7
+
+# How long a refused car's arming pictures wait for a crossing that may be
+# that car driving in anyway. Past it -- or when the plates, the reads below
+# the confidence or the appearance descriptors say it is another car, or the
+# comparison could not be made -- they go with no stay.
+refused_arming_seconds = 120
+
 # Where events are reported and the cache is refreshed from, when connectivity
 # allows. Never on the hot path. With this set, `serve` REQUIRES the device
 # token the platform issued for this lane, in the file `--platform-token-file`

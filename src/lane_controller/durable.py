@@ -41,7 +41,10 @@ every car at a garage that takes transients, and still keeps a `full` lane
 shut (`DecisionCache.clear`). AND A PASS-ONLY GARAGE'S REGISTERS, which are
 personal data, outlive it too while the platform cannot be reached: there they
 are the only way a car gets in. The first rules read that answers wipes them
-and holds only what it carries.
+and holds only what it carries; a platform that refuses the lane outright
+(401, 403, 404) wipes them at once; and past `[lane]
+pass_registers_offline_days` after the platform last confirmed them they go
+anyway, on a restart too.
 
 THE DIRECTORY IS THE PROCESS'S OWN, OR THE STORE REFUSES TO OPEN. A cache row
 is `plate -> allow`: a line somebody wrote into this file by hand OPENS THE

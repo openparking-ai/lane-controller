@@ -67,6 +67,7 @@ from .decision import (
     Outcome,
     closed_to,
     decide,
+    normalise_identity,
     plate_read,
 )
 from .events import EventQueue, LaneEvent
@@ -505,7 +506,7 @@ class LaneController:
         #: The held vend (its `transit_since`) whose late crossing has already
         #: been taken for its car, so a second crossing after it is not.
         self._late_taken_for: str | None = None
-        #: A refused car's arming read, `(decision_at, frames)`, held until the
+        #: A refused car's arming read, `(decision_at, frames, held_at)`, held until the
         #: next arrival (`_keep_refused_arming`); and the one a person's
         #: completion set aside for its transit, `(at, frames)`
         #: (`take_completion_arming`).
@@ -1675,7 +1676,7 @@ class LaneController:
         (`take_completion_arming`) or drives in anyway (`_refused_arming_for`),
         the pictures it was identified from go with its stay."""
         self._held_arming = (
-            (self.last_decision_at, list(frames))
+            (self.last_decision_at, list(frames), self._clock())
             if self.config.direction == "entry"
             and not decision.should_vend
             and decision.outcome is not Outcome.NO_VEHICLE
@@ -1691,22 +1692,57 @@ class LaneController:
 
     def _refused_arming_for(self, identity) -> list:
         """The arming read of the car this lane last refused, for a crossing
-        that may be that car driving in anyway: no arrival since, the refusal
-        not completed by anybody, and no plate read on both that says they are
-        two cars. Taken once. Not a binding -- the lane cannot prove whose
-        crossing this was -- which is why a contradicting plate keeps them out."""
+        that may be that car driving in anyway. Taken once, and only when
+        nothing says it is another car:
+
+          * no arrival since, and the refusal not completed by anybody;
+          * not older than `[lane] refused_arming_seconds` (120 s by default):
+            a car that drives in after a refusal does it then, not hours later;
+          * no plate text on both reads that differs -- read with confidence
+            or below it: two different unsure reads are two cars as much as
+            two different sure ones;
+          * appearance descriptors on both that MATCH, by the identity
+            service's comparison (`banned_matcher`), when both reads have one.
+
+        WHEN IN DOUBT, NOTHING: a comparison that cannot be made -- descriptors
+        on both and no comparison wired, or one that fails -- attaches nothing.
+        Not a binding: the lane cannot prove whose crossing this was."""
         if (
             self._held_arming is None
             or self.last_decision is None
             or self.last_decision.should_vend
             or self.last_decision_completed_at is not None
+            or self._held_arming[0] != self.last_decision_at
         ):
             return []
-        refused = plate_read(self.last_decision.identity, self.config.confidence_threshold)
-        crossing = plate_read(identity, self.config.confidence_threshold)
-        if refused and crossing and refused.upper() != crossing.upper():
+        if self._clock() - self._held_arming[2] > self.config.refused_arming_seconds:
+            return []
+        refused = self.last_decision.identity
+        if refused.plate and identity.plate and (
+            normalise_identity(refused.plate) != normalise_identity(identity.plate)
+        ):
+            return []
+        if refused.descriptor and identity.descriptor and not self._same_look(refused, identity):
             return []
         return self._take_held_arming()
+
+    def _same_look(self, refused, identity) -> bool:
+        """Whether two reads' appearance descriptors are one car's, by the
+        identity service's comparison -- the banned list's. False when it is
+        not wired or cannot answer: in doubt, they are not."""
+        if self.banned_matcher is None:
+            return False
+        try:
+            return (
+                self.banned_matcher.match(
+                    identity.descriptor, [{"id": "refused", "descriptor": refused.descriptor}]
+                )
+                == "refused"
+            )
+        except Exception:  # noqa: BLE001 -- a comparison that fails is a doubt
+            log.exception("lane %s: comparing a crossing with the refused car failed",
+                          self.config.lane_id)
+            return False
 
     def take_completion_arming(self, at: str) -> list:
         """The arming read of the car a person's completion let in, for the

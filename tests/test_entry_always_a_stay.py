@@ -159,6 +159,8 @@ def a_lane(
     frames_per_read=2,
     arrivals=1,
     cache=None,
+    clock=None,
+    matcher="exact",
 ):
     """An entry lane at a garage that has said what it takes, wired to the
     simulated seams and to a FakePlatform, on the lane's clock at NOW."""
@@ -199,8 +201,8 @@ def a_lane(
         closing_loops=ScriptedClosingLoops(list(crossings)) if closing_loops else None,
         cache=cache,
         events=EventQueue(PlatformTransport(platform), store=store),
-        banned_matcher=ExactBannedMatcher(),
-        clock=lambda: NOW,
+        banned_matcher=ExactBannedMatcher() if matcher == "exact" else matcher,
+        clock=clock or (lambda: NOW),
     )
     return controller, vend, platform
 
@@ -237,9 +239,11 @@ def test_a_refused_car_that_drove_in_is_a_stay_flagged_as_no_open_command_let_it
     assert len(pictures_of(platform, opened["event_id"])) == 2
 
 
-@pytest.mark.parametrize("crossing", [UNREAD, LOW, ENGINE_DOWN],
+@pytest.mark.parametrize(("crossing", "arming"), [(UNREAD, 2), (LOW, 0), (ENGINE_DOWN, 2)],
                          ids=["nothing read", "below the confidence", "engine down"])
-def test_a_car_nobody_could_read_through_the_gate_is_a_stay_with_an_unreadable_plate(crossing):
+def test_a_car_nobody_could_read_through_the_gate_is_a_stay_with_an_unreadable_plate(
+    crossing, arming
+):
     """The plate unreadable is a value of the car's identity, never a reason
     to leave the car out of the record -- and a read below the lane's
     confidence is unreadable, never the stay's plate."""
@@ -251,8 +255,10 @@ def test_a_car_nobody_could_read_through_the_gate_is_a_stay_with_an_unreadable_p
     assert opened["no_open_command"] is True and opened["entry_confirmation"] == CONFIRMED
     assert opened["tailgater"] is False, "a car nobody could read is never a tailgater"
     assert opened["descriptor"] == crossing.descriptor, "what was seen goes with it"
-    # The refused car's arming read (two frames), then the closing loop's two.
-    assert len(pictures_of(platform, opened["event_id"])) == 4
+    # The closing loop's two, and the refused car's arming read (two frames)
+    # when nothing says it is another car -- the read below the confidence
+    # has a descriptor that does not match the refused car's, so not there.
+    assert len(pictures_of(platform, opened["event_id"])) == 2 + arming
 
 
 def test_the_second_car_through_one_opening_gets_its_own_stay():
@@ -984,3 +990,187 @@ def test_a_crossing_whose_plate_says_it_is_another_car_does_not_take_them():
     [opened] = platform.opened
     kept = {p["image"] for p in pictures_of(platform, opened["event_id"])}
     assert not set(IMAGES[:2]) & kept
+
+
+# ---------------------------------------------------------------------------
+# Round 2 -- the registers' two ends, the refused car's pictures, the rule first
+# ---------------------------------------------------------------------------
+
+
+def kept_past_the_bound(path, *, offline_s=7 * 86_400.0):
+    """A pass-only garage's lane, synced, then a day past its bound with the
+    platform away: its registers kept."""
+    platform = a_pass_only_platform()
+    cache = DecisionCache(max_age_seconds=3600, store=DurableStore(path),
+                          pass_registers_offline_s=offline_s)
+    sync_rules(platform, cache)
+    cache._refreshed_at -= 7200
+    assert cache.expire_if_past_bound() is True
+    assert "garage_pass" in cache.entitlements, "the premise: kept through the outage"
+    return platform, cache
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_a_platform_that_refuses_this_lane_wipes_the_registers_at_once(tmp_path, status):
+    """A revoked device token answers 401 for ever: the registers it handed the
+    lane are held for nobody, and go now -- memory and disk."""
+    path = narrow(tmp_path) / "cache.sqlite"
+    platform, cache = kept_past_the_bound(path)
+
+    def refused():
+        raise PlatformRejected(status, "this lane is not one the platform knows")
+
+    platform.get_rules = refused
+    with pytest.raises(PlatformRejected):
+        sync_rules(platform, cache)
+    assert cache.entitlements == {}
+    assert DecisionCache(max_age_seconds=3600, store=DurableStore(path)).entitlements == {}, (
+        "the file still holds them"
+    )
+    controller, _, _ = a_lane([HOLDER_SEEN], cache=cache)
+    assert controller.run_once().outcome is Outcome.FALLBACK, "to a person"
+
+
+@pytest.mark.parametrize("refusal", ["unreachable", 409])
+def test_the_control_an_outage_or_another_refusal_keeps_them(tmp_path, refusal):
+    platform, cache = kept_past_the_bound(narrow(tmp_path) / "cache.sqlite")
+    if refusal == "unreachable":
+        platform.online = False
+        assert sync_rules(platform, cache) is None
+    else:
+        def conflict():
+            raise PlatformRejected(refusal, "not about this lane")
+
+        platform.get_rules = conflict
+        with pytest.raises(PlatformRejected):
+            sync_rules(platform, cache)
+    assert "garage_pass" in cache.entitlements
+
+
+def test_past_the_ceiling_the_registers_go_and_a_car_goes_to_a_person(tmp_path):
+    path = narrow(tmp_path) / "cache.sqlite"
+    platform, cache = kept_past_the_bound(path)
+    confirmed = cache._registers_confirmed_at
+    assert cache.expire_if_past_bound(now=confirmed + 7 * 86_400 - 1) is False
+    assert "garage_pass" in cache.entitlements, "inside the ceiling: kept"
+    assert cache.expire_if_past_bound(now=confirmed + 7 * 86_400 + 1) is True
+    assert cache.entitlements == {}
+    assert DecisionCache(max_age_seconds=3600, store=DurableStore(path)).entitlements == {}
+    controller, _, _ = a_lane([HOLDER_SEEN], cache=cache)
+    decision = controller.run_once()
+    assert decision.outcome is Outcome.FALLBACK
+    assert "the pass could not be confirmed" in decision.reason
+
+
+def test_a_restart_from_disk_holds_them_inside_the_ceiling_and_not_past_it(tmp_path):
+    path = narrow(tmp_path) / "cache.sqlite"
+    kept_past_the_bound(path, offline_s=10_000)  # confirmed two hours ago
+    inside = DecisionCache(max_age_seconds=3600, store=DurableStore(path),
+                           pass_registers_offline_s=10_000)
+    assert "garage_pass" in inside.entitlements
+    past = DecisionCache(max_age_seconds=3600, store=DurableStore(path),
+                         pass_registers_offline_s=3_600)
+    assert past.entitlements == {}, "restored past the ceiling"
+    assert DecisionCache(max_age_seconds=3600, store=DurableStore(path)).entitlements == {}, (
+        "and the file still holds them"
+    )
+
+
+def test_a_restart_after_the_bound_passed_while_the_process_was_down(tmp_path):
+    path = narrow(tmp_path) / "cache.sqlite"
+    platform = a_pass_only_platform()
+    stopped = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    stopped.load_payload(platform.get_rules(), now=time.time() - 7200)
+    restarted = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    assert "garage_pass" in restarted.entitlements and restarted.stays == {}
+    short = DecisionCache(max_age_seconds=3600, store=DurableStore(path),
+                          pass_registers_offline_s=3_600)
+    assert short.entitlements == {}
+
+
+def test_serve_wires_the_two_settings():
+    from lane_controller import cli
+
+    base = dict(lane_id="l", site_id="s", camera=CameraConfig(camera_id="c", rtsp_url=""),
+                gate=GateConfig())
+    wired = cli.wire_lane(LaneConfig(**base, pass_registers_offline_days=2), platform=None)
+    assert wired.controller.cache._registers_offline_max == 2 * 86_400
+    assert LaneConfig(**base).refused_arming_seconds == 120
+    for name in ("pass_registers_offline_days", "refused_arming_seconds"):
+        with pytest.raises(ValueError, match=name):
+            LaneConfig(**base, **{name: 0})
+
+
+class Clock:
+    def __init__(self):
+        self.now = NOW
+
+    def __call__(self):
+        return self.now
+
+
+def test_a_refused_cars_pictures_do_not_go_to_a_crossing_hours_later():
+    clock = Clock()
+    controller, _, platform = a_lane([SEEN, UNREAD], rules=[Rule(plate=STRANGER, allow=False)],
+                                     images=IMAGES, clock=clock)
+    controller.run_once()
+    clock.now += 6 * 3600
+    controller.run_once()
+    [opened] = platform.opened
+    assert not set(IMAGES[:2]) & {p["image"] for p in pictures_of(platform, opened["event_id"])}
+    # THE CONTROL: the same crossing inside the limit takes them.
+    clock = Clock()
+    controller, _, platform = a_lane([SEEN, UNREAD], rules=[Rule(plate=STRANGER, allow=False)],
+                                     images=IMAGES, clock=clock)
+    controller.run_once()
+    clock.now += 60
+    controller.run_once()
+    [opened] = platform.opened
+    assert set(IMAGES[:2]) <= {p["image"] for p in pictures_of(platform, opened["event_id"])}
+
+
+def test_two_different_reads_below_the_confidence_are_two_cars():
+    refused = VehicleIdentity(plate="AAA111", confidence=0.40, presence=True)
+    other = VehicleIdentity(plate="ZZZ999", confidence=0.40, presence=True)
+    controller, _, platform = a_lane([refused, other], transient=False, register=a_register(),
+                                     images=IMAGES)
+    assert controller.run_once().outcome is Outcome.FALLBACK, "the premise: refused, a person"
+    controller.run_once()
+    [opened] = platform.opened
+    assert not set(IMAGES[:2]) & {p["image"] for p in pictures_of(platform, opened["event_id"])}
+
+
+@pytest.mark.parametrize(
+    ("crossing_look", "matcher", "attached"),
+    [
+        ("opvid-opa-id/2:a", "exact", True),
+        ("opvid-opa-id/2:other", "exact", False),
+        ("opvid-opa-id/2:a", None, False),
+        ("opvid-opa-id/2:a", "broken", False),
+    ],
+    ids=["same look", "another look", "no comparison wired", "the comparison fails"],
+)
+def test_the_looks_must_match_and_a_doubt_attaches_nothing(crossing_look, matcher, attached):
+    class Broken:
+        def match(self, descriptor, banned):
+            raise ConnectionError("the identity service is down")
+
+    crossing = VehicleIdentity(plate=None, confidence=0.0, presence=True, descriptor=crossing_look)
+    controller, _, platform = a_lane(
+        [SEEN, crossing], rules=[Rule(plate=STRANGER, allow=False)], images=IMAGES,
+        matcher=Broken() if matcher == "broken" else matcher,
+    )
+    controller.run_once()
+    controller.run_once()
+    [opened] = platform.opened
+    kept = {p["image"] for p in pictures_of(platform, opened["event_id"])}
+    assert (set(IMAGES[:2]) <= kept) is attached
+
+
+def test_at_a_pass_only_garage_the_owners_rule_comes_before_the_registers():
+    denied, vend, _ = a_lane([HOLDER_SEEN], transient=False, register=a_register(),
+                             rules=[Rule(plate=HOLDER, allow=False)])
+    assert denied.run_once().outcome is Outcome.DENY, "a pass let a plate the owner denied in"
+    assert vend.vend_count == 0
+    holder, vend, _ = a_lane([HOLDER_SEEN], transient=False, register=a_register())
+    assert holder.run_once().outcome is Outcome.ALLOW, "the control: no rule, the pass opens"

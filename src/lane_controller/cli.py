@@ -237,7 +237,9 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
         # forged row here opens the barrier. `CacheDirectoryUnsafe` reaches
         # `cmd_serve`, which prints it and exits 2 before the port opens.
         cache = DecisionCache(
-            max_age_seconds=config.rules_max_age_seconds, store=DurableStore(config.cache_path)
+            max_age_seconds=config.rules_max_age_seconds,
+            store=DurableStore(config.cache_path),
+            pass_registers_offline_s=config.pass_registers_offline_days * 86_400.0,
         )
         held = "restored" if cache.default_action is not None or cache.stays_cursor else "empty"
         seams["cache"] = (
@@ -245,7 +247,10 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
             "the same age at which the lane stops trusting it)"
         )
     else:
-        cache = DecisionCache(max_age_seconds=config.rules_max_age_seconds)
+        cache = DecisionCache(
+            max_age_seconds=config.rules_max_age_seconds,
+            pass_registers_offline_s=config.pass_registers_offline_days * 86_400.0,
+        )
         seams["cache"] = "MEMORY ONLY (no [lane] cache_path): a restart holds nothing"
     if platform is not None:
         seams["outbox"] = (
