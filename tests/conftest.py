@@ -3458,8 +3458,34 @@ def _break_the_entry_stay(monkeypatch):
 
         monkeypatch.setattr(decision_module.DecisionCache, "clear", reopening)
 
+    elif mode == "stale_deny_skipped":
+        # A deny in rules past their age is not applied: a ban lapses with
+        # the cache (the owner's decision of 2026-10-30 says it never does).
+        original = decision_module.owner_denies
+
+        def lapsing(cache, *plates):
+            return None if cache.is_stale() else original(cache, *plates)
+
+        monkeypatch.setattr(decision_module, "owner_denies", lapsing)
+
+    elif mode == "stale_deny_unrecorded":
+        # A deny from rules past their age is applied but not said to be stale.
+        original = decision_module._denied
+        monkeypatch.setattr(decision_module, "_denied",
+                            lambda rule, identity, *, stale: original(rule, identity, stale=False))
+
+    elif mode == "deny_skipped_unstated":
+        # The deny is asked only at a garage that has said what it takes.
+        original = decision_module.owner_denies
+
+        def stated_only(cache, *plates):
+            return original(cache, *plates) if cache.transient_available is not None else None
+
+        monkeypatch.setattr(decision_module, "owner_denies", stated_only)
+
     elif mode == "stale_rule_applied":
-        # E3: an owner's rule is applied from a cache past its age.
+        # E3, kept for an allow: an owner's ALLOW rule is applied from a cache
+        # past its age.
         original = decision_module._decide_entry
 
         def trusting(identity, cache, **kwargs):

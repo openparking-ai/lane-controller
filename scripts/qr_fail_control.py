@@ -38,6 +38,12 @@ that drives it; no tracked file is edited.
   pass_not_recorded         the rule the module passed the QR on is not on `vended`
   pictures_not_kept         an opening by one difference or nothing read keeps no pictures
   plate_on_vended           the QR's plate rides on `vended`
+  stale_deny_skipped        a deny on the QR's car lapses with rules past their age
+  stale_deny_unrecorded     a deny applied from stale rules does not say so
+  watch_time_rule_dropped   a clear longer than a flicker in one sample is a flicker
+  qr_not_on_the_open        the stay a QR opened does not name the QR
+  qr_not_on_the_close       the exit a QR let out does not name the QR on its close
+  qr_not_sent               the transport leaves the QR off the open
 """
 
 from __future__ import annotations
@@ -59,6 +65,7 @@ DECISION = "src/lane_controller/decision.py"
 CLIENT = "src/lane_controller/platform_client.py"
 CLI = "src/lane_controller/cli.py"
 WATCH = "src/lane_controller/loop_watch.py"
+SYNC = "src/lane_controller/sync.py"
 
 BREAKAGES = [
     ("any_answer_opens", "the gate opens on any answer", CONTROLLER,
@@ -126,14 +133,14 @@ BREAKAGES = [
      "            with self._lock:\n                self._left = True\n            return\n",
      "            return\n"),
     ("deny_first_dropped", "an unsure read gets around the owner's deny", DECISION,
-     "    denied = owner_denies(cache, plate_seen(identity), stale=stale)\n",
-     "    denied = None\n"),
+     "        denied = owner_denies(cache, plate_seen(identity))\n",
+     "        denied = None\n"),
     ("deny_on_read_dropped", "a denied read is presented", CONTROLLER,
-     "        if owner_denies(self.cache, plate_seen(identity), stale=stale) is not None:\n",
+     "        if owner_denies(self.cache, plate_seen(identity)) is not None:\n",
      "        if False:\n"),
     ("deny_on_qr_car_dropped", "the QR's denied car is let in", CONTROLLER,
-     '        if owner_denies(self.cache, _text(enrolment.get("qr_plate")), stale=stale) is not '
-     'None:\n', "        if False:\n"),
+     '        if owner_denies(self.cache, _text(enrolment.get("qr_plate"))) is not None:\n',
+     "        if False:\n"),
     ("deny_normal_form_dropped", "a deny typed with a dash misses the QR's plate", DECISION,
      "        key = normalise_identity(plate)\n",
      "        return None\n        key = normalise_identity(plate)\n"),
@@ -141,6 +148,27 @@ BREAKAGES = [
      '**({"qr_passed_by": passed_by} if passed_by else {}),', ""),
     ("pictures_not_kept", "no pictures of a passed car", CONTROLLER,
      "        if passed_by in QR_PASSES_KEPT:\n", "        if False:\n"),
+    ("stale_deny_skipped", "a stale deny lapses", DECISION,
+     "    return next((rule for plate in plates if (rule := cache.denying(plate)) is not None), "
+     "None)",
+     "    if cache.is_stale():\n        return None\n"
+     "    return next((rule for plate in plates if (rule := cache.denying(plate)) is not None), "
+     "None)"),
+    ("stale_deny_unrecorded", "a stale deny is not said", CONTROLLER,
+     '            **({"stale_deny": True} if self.cache.is_stale() else {}),\n', ""),
+    ("watch_time_rule_dropped", "a long clear in one sample is a flicker", WATCH,
+     "                if since is not None and now - since >= FLICKER_SECONDS:\n"
+     "                    self._left = True\n", ""),
+    ("qr_not_on_the_open", "the open does not name the QR", CONTROLLER,
+     "                **self._take_qr_opening(at),\n                at=at,",
+     "                at=at,"),
+    ("qr_not_on_the_close", "the close does not name the QR", CONTROLLER,
+     "            **self._take_qr_opening(at),\n            **({\"local_decision\"",
+     "            **({\"local_decision\""),
+    ("qr_not_sent", "the transport drops the QR", SYNC,
+     '            **({"qr": event.detail["qr"]} if event.detail.get("qr") else {}),\n'
+     "            # What was read below the confidence, not an identity (0036).\n",
+     "            # What was read below the confidence, not an identity (0036).\n"),
     ("plate_on_vended", "the QR's plate rides on vended", CONTROLLER,
      '**({"qr_passed_by": passed_by} if passed_by else {}),',
      '**({"qr_passed_by": passed_by, "qr_plate": enrolment.get("qr_plate")} '

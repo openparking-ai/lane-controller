@@ -397,10 +397,29 @@ not change; how often each member appears does.
   plate it read at its confidence or nothing, and opens on `covered` only, for
   the car still on the arming loop. A plate the owner denied -- read at any
   confidence, or the plate the QR was made for -- is `deny` first and is never
-  opened by a QR. That open is not on this contract as a new decision: the
+  opened by a QR, whatever the age of the lane's rules: a deny always wins
+  (2026-10-30; an allow rule is still applied only from a trusted cache), and
+  a deny applied from rules past their age carries `stale_deny: true` on its
+  `decision` event. The same holds at every entry, a garage that has not
+  stated what it takes included. That open is not on this contract as a new decision: the
   refused decision stays the last one, `decision.completed` becomes its time,
   and `vended` carries `registration_qr_covered`. A person's completion of the
   same decision afterwards is refused `already_completed`, as for any.
+
+  **What the platform is sent about a QR's opening** (beside this read
+  contract): `vended` carries `qr_passed_by` (how the pass module's rule passed
+  the QR: `same_plate`, `look_alike`, `one_difference`, `nothing_read`) and
+  `enrolment` (the QR's id), never a plate; a QR that opened on
+  `one_difference` or `nothing_read` has the car's pictures kept against that
+  `vended` event. The stay the QR opened -- `POST /api/v1/lane/sessions/open`
+  at an entry, `/sessions/close` at an exit -- carries
+  `qr: {"enrolment": "<id>", "passed_by": "<rule>", "qr_plate": "<the QR's
+  plate, the pass module's normal form>"}`, each key only when the module
+  answered it, beside the plate as read. It is there for the platform to store
+  on the stay and to close the stay by the QR, so a car let in on one
+  difference or on nothing read is the pass's car at the exit; a platform that
+  does not store it yet ignores it, and the open and close are otherwise
+  byte-identical to before.
 - **A garage that has not stated it**, and **every exit**, decide as before.
 
 Whatever was decided, every car the loops see go in -- the one the lane opened

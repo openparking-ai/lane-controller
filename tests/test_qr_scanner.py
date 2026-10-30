@@ -472,6 +472,24 @@ def test_the_control_without_the_owners_deny_the_same_answer_opens():
     assert controller.run_once() is not None and vend.vend_count == 1
 
 
+def test_a_stale_deny_on_the_qrs_car_still_keeps_the_gate_shut_and_says_so():
+    """The owner's decision of 2026-10-30: a deny always wins, also from rules
+    past their age. Nothing read, the module passes the QR, and the owner
+    denied the car it was made for: shut, and the record says it was stale."""
+    controller, vend, platform, scanner, presenter, _ = a_lane(
+        NO_PLATE, presenter=Presenter(passed("nothing_read")), crossings=())
+    controller.cache.load([Rule(plate=HOLDER, allow=False)], default_action="allow",
+                          now=time.time() - 7200)
+    assert controller.cache.is_stale()
+    controller.run_once()
+    scanner.scan(QR)
+    assert controller.run_once() is None
+    assert len(presenter.calls) == 1 and vend.vend_count == 0
+    [said] = [e for e in platform.events.values()
+              if e["kind"] == "decision" and "QR" in e["detail"]["reason"]]
+    assert said["detail"]["stale_deny"] is True
+
+
 # ---------------------------------------------------------------------------
 # 4b -- the car that was there when the QR was scanned, and no other
 # ---------------------------------------------------------------------------
@@ -655,6 +673,94 @@ def test_the_gate_opens_on_open_true_and_on_nothing_else(answer):
     scanner.scan(QR)
     assert controller.run_once() is None
     assert len(presenter.calls) == 1 and vend.vend_count == 0
+
+
+class Readings:
+    """A loop whose readings are set by the test, one per sample."""
+
+    def __init__(self):
+        self.occupied = True
+
+    def is_occupied(self) -> bool:
+        return self.occupied
+
+
+def test_a_clear_longer_than_a_flicker_seen_in_one_sample_is_a_car_gone():
+    """The watch's time rule (loop_watch, half a second on the lane's clock):
+    one clear sample only, because the samples came far apart, but the clear
+    lasted longer than a flicker -- the car backed off and another rolled on."""
+    from lane_controller.loop_watch import FLICKER_SECONDS, LoopWatch
+
+    loop, now = Readings(), [100.0]
+    watch = LoopWatch(loop, lambda: now[0])
+    loop.occupied, now[0] = False, 100.1
+    watch._sample()
+    loop.occupied, now[0] = True, 100.1 + FLICKER_SECONDS + 0.1
+    watch._sample()
+    assert not watch.stayed(), "a clear longer than a flicker was taken for one"
+    # THE CONTROL: the same single clear sample, shorter than a flicker
+    loop, now = Readings(), [100.0]
+    watch = LoopWatch(loop, lambda: now[0])
+    loop.occupied, now[0] = False, 100.1
+    watch._sample()
+    loop.occupied, now[0] = True, 100.1 + FLICKER_SECONDS - 0.2
+    watch._sample()
+    assert watch.stayed()
+
+
+# ---------------------------------------------------------------------------
+# 9 -- the stay a QR opened names the QR, for the platform to tie them
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("rule", ["one_difference", "nothing_read", "same_plate"])
+def test_the_stay_a_qr_opened_carries_the_qr_and_how_it_passed(rule):
+    identity = NO_PLATE if rule == "nothing_read" else SEEN
+    controller, vend, platform, scanner, _, _ = a_lane(identity, presenter=Presenter(
+        passed(rule)))
+    controller.run_once()
+    scanner.scan(QR)
+    assert controller.run_once() is not None
+    [stay] = platform.opened
+    assert stay["qr"] == {"enrolment": "qr-1", "passed_by": rule, "qr_plate": HOLDER_KEY}
+    assert stay.get("plate") == (STRANGER if identity is SEEN else None), "as read"
+
+
+def test_an_exit_a_qr_let_out_carries_the_qr_on_its_close():
+    controller, vend, platform, scanner, _, _ = a_lane(
+        LOW, direction="exit", transient=True, presenter=Presenter(passed("nothing_read")))
+    controller.run_once()
+    scanner.scan(QR)
+    controller.run_once()
+    [closed] = platform.closed
+    assert closed["qr"] == {"enrolment": "qr-1", "passed_by": "nothing_read",
+                            "qr_plate": HOLDER_KEY}
+
+
+def test_a_stay_no_qr_opened_carries_no_qr():
+    controller, vend, platform, _, _, _ = a_lane(SEEN, transient=True)
+    assert controller.run_once().should_vend
+    [stay] = platform.opened
+    assert "qr" not in stay
+
+
+def test_the_client_sends_the_qr_on_the_open_and_the_close():
+    sent = []
+
+    def opener(request, timeout):
+        sent.append(json.loads(request.data))
+        return _Response(json.dumps({"session": {"entry_confirmation": "confirmed",
+                                                 "exit_confirmation": "confirmed"}}).encode())
+
+    client = PlatformClient("https://platform.example", "t", opener=opener)
+    qr = {"enrolment": "qr-1", "passed_by": "one_difference", "qr_plate": "PASS777"}
+    client.open_session(event_id="e1", entry_at="2026-09-21T14:00:00Z",
+                        entry_confirmation="confirmed", plate="PASS778", qr=qr)
+    client.close_session(event_id="e2", exit_at="2026-09-21T15:00:00Z",
+                         exit_confirmation="confirmed", plate="PASS778", qr=qr)
+    client.open_session(event_id="e3", entry_at="2026-09-21T14:00:00Z",
+                        entry_confirmation="confirmed", plate="PASS778")
+    assert sent[0]["qr"] == qr and sent[1]["qr"] == qr and "qr" not in sent[2]
 
 
 # ---------------------------------------------------------------------------

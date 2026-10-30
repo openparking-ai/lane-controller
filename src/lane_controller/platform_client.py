@@ -207,6 +207,7 @@ class PlatformClient:
         no_open_command: bool = False,
         unsure_plate: str | None = None,
         unsure_plate_confidence: float | None = None,
+        qr: dict | None = None,
     ) -> dict:
         # event_id is the lane's own, and it is what makes a re-sent flush safe.
         # The platform keys the session on it, so this exact arrival can only
@@ -246,6 +247,10 @@ class PlatformClient:
                     if unsure_plate is not None
                     else {}
                 ),
+                # The QR that let the car in (`{enrolment, passed_by,
+                # qr_plate}`), ONLY when one did: the platform ties the stay to
+                # it (2026-10-30). Every other open is byte-identical to before.
+                **({"qr": qr} if qr is not None else {}),
             },
         )
 
@@ -289,6 +294,7 @@ class PlatformClient:
         descriptor: str | None = None,
         local_decision: dict | None = None,
         reader_shown: dict | None = None,
+        qr: dict | None = None,
     ) -> dict:
         body = {
             "event_id": event_id,
@@ -315,6 +321,10 @@ class PlatformClient:
         # is its discounted fee.
         if reader_shown is not None:
             body["reader_shown"] = reader_shown
+        # The QR that let the car out (`{enrolment, passed_by, qr_plate}`),
+        # ONLY when one did.
+        if qr is not None:
+            body["qr"] = qr
         return self._request("POST", "/api/v1/lane/sessions/close", body)
 
 

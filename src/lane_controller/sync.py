@@ -502,6 +502,9 @@ class PlatformTransport(EventTransport):
             **({"plate_unreadable": True} if event.detail.get("plate_unreadable") else {}),
             # A car no open command let in, read or not (0036): its own mark.
             **({"no_open_command": True} if event.detail.get("no_open_command") else {}),
+            # The QR that let this car in, and how (the owner's rule of
+            # 2026-10-30): for the platform to tie the stay to it.
+            **({"qr": event.detail["qr"]} if event.detail.get("qr") else {}),
             # What was read below the confidence, not an identity (0036).
             **(
                 {
@@ -552,6 +555,9 @@ class PlatformTransport(EventTransport):
             # What the reader showed, when a screen said (A2.2); absent, the
             # close is the one this lane sent before it existed.
             **_reader_shown(event),
+            # The QR that let this car out, and how: for the platform to
+            # close the stay by the QR (its own round).
+            **({"qr": event.detail["qr"]} if event.detail.get("qr") else {}),
         )
         require_confirmation_echo(result, declared, end="exit", action="close")
         require_descriptor_echo(result, descriptor, end="exit", action="close")

@@ -214,6 +214,7 @@ class FakePlatform:
         no_open_command: bool = False,
         unsure_plate: str | None = None,
         unsure_plate_confidence: float | None = None,
+        qr: dict | None = None,
     ) -> dict:
         self._check()
         if unsure_plate is not None and not plate_unreadable:
@@ -247,6 +248,7 @@ class FakePlatform:
                 "no_open_command": no_open_command,
                 "unsure_plate": unsure_plate,
                 "unsure_plate_confidence": unsure_plate_confidence,
+                **({"qr": qr} if qr is not None else {}),
             }
         )
         # Keyed on the event, exactly as the platform is. An entry replayed
@@ -294,6 +296,7 @@ class FakePlatform:
         descriptor: str | None = None,
         local_decision: dict | None = None,
         reader_shown: dict | None = None,
+        qr: dict | None = None,
     ) -> dict:
         self._check()
         identity = self._identity(plate, ticket_ref)
@@ -311,6 +314,7 @@ class FakePlatform:
                 "descriptor": descriptor,
                 "local_decision": local_decision,
                 **({"reader_shown": reader_shown} if reader_shown is not None else {}),
+                **({"qr": qr} if qr is not None else {}),
             }
         )
         if event_id in self.sessions_by_close_event:

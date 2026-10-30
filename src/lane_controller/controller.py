@@ -245,6 +245,8 @@ class LaneController:
         # Either absent: no QR is read here, and a refusal stands as it is.
         self.qr_scanner = qr_scanner
         self.qr_presenter = qr_presenter
+        #: The QR that opened the transit begun at this instant, for its stay.
+        self._qr_opening: tuple[str, dict] | None = None
         # The banned-car comparison (U7f). None: this lane refuses no car as
         # banned, whatever list it holds.
         self.banned_matcher = banned_matcher
@@ -618,6 +620,8 @@ class LaneController:
             reason=decision.reason,
             fallback=decision.fallback.value if decision.fallback else None,
             rate_plan=decision.rate_plan,
+            # A DENY FROM RULES PAST THEIR AGE, applied anyway (2026-10-30).
+            **({"stale_deny": True} if decision.stale_deny else {}),
             **(
                 {"exit_pricing": decision.exit_pricing.to_detail()}
                 if decision.exit_pricing is not None
@@ -844,8 +848,8 @@ class LaneController:
         presented at all; and a deny rule for the plate the QR was made for
         (`enrolment.qr_plate` in the answer) keeps the gate shut after the
         module answered -- with nothing read, the car let in on a QR is the
-        QR's car. Neither is a QR's to overrule. Like every owner's rule, a
-        deny is applied while the cache is trusted (`owner_denies`).
+        QR's car. Neither is a QR's to overrule, and a deny wins whatever the
+        cache's age (`owner_denies`): applied stale, it is recorded so.
 
         WHAT IS PRESENTED is the plate this lane stands behind (`plate_read`)
         or nothing: a plate below the confidence, no plate and no read are
@@ -914,13 +918,14 @@ class LaneController:
             # asked here, before a QR can let this car in.
             log.info("lane %s: a QR was scanned for a banned car; not presented", lane)
             return None
-        stale = self.cache.is_stale()
-        if owner_denies(self.cache, plate_seen(identity), stale=stale) is not None:
+        if owner_denies(self.cache, plate_seen(identity)) is not None:
             # THE OWNER'S DENY ON WHAT WAS READ, AT ANY CONFIDENCE: before the
             # QR goes anywhere. The decision already denies a car read this
             # way; the cache may have learned the rule since.
             log.info("lane %s: a QR was scanned for a car the owner's rule denies; not "
                      "presented", lane)
+            self._qr_denied("the owner's rule denies this car; a QR does not overrule the "
+                            "owner")
             return None
         # NOTHING USABLE IS NOTHING: below the confidence is not a read.
         vehicle = plate_read(identity, self.config.confidence_threshold) or None
@@ -963,19 +968,14 @@ class LaneController:
                 enrolment.get("refused"),
             )
             return None
-        if owner_denies(self.cache, _text(enrolment.get("qr_plate")), stale=stale) is not None:
+        if owner_denies(self.cache, _text(enrolment.get("qr_plate"))) is not None:
             # THE OWNER'S DENY ON THE QR'S CAR: with nothing read, or a read
             # one character off, the car the QR lets in is the car it was
             # made for -- and the owner denied that car. Shut; a person.
             log.info("lane %s: the owner's rule denies the car a QR was made for; the gate "
                      "stays shut", lane)
-            self.events.record(
-                "decision", lane, outcome=Outcome.DENY.value,
-                reason="the owner's rule denies the car this QR was made for; a QR does not "
-                "overrule the owner",
-                fallback=None, rate_plan=None,
-            )
-            self.deliver()
+            self._qr_denied("the owner's rule denies the car this QR was made for; a QR does "
+                            "not overrule the owner")
             return None
         if self.last_decision_at != decided_at or self.last_decision_completed_at is not None:
             log.warning(
@@ -998,6 +998,7 @@ class LaneController:
             self.deliver()
             return None
         passed_by = _text(enrolment.get("passed_by"))
+        qr_id = _text(enrolment.get("enrolment"))
         self.vend.vend(REASON_QR_OPENED)
         vended = self.events.record(
             "vended", lane, reason=REASON_QR_OPENED,
@@ -1012,12 +1013,41 @@ class LaneController:
         at = to_iso(self._clock())
         arming = self._take_held_arming()
         self.last_decision_completed_at = at
+        # WHICH QR LET THIS CAR IN, AND HOW, ON ITS STAY: the open at an entry,
+        # the close at an exit (`_record_session`). The stay keeps the plate
+        # as read; these let the platform tie it to the QR -- and its plate --
+        # so a car let in on one difference or on nothing read is the pass's
+        # car at the exit too.
+        if qr_id is not None:
+            self._qr_opening = (at, {
+                "enrolment": qr_id,
+                **({"passed_by": passed_by} if passed_by else {}),
+                **({"qr_plate": enrolment["qr_plate"]} if _text(enrolment.get("qr_plate"))
+                   else {}),
+            })
         opened = Decision(outcome=Outcome.ALLOW, reason=REASON_QR_OPENED, identity=identity)
         if self.config.direction != "entry":
             arming = []
         self._settle_transit(identity, at, exit_pricing=None, arming=arming)
         self.deliver()
         return opened
+
+    def _qr_denied(self, reason: str) -> None:
+        """The owner's deny keeping a QR's car out, recorded as a `decision`
+        -- stale when the cache is past its age. No plate."""
+        self.events.record(
+            "decision", self.config.lane_id, outcome=Outcome.DENY.value, reason=reason,
+            fallback=None, rate_plan=None,
+            **({"stale_deny": True} if self.cache.is_stale() else {}),
+        )
+        self.deliver()
+
+    def _take_qr_opening(self, at: str) -> dict:
+        """`{"qr": ...}` for the stay a QR opened at `at`, once; `{}` otherwise."""
+        held, self._qr_opening = self._qr_opening, None
+        if held is None or held[0] != at:
+            return {}
+        return {"qr": held[1]}
 
     def _car_at_the_barrier(self, *, read: bool = True) -> bool:
         """A car on the arming loop (read now, unless `read` is False: the
@@ -2085,6 +2115,7 @@ class LaneController:
                 **self._identity_detail(identity, with_region=True),
                 **self._session_descriptor(identity),
                 **unsure,
+                **self._take_qr_opening(at),
                 at=at,
                 entry_confirmation=confirmation,
                 # A car no vend let in whose plate was READ (U7f). Only when
@@ -2118,6 +2149,7 @@ class LaneController:
             lane,
             **self._identity_detail(identity, with_region=False),
             **self._session_descriptor(identity),
+            **self._take_qr_opening(at),
             **({"local_decision": exit_pricing.to_detail()} if exit_pricing is not None else {}),
             # What the reader put up for this stay, SEALED as the close is
             # recorded (A2.2): the platform records a held validation only

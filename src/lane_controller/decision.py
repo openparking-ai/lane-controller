@@ -156,6 +156,9 @@ class Decision:
     #: confirm (`_decide_entry`). Set where the decision is made and nowhere
     #: else; `qr_may_open` adds the exit's case.
     qr_may_open: bool = False
+    #: True when this DENY came from an owner's rule in a cache past its age:
+    #: a deny always wins, and the record says it was applied stale.
+    stale_deny: bool = False
 
     @property
     def should_vend(self) -> bool:
@@ -288,15 +291,32 @@ def plate_seen(identity: VehicleIdentity) -> str | None:
     return identity.plate
 
 
-def owner_denies(cache: DecisionCache, *plates: str | None, stale: bool) -> Rule | None:
-    """THE OWNER'S DENY, CHECKED FIRST AND ALWAYS WINNING (the owner's rule of
+def owner_denies(cache: DecisionCache, *plates: str | None) -> Rule | None:
+    """THE OWNER'S DENY, CHECKED FIRST AND ALWAYS WINNING (the owner's rules of
     2026-10-30): the deny rule naming any of these plates -- what was read at
     any confidence (`plate_seen`), and the plate a QR was made for -- or None.
-    Like every owner's rule, only while the cache is trusted (`stale` False):
-    a stale rule is never applied (E3, the entry's second review)."""
-    if stale:
-        return None
+    WHATEVER THE CACHE'S AGE: a ban is a ban, and a gate that fails shut on a
+    deny past its age is one a person opens by hand. This replaces E3 (the
+    entry's second review) for a deny; an ALLOW rule is still applied only
+    from a trusted cache. A deny applied from a stale cache is recorded as one
+    (`Decision.stale_deny`, `stale_deny: true` on the event)."""
     return next((rule for plate in plates if (rule := cache.denying(plate)) is not None), None)
+
+
+#: The reason a deny applied from a cache past its age adds to "plate is
+#: denied by rule": said, so the record shows the rules were old.
+STALE_DENY_REASON = "the lane's rules are past their age and a deny is applied anyway"
+
+
+def _denied(rule: Rule, identity: VehicleIdentity, *, stale: bool) -> Decision:
+    """The owner's deny for this car, recorded as stale when the cache is."""
+    return Decision(
+        outcome=Outcome.DENY,
+        reason="plate is denied by rule" + (f"; {STALE_DENY_REASON}" if stale else ""),
+        identity=identity,
+        rate_plan=rule.rate_plan,
+        stale_deny=stale,
+    )
 
 
 def plate_read(identity: VehicleIdentity, confidence_threshold: float) -> str | None:
@@ -970,6 +990,14 @@ def decide(
         )
 
     if direction != "exit":
+        # THE OWNER'S DENY, FIRST AND ALWAYS, AT EVERY ENTRY (2026-10-30): a
+        # plate the owner denied -- read at any confidence, whatever the
+        # cache's age -- is denied before anything else is asked, at a garage
+        # that has said what it takes and at one that has not. A ban is a ban:
+        # never a refusal a QR may open, never let in on a pass.
+        denied = owner_denies(cache, plate_seen(identity))
+        if denied is not None:
+            return _denied(denied, identity, stale=cache.is_stale(now=now))
         admits = garage_admits(cache)
         if admits is not None:
             # THE OWNER'S ENTRY RULE, at a garage that has said what it takes.
@@ -1154,18 +1182,19 @@ def _decide_entry(
     """The entry at a garage that has said what it takes. Presence and a
     closing to everyone were decided before this, as for every lane.
 
-    THE OWNER'S DENY COMES FIRST (2026-10-30): a plate the owner denied --
-    read at the lane's confidence or below it (`plate_seen`), while the cache
-    is trusted -- is DENIED before anything else is asked, at both kinds of
-    garage, and is never a refusal a QR may open. A plate read below the
+    THE OWNER'S DENY COMES FIRST (2026-10-30) and was asked by `decide`
+    before this: a plate the owner denied -- read at the lane's confidence or
+    below it (`plate_seen`), whatever the cache's age -- is DENIED before
+    anything else, at both kinds of garage, and is never a refusal a QR may
+    open. A plate read below the
     confidence used to fall to "the pass could not be confirmed" before the
     rule was looked up, and a QR then let the denied car in.
 
     WHAT THE LANE STANDS BEHIND is `plate_read`: only a plate read at the
     lane's confidence is looked up to OPEN anything, in the rules or the
     registers, so a car nobody could read is never matched to someone else's
-    pass. AN OWNER'S RULE for a plate, deny or allow, is consulted only while
-    the cache is trusted -- a stale rule is never applied, as before.
+    pass. AN OWNER'S ALLOW RULE for a plate is consulted only while the cache
+    is trusted -- a stale allow is never applied; a stale deny is (above).
     (The platform serves no rules today; a lane given one honours it.)
 
     A GARAGE THAT TAKES TRANSIENTS:
@@ -1186,9 +1215,6 @@ def _decide_entry(
       5. a car a register covers today: open;
       6. every other car is DENIED (`REASON_NOT_REGISTERED`, the QR seam).
     """
-    denied = owner_denies(cache, plate_seen(identity), stale=stale)
-    if denied is not None:
-        return _by_rule(denied, identity)
     read = plate_read(identity, confidence_threshold)
     covered = False
     if read:
