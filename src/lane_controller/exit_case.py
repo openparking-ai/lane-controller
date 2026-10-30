@@ -453,12 +453,35 @@ def send_receipt(case: ExitCase, platform, display: ExitDisplay | None) -> bool:
 
 
 #: What `cancel_on_reader` found: the payment canceled at Stripe; the card had
-#: already paid (409 `exit_paid`); a card still being authorised (409
-#: `payment_in_progress`); or the platform not reached, or refusing otherwise.
+#: already paid (409 `exit_paid`); the case had no payment to cancel (409
+#: `no_payment`); a card still being authorised (409 `payment_in_progress`);
+#: the platform not reached, a 5xx or a 429 (`failed`); or a refusal no retry
+#: can change (`refused`: the case is not this lane's or not there, or Stripe
+#: took another amount -- a person decides).
 CANCELED = "canceled"
 CANCEL_FOUND_PAID = "paid"
+CANCEL_NOTHING = "nothing"
 CANCEL_IN_PROGRESS = "in_progress"
 CANCEL_FAILED = "failed"
+CANCEL_REFUSED = "refused"
+
+#: The platform has the payment off the reader, or never had one on it: the
+#: cancel is done and is not asked again.
+CANCEL_CONFIRMED = frozenset({CANCELED, CANCEL_FOUND_PAID, CANCEL_NOTHING})
+#: Asked again, with a bounded backoff, until the platform confirms
+#: (`PendingCancels`): never dropped, and never on the lane's thread.
+CANCEL_RETRY = frozenset({CANCEL_IN_PROGRESS, CANCEL_FAILED})
+
+#: The first wait before a cancel is asked again, doubled on each failure up
+#: to `EXIT_CANCEL_RETRY_MAX_SECONDS` -- asked again for as long as it takes.
+EXIT_CANCEL_RETRY_FIRST_SECONDS = 1.0
+EXIT_CANCEL_RETRY_MAX_SECONDS = 30.0
+#: After this many failed asks a person is told, once: another car's fee may
+#: still be on the reader. The lane goes on asking.
+EXIT_CANCEL_TELL_AFTER = 5
+#: What a person is told then, and when the platform refuses a cancel outright.
+NEEDS_CANCEL_PENDING = "cancel_pending"
+NEEDS_CANCEL_REFUSED = "cancel_refused"
 
 #: The vend authorities the platform's close takes as `let_out_by` (platform
 #: 0042; `human_open_and_flag` is marked flagged on its change-log line). It
@@ -472,7 +495,10 @@ def cancel_on_reader(case: ExitCase, platform) -> str | None:
     """Cancel the case's payment at Stripe and take it off the lane's reader,
     through the platform (`/exits/:id/pay/cancel`): the lane let the case go,
     or a person opened for it. Only a case whose fee was handed to the reader;
-    None for any other. Asked once, never again for the same case.
+    None for any other. Asked once here; an answer in `CANCEL_RETRY` is asked
+    again by `PendingCancels`, off the lane's thread, until the platform
+    confirms -- a failed cancel is never dropped (it once left another car's
+    fee on the reader).
 
     A card that had already paid (`exit_paid`) is not a failure: the platform
     has the case settled as paid, and nothing was canceled. It opens nothing
@@ -482,20 +508,110 @@ def cancel_on_reader(case: ExitCase, platform) -> str | None:
     (`payment_in_progress`) opens nothing either."""
     if platform is None or case.exit_id is None or case.sent_at is None:
         return None
+    return cancel_payment(case.exit_id, platform)
+
+
+def cancel_payment(exit_id: str, platform) -> str:
+    """One ask of `/exits/:id/pay/cancel`, read into one of the outcomes above.
+    The case's id is the only thing sent; nothing here names a plate."""
     try:
-        platform.exit_pay_cancel(case.exit_id)
+        platform.exit_pay_cancel(exit_id)
     except PlatformRejected as err:
         if err.code == "exit_paid":
             log.info("exit case: the card had already paid; the platform settled the case "
                      "as paid, and nothing was canceled")
             return CANCEL_FOUND_PAID
+        if err.code == "no_payment":
+            log.info("exit case: the case has no payment to cancel")
+            return CANCEL_NOTHING
         if err.code == "payment_in_progress":
-            log.info("exit case: a card is being authorised; the payment was not canceled")
+            log.info("exit case: a card is being authorised; the payment was not canceled yet")
             return CANCEL_IN_PROGRESS
-        log.warning("exit case: the payment could not be canceled: %s",
-                    err.code or err.__class__.__name__)
-        return CANCEL_FAILED
+        if err.status == 429:
+            log.warning("exit case: the payment cancel was rate limited; it is asked again")
+            return CANCEL_FAILED
+        log.warning("exit case: the platform refused the payment cancel: %s",
+                    err.code or err.status)
+        return CANCEL_REFUSED
     except PlatformUnreachable as err:
-        log.warning("exit case: the payment could not be canceled: %s", err.__class__.__name__)
+        log.warning("exit case: the payment could not be canceled yet: %s",
+                    err.__class__.__name__)
         return CANCEL_FAILED
     return CANCELED
+
+
+@dataclass
+class _Pending:
+    attempts: int
+    due: float
+    told: bool = False
+
+
+def cancel_backoff(attempts: int) -> float:
+    """The wait after `attempts` failed asks: 1, 2, 4, 8, 16, then 30 seconds
+    for as long as it takes."""
+    return min(EXIT_CANCEL_RETRY_MAX_SECONDS,
+               EXIT_CANCEL_RETRY_FIRST_SECONDS * 2 ** max(0, attempts - 1))
+
+
+class PendingCancels:
+    """The payment cancels the platform has not confirmed, by exit case id,
+    each with the next time it is due. Kept on disk through the event queue
+    (`EventQueue.keep_cancel`) when it has a store, so a restart asks again
+    for every one -- due at once.
+
+    Two threads meet here: the lane's adds a cancel that failed, the drain's
+    asks again (`LaneController.retry_cancels`). One lock, never held across
+    a network call."""
+
+    def __init__(self, clock, events=None) -> None:
+        self._clock = clock
+        self._events = events
+        self._lock = threading.Lock()
+        self._pending: dict[str, _Pending] = {}
+        held = events.held_cancels() if events is not None else []
+        now = clock()
+        for exit_id in held:
+            self._pending[exit_id] = _Pending(attempts=0, due=now)
+
+    def add(self, exit_id: str) -> None:
+        """A cancel asked once and not confirmed: asked again after the first wait."""
+        with self._lock:
+            if exit_id in self._pending:
+                return
+            self._pending[exit_id] = _Pending(attempts=1, due=self._clock() + cancel_backoff(1))
+        if self._events is not None:
+            self._events.keep_cancel(exit_id, self._clock())
+
+    def due(self) -> list[str]:
+        now = self._clock()
+        with self._lock:
+            return [exit_id for exit_id, p in self._pending.items() if p.due <= now]
+
+    def failed(self, exit_id: str) -> tuple[int, bool]:
+        """One more failed ask: the attempts so far, and whether a person is
+        to be told now (once, at `EXIT_CANCEL_TELL_AFTER`)."""
+        with self._lock:
+            pending = self._pending.get(exit_id)
+            if pending is None:
+                return 0, False
+            pending.attempts += 1
+            pending.due = self._clock() + cancel_backoff(pending.attempts)
+            tell = pending.attempts >= EXIT_CANCEL_TELL_AFTER and not pending.told
+            pending.told = pending.told or tell
+            return pending.attempts, tell
+
+    def settle(self, exit_id: str) -> None:
+        """Confirmed, or refused for good: never asked again."""
+        with self._lock:
+            known = self._pending.pop(exit_id, None) is not None
+        if known and self._events is not None:
+            self._events.forget_cancel(exit_id)
+
+    def __contains__(self, exit_id: object) -> bool:
+        with self._lock:
+            return exit_id in self._pending
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._pending)

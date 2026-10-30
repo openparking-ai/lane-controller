@@ -1216,11 +1216,23 @@ def test_the_cancel_reads_exit_paid_as_paid_and_payment_in_progress_as_neither()
     for refusal, outcome in [
         (None, exit_case_module.CANCELED),
         ("exit_paid", exit_case_module.CANCEL_FOUND_PAID),
+        ("no_payment", exit_case_module.CANCEL_NOTHING),
         ("payment_in_progress", exit_case_module.CANCEL_IN_PROGRESS),
-        ("no_payment", exit_case_module.CANCEL_FAILED),
+        ("exit_on_another_lane", exit_case_module.CANCEL_REFUSED),
+        ("payment_amount_mismatch", exit_case_module.CANCEL_REFUSED),
     ]:
         exits.exit_pay_cancel_refusal = refusal
         assert exit_case_module.cancel_on_reader(case, exits) == outcome, refusal
+    exits.exit_pay_cancel_refusal = None
+    exits.online = False
+    assert exit_case_module.cancel_on_reader(case, exits) == exit_case_module.CANCEL_FAILED
+    exits.online = True
+
+    def rate_limited(exit_id):
+        raise PlatformRejected(429, "{}")
+
+    exits.exit_pay_cancel = rate_limited
+    assert exit_case_module.cancel_on_reader(case, exits) == exit_case_module.CANCEL_FAILED
 
 
 def cancels(exits):
@@ -1374,3 +1386,302 @@ def test_a_persons_close_answered_503_payment_unsettled_stays_queued_and_is_sent
     assert again == first, "the close sent again is not the close that was refused"
     assert first["exit_id"] == "exit-1"
     assert first["let_out_by"] == VendAuthority.HUMAN_OPEN_NOW.value
+
+
+# ---------------------------------------------------------------------------
+# A failed cancel is asked again until the platform confirms (fix 4).
+# ---------------------------------------------------------------------------
+
+
+def cancel_fails(exits, times, *, how="unreachable"):
+    """`/pay/cancel` fails `times` times -- the platform out of reach, or a
+    card still being authorised -- and then confirms."""
+    from lane_controller.platform_client import PlatformUnreachable
+
+    real = exits.exit_pay_cancel
+    left = {"n": times}
+
+    def cancel(exit_id):
+        exits.exit_requests.append(("pay_cancel", exit_id))
+        if left["n"] > 0:
+            left["n"] -= 1
+            if how == "unreachable":
+                raise PlatformUnreachable("timed out")
+            raise PlatformRejected(409, "{}", "payment_in_progress")
+        exits.exit_requests.pop()
+        return real(exit_id)
+
+    exits.exit_pay_cancel = cancel
+
+
+def dropped_on_the_reader(exits_times=1, *, how="unreachable", drain=True, events=None):
+    """A case whose fee is on the reader, dropped because its car left, with
+    the first cancel failing. `drain`: a `LaneRunner`-shaped drain is
+    installed, so `deliver()` is a signal and the lane's thread never asks."""
+    controller, vend, exits, clock, order = an_exit(answer=PAYMENT)
+    if events is not None:
+        events._transport = PlatformTransport(exits)
+        controller.events = events
+        controller._cancels = exit_case_module.PendingCancels(clock, events)
+    if drain:
+        controller.set_drain(lambda: None)
+    controller.run_once()
+    cancel_fails(exits, exits_times, how=how)
+    controller.loop.clear()
+    controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
+    assert len(cancels(exits)) == 1, "the first ask, as the case was dropped"
+    return controller, vend, exits, clock
+
+
+@pytest.mark.parametrize("how", ["unreachable", "payment_in_progress"])
+def test_a_failed_cancel_is_asked_again_with_a_bounded_backoff_until_confirmed(how):
+    controller, vend, exits, clock = dropped_on_the_reader(7, how=how)
+    asked_at = []
+    start = clock.now
+    for _ in range(int(200 / 0.5)):
+        clock.tick(0.5)
+        if controller.retry_cancels():
+            asked_at.append(clock.now - start)
+    # 1, 2, 4, 8, 16, 30, 30 seconds apart: bounded, and asked until confirmed
+    gaps = [b - a for a, b in zip([0.0, *asked_at], asked_at, strict=False)]
+    assert gaps == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0], gaps
+    assert len(cancels(exits)) == 8, "seven failures and the confirming ask"
+    assert "exit-1" not in controller._cancels
+    clock.tick(3600)
+    assert controller.retry_cancels() == 0, "a confirmed cancel is never asked again"
+    assert vend.vend_count == 0
+
+
+def test_the_backoff_is_bounded():
+    assert [exit_case_module.cancel_backoff(n) for n in range(1, 9)] == [
+        1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+
+def test_the_lane_thread_never_asks_a_cancel_again_under_the_runner():
+    """Never blocking the lane loop: with the runner's drain installed the lane
+    turns go on, past every backoff, and only the drain asks again."""
+    controller, vend, exits, clock = dropped_on_the_reader(1)
+    for _ in range(20):
+        clock.tick(5)
+        controller.observe_exit_case()
+        controller.run_once(timeout=0)
+    # the next car, covered, served on the lane's thread: every delivery it
+    # makes is the runner's signal, and none of them asks the cancel again
+    controller.identifier = StubVehicleIdentifier([VehicleIdentity(
+        plate="PASS-1", plate_region="FL", make=None, model=None, color=None,
+        confidence=0.99)])
+    controller.loop = SimulatedLoopInput(arrivals=1)
+    assert controller.run_once().should_vend and vend.vend_count == 1
+    controller.deliver()
+    assert len(cancels(exits)) == 1, "the lane's thread asked a cancel again"
+    from lane_controller.runner import LaneRunner
+
+    runner = LaneRunner(controller, client=None, rules_refresh_s=300.0, stays_refresh_s=5.0)
+    runner.drain_turn()
+    assert len(cancels(exits)) == 2 and "exit-1" not in controller._cancels
+
+
+def test_a_slow_retry_never_holds_the_lane():
+    controller, vend, exits, clock = dropped_on_the_reader(1)
+    release, entered = threading.Event(), threading.Event()
+    real = exits.exit_pay_cancel
+
+    def hung(exit_id):
+        entered.set()
+        release.wait(5)
+        return real(exit_id)
+
+    exits.exit_pay_cancel = hung
+    clock.tick(5)
+    worker = threading.Thread(target=controller.retry_cancels)
+    worker.start()
+    assert entered.wait(2)
+    began = time.monotonic()
+    controller.observe_exit_case()
+    controller.run_once(timeout=0)
+    assert controller.retry_cancels() == 0, "a second retry pass while one is in flight"
+    assert time.monotonic() - began < 1.0, "the lane waited on a cancel"
+    release.set()
+    worker.join(5)
+    assert "exit-1" not in controller._cancels
+
+
+def test_a_bare_controller_asks_again_when_it_delivers():
+    controller, vend, exits, clock = dropped_on_the_reader(1, drain=False)
+    clock.tick(1)
+    controller.deliver()
+    assert len(cancels(exits)) == 2 and "exit-1" not in controller._cancels
+
+
+def test_a_person_is_told_once_when_a_cancel_keeps_failing_and_the_lane_goes_on_asking():
+    controller, vend, exits, clock = dropped_on_the_reader(50)
+    for _ in range(int(600 / 0.5)):
+        clock.tick(0.5)
+        controller.retry_cancels()
+    pending = told(controller, "cancel_pending")
+    assert [(e["detail"]["exit_id"], e["detail"]["attempts"]) for e in pending] == [
+        ("exit-1", exit_case_module.EXIT_CANCEL_TELL_AFTER)]
+    assert "exit-1" in controller._cancels, "still asked"
+    assert vend.vend_count == 0
+
+
+def test_a_cancel_the_platform_refuses_outright_is_not_asked_again_and_a_person_is_told():
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.set_drain(lambda: None)
+    controller.run_once()
+    exits.exit_pay_cancel_refusal = "exit_on_another_lane"
+    controller.loop.clear()
+    controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
+    assert "exit-1" not in controller._cancels
+    assert [e["detail"]["exit_id"] for e in told(controller, "cancel_refused")] == ["exit-1"]
+    clock.tick(60)
+    assert controller.retry_cancels() == 0 and len(cancels(exits)) == 1
+
+
+def test_a_cancel_not_confirmed_before_a_restart_is_asked_again_after_it(tmp_path):
+    from lane_controller.durable import OutboxStore
+
+    path = tmp_path / "lane" / "decision-cache.outbox.sqlite"
+    first = EventQueue(store=OutboxStore(path))
+    controller, vend, exits, clock = dropped_on_the_reader(1, events=first)
+    assert "exit-1" in controller._cancels
+    assert first.wait_written(5)
+    assert OutboxStore(path).held_cancels() == ["exit-1"]
+    # THE RESTART: a new process, a new queue on the same file
+    again = EventQueue(PlatformTransport(exits), store=OutboxStore(path))
+    restarted = LaneController(
+        controller.config, loop=SimulatedLoopInput(arrivals=0), camera=CannedCameraFeed(),
+        vend=RecordingVendOutput(), identifier=StubVehicleIdentifier([]), cache=controller.cache,
+        events=again, clock=clock, exits=exits)
+    restarted.set_drain(lambda: None)
+    assert "exit-1" in restarted._cancels, "the restart forgot the cancel"
+    assert restarted.retry_cancels() == 1, "due at once after a restart"
+    assert len(cancels(exits)) == 2 and "exit-1" not in restarted._cancels
+    assert again.wait_written(5)
+    assert OutboxStore(path).held_cancels() == [], "a confirmed cancel left on disk"
+
+
+# ---------------------------------------------------------------------------
+# The payment-status guard, and no plate in a log line (fix 5).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["processing", "requires_capture", "succeeded", "canceled"])
+def test_a_payment_that_is_not_open_is_never_handed_to_the_reader_again(status):
+    """`_act`'s guard: only a payment that is open (or none yet) goes to the
+    reader. A card being processed, captured or canceled is the platform's;
+    handing the fee over again would put a second payment on the reader."""
+    controller, vend, exits, clock, _ = an_exit(
+        answer={**PAYMENT, "payment": {"status": status, "last_failure": None}})
+    controller.run_once()
+    for _ in range(3):
+        clock.tick(EXIT_RESEND_SECONDS)
+        controller.observe_exit_case()
+    assert pays(exits) == [], status
+    assert vend.vend_count == 0
+
+
+def test_the_control_an_open_payment_is_handed_to_the_reader():
+    controller, vend, exits, clock, _ = an_exit(
+        answer={**PAYMENT, "payment": {"status": "open", "last_failure": None}})
+    controller.run_once()
+    assert len(pays(exits)) == 1
+
+
+def test_no_log_line_carries_the_plate_text(caplog):
+    """Every exit-case path that logs -- opened, paid, declined, busy, word,
+    refused, unanswered, left, cancel failing and confirmed -- and no
+    record names the plate, as typed or as folded."""
+    caplog.set_level(logging.DEBUG)
+    display = SimulatedExitDisplay(entry_time="2026-09-21T09:00:00-04:00")
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT, display=display)
+    controller.run_once()
+    exits.exit_answer = {**PAYMENT, "payment": {"status": "open", "last_failure": DECLINED}}
+    clock.tick()
+    controller.observe_exit_case()
+    exits.exit_pay_refusal = "reader_busy"
+    clock.tick(EXIT_RESEND_SECONDS)
+    controller.observe_exit_case()
+    exits.exit_pay_refusal = None
+    exits.online = False
+    clock.tick(EXIT_RESEND_SECONDS)
+    controller.observe_exit_case()
+    exits.online = True
+    exits.exit_answer = {"settled": False, "needs": "driver_word"}
+    clock.tick(EXIT_RESEND_SECONDS)
+    controller.observe_exit_case()
+    exits.exit_answer = dict(PAID)
+    clock.tick()
+    controller.observe_exit_case()
+    # a second car, dropped with its cancel failing, then confirmed
+    second, _, exits2, clock2 = dropped_on_the_reader(1, drain=False)
+    clock2.tick(2)
+    second.deliver()
+    text = caplog.text
+    assert "exit case" in text, "the control: the exit case does log"
+    for plate in ("TRNS-7", "TRNS7", "TRN57", fold("TRNS-7")):
+        assert plate not in text, plate
+
+
+# ---------------------------------------------------------------------------
+# At night, a reader that cannot take a card (Gokhan, 2026-10-30).
+# ---------------------------------------------------------------------------
+
+
+def a_reader_that_cannot_take_a_card(reader):
+    """An exit case needing payment whose `/pay` always fails: the reader is
+    offline (503 `reader_offline`) or none is bound to the lane."""
+    from lane_controller.platform_client import PlatformUnreachable
+
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    if reader == "offline":
+        def offline(exit_id):
+            exits.exit_requests.append(("pay", exit_id))
+            raise PlatformUnreachable("HTTP 503: reader_offline")
+
+        exits.exit_pay = offline
+        return controller, vend, exits, clock, "unanswered"
+    exits.exit_pay_refusal = "no_reader_bound"
+    return controller, vend, exits, clock, "refused"
+
+
+@pytest.mark.parametrize("reader", ["offline", "none bound"])
+def test_at_night_a_reader_that_cannot_take_a_card_keeps_the_car_at_a_shut_gate_for_a_person(
+    reader,
+):
+    """The decision of 2026-10-30, as the lane does it already: the card reader
+    cannot take a card and nobody is on duty -- the case waits at a shut gate,
+    a person is told once, and the lane never opens on its own however long
+    the car waits (six hours here). A person deciding the case on the
+    platform is the way out, and the barrier then moves once."""
+    controller, vend, exits, clock, need = a_reader_that_cannot_take_a_card(reader)
+    decision = controller.run_once()
+    assert decision.fallback is Fallback.EXIT_NOT_SETTLED and vend.vend_count == 0
+    for _ in range(6 * 60):  # six hours, a turn a minute
+        clock.tick(60)
+        controller.observe_exit_case()
+    assert vend.vend_count == 0, "the gate opened with no card taken and no person"
+    assert controller._exit_case is not None, "the case was let go"
+    assert len(told(controller, need)) == 1, "a person is told once"
+    assert len(pays(exits)) > 1, "the fee is still offered to the reader"
+    exits.exit_answer = {"settled": True, "why": "person"}
+    clock.tick(60)
+    controller.observe_exit_case()
+    assert vend.vend_count == 1
+
+
+@pytest.mark.parametrize("reader", ["offline", "none bound"])
+def test_a_person_at_the_lane_lets_out_the_car_a_dead_reader_kept_waiting(reader):
+    controller, vend, exits, clock, need = a_reader_that_cannot_take_a_card(reader)
+    service = LaneService(controller)
+    controller.run_once()
+    for _ in range(3):  # a person at the lane within the completion's age bound
+        clock.tick(30)
+        controller.observe_exit_case()
+    assert vend.vend_count == 0 and len(told(controller, need)) == 1
+    status, said = person_opens(service, controller)
+    assert status == 202 and vend.vend_count == 1, said

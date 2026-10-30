@@ -298,6 +298,13 @@ class LaneController:
         # session times, which is the point: the platform must price the stay
         # from when the car was there, not from when it heard about it.
         self._clock = clock
+        #: THE CANCELS THE PLATFORM HAS NOT CONFIRMED, asked again with a
+        #: bounded backoff until it does (`retry_cancels`), on the drain's
+        #: thread -- never the lane's -- and on disk with the outbox, so a
+        #: restart asks again. A failed cancel was once dropped and left
+        #: another car's fee on the reader.
+        self._cancels = exit_case.PendingCancels(clock, self.events)
+        self._retrying = threading.Lock()
         # THE READ SIDE, and it is deliberately nothing more than this. The
         # contract publishes the last decision and the current transit, and
         # both live here, in memory, for exactly as long as this process does.
@@ -873,7 +880,7 @@ class LaneController:
         self.last_decision_completed_at = at
         self.begin_transit(identity, at)
         if case is not None:
-            exit_case.cancel_on_reader(case, self.exits)
+            self._cancel_on_reader(case)
             if self.exit_display is not None:
                 self.exit_display.show_exit(None)
 
@@ -1178,9 +1185,58 @@ class LaneController:
         case, self._left_on_reader = self._left_on_reader, None
         if case is None:
             return
-        exit_case.cancel_on_reader(case, self.exits)
+        self._cancel_on_reader(case)
         if self._reader_case == case.exit_id:
             self._reader_case = None
+
+    def _cancel_on_reader(self, case: exit_case.ExitCase) -> None:
+        """Ask once (`exit_case.cancel_on_reader`); a cancel the platform did
+        not confirm goes on the pending list, to be asked again off this
+        thread; one it refused outright is a person's to finish."""
+        outcome = exit_case.cancel_on_reader(case, self.exits)
+        if outcome in exit_case.CANCEL_RETRY:
+            self._cancels.add(case.exit_id)
+        elif outcome == exit_case.CANCEL_REFUSED:
+            self._tell_cancel(case.exit_id, exit_case.NEEDS_CANCEL_REFUSED)
+
+    def retry_cancels(self) -> int:
+        """Ask the platform again for every pending cancel that is due, until
+        it confirms: on the drain's thread under `LaneRunner` (its every
+        turn), inline only on a bare controller (`deliver`). Never on the
+        lane's thread under the runner, so a slow or failing platform never
+        holds a car. One retry pass at a time. Returns how many were asked."""
+        if self.exits is None or not self._retrying.acquire(blocking=False):
+            return 0
+        try:
+            asked = 0
+            for exit_id in self._cancels.due():
+                asked += 1
+                outcome = exit_case.cancel_payment(exit_id, self.exits)
+                if outcome in exit_case.CANCEL_CONFIRMED:
+                    self._cancels.settle(exit_id)
+                elif outcome == exit_case.CANCEL_REFUSED:
+                    self._cancels.settle(exit_id)
+                    self._tell_cancel(exit_id, exit_case.NEEDS_CANCEL_REFUSED)
+                else:
+                    attempts, tell = self._cancels.failed(exit_id)
+                    if tell:
+                        self._tell_cancel(exit_id, exit_case.NEEDS_CANCEL_PENDING,
+                                          attempts=attempts)
+            return asked
+        finally:
+            self._retrying.release()
+
+    def _tell_cancel(self, exit_id: str, need: str, **detail) -> None:
+        """A payment that may still be on the reader, said to a person once."""
+        self.events.record(
+            "fallback_needs_human",
+            self.config.lane_id,
+            reason=f"the exit case's payment could not be taken off the reader: {need}",
+            fallback=Fallback.EXIT_NOT_SETTLED.value,
+            exit_id=exit_id,
+            needs=need,
+            **detail,
+        )
 
     # ------------------------------------------------------------------
     # From the vend to the session, or to one of the three other answers.
@@ -1981,6 +2037,7 @@ class LaneController:
         if self._drain is None:
             self.events.flush()
             self.events.flush_pictures()
+            self.retry_cancels()
         else:
             self._drain()
 

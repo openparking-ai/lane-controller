@@ -289,6 +289,9 @@ class OutboxStore:
                 "event_id TEXT NOT NULL, taken_at REAL NOT NULL, size INTEGER NOT NULL, "
                 "image BLOB NOT NULL)"
             ))
+            _touch(self.path, lambda c: c.execute(
+                "CREATE TABLE IF NOT EXISTS cancels (exit_id TEXT PRIMARY KEY, at REAL NOT NULL)"
+            ))
 
     def add(self, event: LaneEvent) -> None:
         detail = json.dumps(event.detail, sort_keys=True)
@@ -317,6 +320,30 @@ class OutboxStore:
                       event_id=event_id)
             for kind, lane_id, at, detail, event_id in rows
         ]
+
+    # -- the cancels the platform has not confirmed -------------------------------
+
+    def add_cancel(self, exit_id: str, at: float) -> None:
+        """An exit case whose payment is still to come off the reader: kept
+        until the platform confirms the cancel, so a restart asks again. An
+        exit case's id, nothing about the car."""
+        with self._lock:
+            _touch(self.path, lambda c: c.execute(
+                "INSERT OR IGNORE INTO cancels (exit_id, at) VALUES (?, ?)", (exit_id, at)
+            ))
+
+    def remove_cancel(self, exit_id: str) -> None:
+        with self._lock:
+            _touch(self.path, lambda c: c.execute(
+                "DELETE FROM cancels WHERE exit_id = ?", (exit_id,)
+            ))
+
+    def held_cancels(self) -> list[str]:
+        with self._lock:
+            rows = _touch(self.path, lambda c: c.execute(
+                "SELECT exit_id FROM cancels ORDER BY at, rowid"
+            ).fetchall())
+        return [exit_id for (exit_id,) in rows]
 
     # -- the pictures ---------------------------------------------------------
 

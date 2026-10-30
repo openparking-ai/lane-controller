@@ -204,6 +204,16 @@ not drive the reader for that car, and a case the lane lets go of — the car
 left, the next car arrived, a person opened at the lane — has its payment
 canceled through the platform (`/exits/:id/pay/cancel`). An `exit_paid` answer
 is taken as paid, never as a failure, and opens nothing for a car already gone.
+**A cancel the platform did not confirm is never dropped**: one that could not
+reach the platform (or got a 5xx or a 429), or met a card being authorised, is
+asked again 1, 2, 4, 8 and 16 seconds later and then every 30 seconds until the
+platform confirms it (canceled, paid, or no payment to cancel). The retries run
+on the outbox's drain thread, never the lane's, and the pending cancels are kept
+in the outbox file, so a restart asks again. After five failed asks a person is
+told once (`fallback_needs_human`, `needs: "cancel_pending"`); a cancel the
+platform refuses outright (another lane's case, a case it does not know, an
+amount Stripe took differently) is not asked again and a person is told
+(`needs: "cancel_refused"`).
 A person's close names the case and the authority they opened on
 (`let_out_by`), and a close answered 503 `payment_unsettled` is sent again.
 The last car's payment comes off the reader after the

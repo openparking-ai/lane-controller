@@ -245,6 +245,9 @@ class LaneRunner:
             # The pictures kept with an entry (U7f), after the records they
             # belong to.
             self.controller.events.flush_pictures()
+            # The exit payments still to come off the reader, asked again
+            # here -- this thread, never the lane's -- when each is due.
+            self.controller.retry_cancels()
         except Exception:  # noqa: BLE001 -- the guard IS the point; see the module docstring
             self.state.drain_turn_errors += 1
             log.exception("a turn of the outbox drain raised; the drain goes round again")

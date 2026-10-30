@@ -236,8 +236,13 @@ class EventQueue:
         # docstring: the recording thread is the lane's.
         self._store = store
         self._disk = DiskWriter() if store is not None else None
+        #: The exit cases whose payment cancel the platform had not confirmed
+        #: when the process stopped (`durable.OutboxStore.held_cancels`): the
+        #: controller asks again for each (`exit_case.PendingCancels`).
+        self._held_cancels: list[str] = []
         if store is not None:
             self._sessions.extend(store.held())
+            self._held_cancels = store.held_cancels()
         # TWO THREADS MEET HERE. The lane thread records; the outbox drains on
         # a thread of its own (`LaneRunner`), or on the assisted vend's settle
         # worker. `_state` guards the deques for the microseconds an append
@@ -375,6 +380,27 @@ class EventQueue:
                 "a %s could not be kept in the outbox file; it is queued in memory only",
                 event.kind,
             )
+
+    def held_cancels(self) -> list[str]:
+        """The cancels held on disk at start, in the order they were kept."""
+        return list(self._held_cancels)
+
+    def keep_cancel(self, exit_id: str, at: float) -> None:
+        """Keep a cancel the platform has not confirmed, on the disk thread."""
+        if self._store is not None:
+            self._disk.submit(lambda: self._store_cancel(self._store.add_cancel, exit_id, at))
+
+    def forget_cancel(self, exit_id: str) -> None:
+        """Drop a cancel the platform confirmed, on the disk thread, after its add."""
+        if self._store is not None:
+            self._disk.submit(lambda: self._store_cancel(self._store.remove_cancel, exit_id))
+
+    @staticmethod
+    def _store_cancel(write, *args) -> None:
+        try:
+            write(*args)
+        except Exception:  # noqa: BLE001 -- a disk that fails never costs the lane
+            log.exception("a pending payment cancel could not be written to the outbox file")
 
     def wait_written(self, timeout: float = DISK_WAIT_S) -> bool:
         """Wait, at most `timeout`, for the disk thread to write what it was

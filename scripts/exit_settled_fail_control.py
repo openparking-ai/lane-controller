@@ -63,6 +63,16 @@ not known to stay down for one.
   close_unsettled_dropped    a close answered 503 payment_unsettled is dropped, not resent.
   let_out_by_not_sent        a person's close does not say what they opened on.
   flagged_let_out_dropped    a close after a flagged opening goes without let_out_by.
+  cancel_dropped             a cancel the platform did not confirm is never asked again.
+  cancel_backoff_unbounded   the wait before a cancel is asked again has no bound.
+  cancel_retried_on_lane_thread  the lane's thread asks the cancels again under the runner.
+  cancel_not_kept_on_disk    a pending cancel is in memory only: a restart forgets it.
+  cancel_not_asked_after_restart  the cancels held on disk are not asked after a restart.
+  cancel_pending_never_told  a cancel that keeps failing tells nobody.
+  cancel_refused_retried     a cancel the platform refuses outright is asked for ever.
+  cancel_retry_blocks        a second retry pass waits on the one in flight.
+  payment_guard_removed      a payment that is not open is handed to the reader again.
+  plate_logged               the plate is written into a log line.
 """
 
 from __future__ import annotations
@@ -145,6 +155,17 @@ BREAKAGES = [
      "a close answered 503 payment_unsettled is dropped from the outbox, not sent again"),
     ("let_out_by_not_sent", "a person's close does not say what authority they opened on"),
     ("flagged_let_out_dropped", "a close after a flagged opening goes without let_out_by"),
+    ("cancel_dropped", "a cancel the platform did not confirm is dropped, never asked again"),
+    ("cancel_backoff_unbounded", "the wait before a cancel is asked again has no bound"),
+    ("cancel_retried_on_lane_thread",
+     "the lane's own thread asks the pending cancels again under the runner"),
+    ("cancel_not_kept_on_disk", "a pending cancel is kept in memory only"),
+    ("cancel_not_asked_after_restart", "the cancels held on disk are not asked after a restart"),
+    ("cancel_pending_never_told", "a cancel that keeps failing tells nobody"),
+    ("cancel_refused_retried", "a cancel the platform refuses outright is asked for ever"),
+    ("cancel_retry_blocks", "a second retry pass waits on the one in flight"),
+    ("payment_guard_removed", "a payment that is not open is handed to the reader again"),
+    ("plate_logged", "the plate is written into a log line"),
 ]
 
 

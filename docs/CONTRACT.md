@@ -455,7 +455,13 @@ driver's word for when they came in, or let out by a person.
   after the vend. A case the lane lets go of without opening for it (the car
   left, the next car arrived, a person opened at the lane) has its payment
   canceled at Stripe and taken off the reader through the platform (`POST
-  /api/v1/lane/exits/:id/pay/cancel`), once. When the next car arrived,
+  /api/v1/lane/exits/:id/pay/cancel`), until the platform confirms it: a
+  cancel that did not reach the platform, got a 5xx or a 429, or met a card
+  being authorised (`payment_in_progress`) is asked again with a backoff of 1,
+  2, 4, 8, 16 and then 30 seconds, off the lane's thread, and survives a
+  restart; after five failed asks `fallback_needs_human` says
+  `needs: "cancel_pending"` once; a cancel refused outright is not asked again
+  (`needs: "cancel_refused"`). When the next car arrived,
   that call is made after the next car's frames are taken: before its case can
   hand a fee to the reader, and after the barrier for a car with no case. A
   409 `exit_paid` means the card had already paid: the platform settles the

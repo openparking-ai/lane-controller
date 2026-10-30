@@ -4090,5 +4090,91 @@ def _break_the_settled_exit(monkeypatch):
         monkeypatch.setattr(case_module, "LET_OUT_AUTHORITIES",
                             case_module.LET_OUT_AUTHORITIES - {"human_open_and_flag"})
 
+    elif mode == "cancel_dropped":
+        # A cancel the platform did not confirm is dropped and never asked
+        # again: another car's fee stays on the reader.
+        monkeypatch.setattr(case_module.PendingCancels, "add", lambda self, exit_id: None)
+
+    elif mode == "cancel_backoff_unbounded":
+        # The wait before a cancel is asked again doubles without a bound.
+        monkeypatch.setattr(
+            case_module, "cancel_backoff",
+            lambda attempts: case_module.EXIT_CANCEL_RETRY_FIRST_SECONDS
+            * 2 ** max(0, attempts - 1),
+        )
+
+    elif mode == "cancel_retried_on_lane_thread":
+        # The lane's own thread asks the pending cancels again on every
+        # delivery, drain or no drain: a slow platform holds the next car.
+        original = LaneController.deliver
+
+        def delivers_and_retries(self):
+            original(self)
+            if self._drain is not None:
+                self.retry_cancels()
+
+        monkeypatch.setattr(LaneController, "deliver", delivers_and_retries)
+
+    elif mode == "cancel_not_kept_on_disk":
+        # A pending cancel lives in memory only: a restart forgets it.
+        from lane_controller.events import EventQueue
+
+        monkeypatch.setattr(EventQueue, "keep_cancel", lambda self, exit_id, at: None)
+
+    elif mode == "cancel_not_asked_after_restart":
+        # The cancels held on disk are not asked again after a restart.
+        from lane_controller.events import EventQueue
+
+        monkeypatch.setattr(EventQueue, "held_cancels", lambda self: [])
+
+    elif mode == "cancel_pending_never_told":
+        # A cancel that keeps failing never tells a person.
+        original = case_module.PendingCancels.failed
+
+        def silent(self, exit_id):
+            attempts, _tell = original(self, exit_id)
+            return attempts, False
+
+        monkeypatch.setattr(case_module.PendingCancels, "failed", silent)
+
+    elif mode == "cancel_refused_retried":
+        # A cancel the platform refuses outright is asked again for ever,
+        # and nobody is told.
+        monkeypatch.setattr(case_module, "CANCEL_RETRY",
+                            case_module.CANCEL_RETRY | {case_module.CANCEL_REFUSED})
+
+    elif mode == "cancel_retry_blocks":
+        # A second retry pass waits for the one in flight.
+        original = LaneController.retry_cancels
+
+        def waits(self):
+            with self._retrying:
+                pass
+            return original(self)
+
+        monkeypatch.setattr(LaneController, "retry_cancels", waits)
+
+    elif mode == "payment_guard_removed":
+        # `_act` hands the fee to the reader whatever the payment's status.
+        original = case_module._act
+
+        def unguarded(case, platform, display, *, now):
+            payment = (case.answer or {}).get("payment")
+            if isinstance(payment, dict) and payment.get("status") not in (None, "open"):
+                case.answer = {**case.answer, "payment": {**payment, "status": "open"}}
+            return original(case, platform, display, now=now)
+
+        monkeypatch.setattr(case_module, "_act", unguarded)
+
+    elif mode == "plate_logged":
+        # The case's step writes the plate into a log line.
+        original = case_module.advance
+
+        def chatty(case, platform, display, *, now):
+            case_module.log.info("exit case for %s", case.identity.plate)
+            return original(case, platform, display, now=now)
+
+        monkeypatch.setattr(case_module, "advance", chatty)
+
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_SETTLED mode: {mode}")
