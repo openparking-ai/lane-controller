@@ -68,7 +68,9 @@ from .decision import (
     closed_to,
     decide,
     normalise_identity,
+    owner_denies,
     plate_read,
+    plate_seen,
     qr_may_open,
 )
 from .events import EventQueue, LaneEvent
@@ -84,6 +86,7 @@ from .interfaces import (
     VehicleIdentity,
     VendOutput,
 )
+from .loop_watch import SAMPLE_SECONDS, LoopWatch
 from .platform_client import PlatformRejected, PlatformUnreachable
 from .reader import ReaderScreen
 from .sync import (
@@ -204,6 +207,16 @@ log = logging.getLogger(__name__)
 BETWEEN_PICTURES = 2
 CLOSING_PICTURES = 2
 REFUSED_PICTURES = 2
+
+#: How the pass module's rule passed a QR (its answer's `passed_by`) when the
+#: opening is kept with the car's pictures: the read was not the QR's plate --
+#: one character off, or nothing usable was read.
+QR_PASSES_KEPT = frozenset({"one_difference", "nothing_read"})
+
+
+def _text(value) -> str | None:
+    """A non-empty string out of an answer, or None."""
+    return value if isinstance(value, str) and value else None
 
 
 class LaneController:
@@ -820,27 +833,53 @@ class LaneController:
         """Read the scanner once; present a QR for the car at the barrier.
 
         Called on the idle turns of `run_once`. A scan is presented only for
-        THE CAR THE LANE LAST REFUSED, still at the arming loop, whose refusal
-        a QR may open (`decision.qr_may_open`) and that nobody has completed
-        -- otherwise it is read, dropped, and nothing is recorded: a QR waved
-        at an empty lane, or at a car already let through, is nobody's.
+        THE CAR THE LANE LAST REFUSED, still at the arming loop with nothing
+        held behind it, whose refusal a QR may open (`decision.qr_may_open`)
+        and that nobody has completed -- otherwise it is read, dropped, and
+        nothing is recorded: a QR waved at an empty lane, or at a car already
+        let through, is nobody's.
 
-        The platform asks the pass module, which spends the QR once and
-        answers this movement: `open` on covered, and on nothing else. Open:
-        the relay, `vended`, and the transit as any open -- at an exit with no
-        local decision, so the close asks the modules, which now cover the
-        stay. Shut: the refusal stands, and a person is still the way past it.
+        THE OWNER'S DENY FIRST AND ALWAYS (2026-10-30): a deny rule for the
+        plate the camera read, AT ANY CONFIDENCE, keeps the QR from being
+        presented at all; and a deny rule for the plate the QR was made for
+        (`enrolment.qr_plate` in the answer) keeps the gate shut after the
+        module answered -- with nothing read, the car let in on a QR is the
+        QR's car. Neither is a QR's to overrule. Like every owner's rule, a
+        deny is applied while the cache is trusted (`owner_denies`).
+
+        WHAT IS PRESENTED is the plate this lane stands behind (`plate_read`)
+        or nothing: a plate below the confidence, no plate and no read are
+        "nothing usable", which the pass module's rule passes for a valid QR
+        (similar enough gets a pass: a look-alike, one difference, or nothing
+        read; `passed_by` in its answer). The decision is the module's, in one
+        place; the lane never compares plates for it.
+
+        The platform asks the pass module, which answers this movement: `open`
+        on covered, and on nothing else. Open: the relay, `vended` (with
+        `qr_passed_by` and the QR's `enrolment` id, never a plate), and the
+        transit as any open -- at an exit with no local decision, so the close
+        asks the modules. A QR that opened on one difference or on nothing
+        read has its car's pictures kept against that `vended` event: the
+        record is the event (the rule, the QR and the pictures), the stay
+        (what was read, as every stay keeps it) and the QR's own row in the
+        pass module (its plate, and what it was handed). Shut: the refusal
+        stands, and a person is still the way past it.
 
         THIS IS THE ONE LANE READ THAT WAITS ON THE NETWORK, and it has to: a
-        QR is a credential only the module can check. It runs on this thread
-        while the car it is for is stopped at the barrier and the arming loop
-        holds every car behind it. Offline -- the platform unreachable or the
-        module unable to answer -- the gate stays shut and a `qr_presented`
-        with `answered: false` says why; the platform recorded every one it
-        answered itself.
+        QR is a credential only the module can check. While it waits, the
+        arming loop is WATCHED (`LoopWatch`), and the barrier opens only for
+        the car that was there when the QR was scanned: the loop occupied now,
+        no clear longer than a flicker while the platform was asked, both
+        arming loops still occupied and nothing on the deactivate loop. A car
+        that backed off -- and whoever rolled on after it -- gets nothing
+        opened; a person is told (`fallback_needs_human`, `needs: "left"`).
+        Offline -- the platform unreachable or the module unable to answer --
+        the gate stays shut and a `qr_presented` with `answered: false` says
+        why; the platform recorded every one it answered itself.
 
         THE TOKEN IS KEPT NOWHERE: not in an event, not in a log line, not on
-        this controller. Neither is the plate on the events this writes.
+        this controller. Neither is a plate on the events this writes, nor in
+        a log line.
 
         A person's completion (`POST /v1/lane/vend`) of the same refusal at
         the same moment is checked against once more, just before the relay,
@@ -859,9 +898,7 @@ class LaneController:
             or decision is None
             or self.last_decision_completed_at is not None
             or not qr_may_open(decision, self.config.direction)
-            or not self.loop.is_occupied()
-            or not self.arming_complete(self.arming_loop_b)
-            or self.held_by_deactivate_loop(self.deactivate_loop)
+            or not self._car_at_the_barrier()
         ):
             log.info(
                 "lane %s: a QR was scanned with no refused car to present it for",
@@ -877,8 +914,18 @@ class LaneController:
             # asked here, before a QR can let this car in.
             log.info("lane %s: a QR was scanned for a banned car; not presented", lane)
             return None
-        vehicle = identity.plate or None
+        stale = self.cache.is_stale()
+        if owner_denies(self.cache, plate_seen(identity), stale=stale) is not None:
+            # THE OWNER'S DENY ON WHAT WAS READ, AT ANY CONFIDENCE: before the
+            # QR goes anywhere. The decision already denies a car read this
+            # way; the cache may have learned the rule since.
+            log.info("lane %s: a QR was scanned for a car the owner's rule denies; not "
+                     "presented", lane)
+            return None
+        # NOTHING USABLE IS NOTHING: below the confidence is not a read.
+        vehicle = plate_read(identity, self.config.confidence_threshold) or None
         unanswered = None
+        watch = LoopWatch(self.loop, self._clock).start()
         try:
             answer = self.qr_presenter(token, vehicle, to_iso(self._clock()))
         except PlatformUnreachable as err:
@@ -892,6 +939,8 @@ class LaneController:
                 QR_STALE: "presented too late",
             }.get(err.code, "rate limited" if err.status == 429 else "refused by the platform")
             answer = None
+        finally:
+            watch.stop()
         if answer is None:
             if unanswered is not None:
                 self.events.record(
@@ -914,13 +963,52 @@ class LaneController:
                 enrolment.get("refused"),
             )
             return None
+        if owner_denies(self.cache, _text(enrolment.get("qr_plate")), stale=stale) is not None:
+            # THE OWNER'S DENY ON THE QR'S CAR: with nothing read, or a read
+            # one character off, the car the QR lets in is the car it was
+            # made for -- and the owner denied that car. Shut; a person.
+            log.info("lane %s: the owner's rule denies the car a QR was made for; the gate "
+                     "stays shut", lane)
+            self.events.record(
+                "decision", lane, outcome=Outcome.DENY.value,
+                reason="the owner's rule denies the car this QR was made for; a QR does not "
+                "overrule the owner",
+                fallback=None, rate_plan=None,
+            )
+            self.deliver()
+            return None
         if self.last_decision_at != decided_at or self.last_decision_completed_at is not None:
             log.warning(
                 "lane %s: a QR was answered for a refusal already completed; not vended", lane
             )
             return None
+        if not (self._loop_now() and watch.stayed() and self._car_at_the_barrier(read=False)):
+            # THE CAR LEFT WHILE THE PLATFORM WAS ASKED -- or another rolled
+            # on, or one pulled up too close behind: nothing opens for whoever
+            # is there now. The refusal stands for a person.
+            log.info("lane %s: the car left the arming loop while its QR was checked; nothing "
+                     "opened", lane)
+            self.events.record(
+                "fallback_needs_human", lane,
+                reason="a QR was answered covered, but the car it was scanned for left the "
+                "arming loop while the platform was asked; nothing opened",
+                fallback=decision.fallback.value if decision.fallback else None,
+                needs="left",
+            )
+            self.deliver()
+            return None
+        passed_by = _text(enrolment.get("passed_by"))
         self.vend.vend(REASON_QR_OPENED)
-        self.events.record("vended", lane, reason=REASON_QR_OPENED)
+        vended = self.events.record(
+            "vended", lane, reason=REASON_QR_OPENED,
+            **({"qr_passed_by": passed_by} if passed_by else {}),
+            **({"enrolment": enrolment["enrolment"]}
+               if isinstance(enrolment.get("enrolment"), str) else {}),
+        )
+        if passed_by in QR_PASSES_KEPT:
+            # OPENED ON A READ THAT WAS NOT THE QR'S PLATE: the car's pictures,
+            # kept against this very `vended` event -- the picture reference.
+            self.events.queue_pictures(vended.event_id, self._take_pictures(REFUSED_PICTURES))
         at = to_iso(self._clock())
         arming = self._take_held_arming()
         self.last_decision_completed_at = at
@@ -930,6 +1018,30 @@ class LaneController:
         self._settle_transit(identity, at, exit_pricing=None, arming=arming)
         self.deliver()
         return opened
+
+    def _car_at_the_barrier(self, *, read: bool = True) -> bool:
+        """A car on the arming loop (read now, unless `read` is False: the
+        caller just read it), both arming loops occupied where there are two,
+        and nothing on the deactivate loop behind it."""
+        return (
+            (not read or self._loop_now())
+            and self.arming_complete(self.arming_loop_b)
+            and not self.held_by_deactivate_loop(self.deactivate_loop)
+        )
+
+    def _loop_now(self) -> bool:
+        """The arming loop now. A clear reading is read once more after
+        `SAMPLE_SECONDS`: one clear sample is a flicker, two a car gone. A
+        read that raises is a car gone."""
+        try:
+            if self.loop.is_occupied():
+                return True
+            time.sleep(SAMPLE_SECONDS)
+            return self.loop.is_occupied()
+        except Exception:  # noqa: BLE001 -- an unread loop fails shut
+            log.warning("lane %s: the arming loop could not be read; nothing opens",
+                        self.config.lane_id)
+            return False
 
     # ------------------------------------------------------------------
     # From the vend to the session, or to one of the three other answers.

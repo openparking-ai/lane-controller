@@ -393,8 +393,11 @@ not change; how often each member appears does.
   a closed lane: a display code is a driver serving themselves, and this garage
   takes no stranger. **A registration QR** the driver scans while the car is
   still at the arming loop may open either refusal, when the garage is not
-  full: the lane presents it through the platform to the pass module and opens
-  on `covered` only. That open is not on this contract as a new decision: the
+  full: the lane presents it through the platform to the pass module, with the
+  plate it read at its confidence or nothing, and opens on `covered` only, for
+  the car still on the arming loop. A plate the owner denied -- read at any
+  confidence, or the plate the QR was made for -- is `deny` first and is never
+  opened by a QR. That open is not on this contract as a new decision: the
   refused decision stays the last one, `decision.completed` becomes its time,
   and `vended` carries `registration_qr_covered`. A person's completion of the
   same decision afterwards is refused `already_completed`, as for any.

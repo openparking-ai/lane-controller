@@ -277,6 +277,28 @@ def garage_admits(cache: DecisionCache) -> str | None:
     return None
 
 
+def plate_seen(identity: VehicleIdentity) -> str | None:
+    """Whatever plate text the camera read, AT ANY CONFIDENCE, of a car that
+    was there -- or None. Never an identity and never looked up to OPEN
+    anything: it is what the owner's deny rule is checked against, first
+    (`owner_denies`), so a plate read below the confidence cannot get around
+    the owner's deny on the way to a person or a QR."""
+    if identity.presence is False or identity.unavailable is not None or not identity.plate:
+        return None
+    return identity.plate
+
+
+def owner_denies(cache: DecisionCache, *plates: str | None, stale: bool) -> Rule | None:
+    """THE OWNER'S DENY, CHECKED FIRST AND ALWAYS WINNING (the owner's rule of
+    2026-10-30): the deny rule naming any of these plates -- what was read at
+    any confidence (`plate_seen`), and the plate a QR was made for -- or None.
+    Like every owner's rule, only while the cache is trusted (`stale` False):
+    a stale rule is never applied (E3, the entry's second review)."""
+    if stale:
+        return None
+    return next((rule for plate in plates if (rule := cache.denying(plate)) is not None), None)
+
+
 def plate_read(identity: VehicleIdentity, confidence_threshold: float) -> str | None:
     """The plate this lane stands behind, or None.
 
@@ -872,6 +894,24 @@ class DecisionCache:
     def lookup(self, plate: str) -> Rule | None:
         return self._rules.get(plate.upper())
 
+    def denying(self, plate: str | None) -> Rule | None:
+        """The owner's DENY rule for this plate, or None: looked up as the
+        rules are keyed, and then under `normalise_identity` -- so the plate a
+        QR was made for, which comes in the pass module's normal form
+        (`ABC123`), meets a rule the owner typed `abc-123`. Wider than
+        `lookup`, and only ever used to keep a gate SHUT: an allow rule is
+        never matched this way."""
+        if not plate:
+            return None
+        exact = self.lookup(plate)
+        if exact is not None:
+            return None if exact.allow else exact
+        key = normalise_identity(plate)
+        return next(
+            (r for r in self._rules.values() if not r.allow and normalise_identity(r.plate) == key),
+            None,
+        )
+
     def __len__(self) -> int:
         return len(self._rules)
 
@@ -1114,12 +1154,19 @@ def _decide_entry(
     """The entry at a garage that has said what it takes. Presence and a
     closing to everyone were decided before this, as for every lane.
 
+    THE OWNER'S DENY COMES FIRST (2026-10-30): a plate the owner denied --
+    read at the lane's confidence or below it (`plate_seen`), while the cache
+    is trusted -- is DENIED before anything else is asked, at both kinds of
+    garage, and is never a refusal a QR may open. A plate read below the
+    confidence used to fall to "the pass could not be confirmed" before the
+    rule was looked up, and a QR then let the denied car in.
+
     WHAT THE LANE STANDS BEHIND is `plate_read`: only a plate read at the
-    lane's confidence is looked up, in the rules or the registers, so a car
-    nobody could read is never matched to someone else's pass. AN OWNER'S RULE
-    for a plate is consulted only while the cache is trusted -- a stale rule is
-    never applied, as before this rule existed. (The platform serves no rules
-    today; a lane given one honours it.)
+    lane's confidence is looked up to OPEN anything, in the rules or the
+    registers, so a car nobody could read is never matched to someone else's
+    pass. AN OWNER'S RULE for a plate, deny or allow, is consulted only while
+    the cache is trusted -- a stale rule is never applied, as before.
+    (The platform serves no rules today; a lane given one honours it.)
 
     A GARAGE THAT TAKES TRANSIENTS:
       1. full (`closed: full`): a car a register covers today gets in; every
@@ -1139,6 +1186,9 @@ def _decide_entry(
       5. a car a register covers today: open;
       6. every other car is DENIED (`REASON_NOT_REGISTERED`, the QR seam).
     """
+    denied = owner_denies(cache, plate_seen(identity), stale=stale)
+    if denied is not None:
+        return _by_rule(denied, identity)
     read = plate_read(identity, confidence_threshold)
     covered = False
     if read:

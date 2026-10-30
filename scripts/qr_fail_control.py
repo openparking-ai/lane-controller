@@ -10,8 +10,10 @@ that drives it; no tracked file is edited.
   owner_overruled           every entry refusal is one a QR may open
   banned_not_asked          a QR lets in a car on the banned list
   car_gone_presented        a QR is presented with the arming loop clear
+  deactivate_ignored        a QR is presented with a car on the deactivate loop
+  second_arming_ignored     a QR is presented with the second arming loop clear
   twice                     a completed refusal is presented again
-  unsure_plate_withheld     a plate read below the confidence is not sent
+  unsure_plate_sent         a plate read below the confidence is sent as a read
   offline_silent            a QR that could not be checked leaves no record
   recorded_twice            the module's own could-not-answer recorded again
   token_in_event            the token rides on `qr_presented`
@@ -22,6 +24,20 @@ that drives it; no tracked file is edited.
   wrong_route               the client posts somewhere the platform does not serve
   unanswered_code_lost      a 503's name is dropped, so it cannot be told from an outage
   not_wired                 a lane with a platform presents nothing
+  not_covered_only          the gate opens on any answer but not covered
+  no_recheck                the gate opens for a refusal a person completed meanwhile
+  left_during_call          the gate opens for a car that left while the QR was checked
+  watch_ignored             the loop's watch is not consulted: a swapped car is let in
+  watch_never_started       the loop is not watched while the platform is asked
+  final_read_dropped        the loop is not read again as the lane decides
+  watch_error_trusted       a loop read that raises on the watch is taken as the car there
+  deny_first_dropped        a read below the confidence gets around the owner's deny
+  deny_on_read_dropped      the QR is presented for a car whose read the owner denies
+  deny_on_qr_car_dropped    the QR opens for the car it was made for, which the owner denied
+  deny_normal_form_dropped  a deny typed with a dash misses the QR's plate
+  pass_not_recorded         the rule the module passed the QR on is not on `vended`
+  pictures_not_kept         an opening by one difference or nothing read keeps no pictures
+  plate_on_vended           the QR's plate rides on `vended`
 """
 
 from __future__ import annotations
@@ -42,6 +58,7 @@ CONTROLLER = "src/lane_controller/controller.py"
 DECISION = "src/lane_controller/decision.py"
 CLIENT = "src/lane_controller/platform_client.py"
 CLI = "src/lane_controller/cli.py"
+WATCH = "src/lane_controller/loop_watch.py"
 
 BREAKAGES = [
     ("any_answer_opens", "the gate opens on any answer", CONTROLLER,
@@ -51,13 +68,17 @@ BREAKAGES = [
     ("banned_not_asked", "a banned car is presented", CONTROLLER,
      "if self._banned(identity) is not None:", "if False:"),
     ("car_gone_presented", "a QR is presented for an empty lane", CONTROLLER,
-     "            or not self.loop.is_occupied()\n", ""),
+     "            (not read or self._loop_now())\n", "            True\n"),
+    ("deactivate_ignored", "a car behind does not keep the QR back", CONTROLLER,
+     "            and not self.held_by_deactivate_loop(self.deactivate_loop)\n", ""),
+    ("second_arming_ignored", "one arming loop of two is enough", CONTROLLER,
+     "            and self.arming_complete(self.arming_loop_b)\n", ""),
     ("twice", "a completed refusal is presented again", CONTROLLER,
      "            or self.last_decision_completed_at is not None\n            or not qr_may_open",
      "            or not qr_may_open"),
-    ("unsure_plate_withheld", "an unsure read is not sent", CONTROLLER,
-     "vehicle = identity.plate or None",
-     "vehicle = plate_read(identity, self.config.confidence_threshold)"),
+    ("unsure_plate_sent", "an unsure read is sent as a read", CONTROLLER,
+     "vehicle = plate_read(identity, self.config.confidence_threshold) or None",
+     "vehicle = identity.plate or None"),
     ("offline_silent", "an unchecked QR leaves no record", CONTROLLER,
      "            if unanswered is not None:\n", "            if False:\n"),
     ("recorded_twice", "the platform's record is doubled", CONTROLLER,
@@ -86,6 +107,44 @@ BREAKAGES = [
      'f"HTTP {err.code}: {body}"'),
     ("not_wired", "a lane with a platform presents nothing", CLI,
      "qr_presenter = platform.redeem_enrolment", "qr_presenter = None"),
+    ("not_covered_only", "the gate opens on anything but not covered", CONTROLLER,
+     'if answer.get("open") is not True:', 'if answer.get("outcome") == "not_covered":'),
+    ("no_recheck", "a completed refusal is vended again", CONTROLLER,
+     "        if self.last_decision_at != decided_at or self.last_decision_completed_at is not "
+     "None:\n", "        if False:\n"),
+    ("left_during_call", "a car that left is opened for", CONTROLLER,
+     "        if not (self._loop_now() and watch.stayed() and "
+     "self._car_at_the_barrier(read=False)):\n", "        if False:\n"),
+    ("watch_ignored", "the watch is not consulted", CONTROLLER,
+     "self._loop_now() and watch.stayed() and", "self._loop_now() and True and"),
+    ("watch_never_started", "the loop is not watched during the call", CONTROLLER,
+     "watch = LoopWatch(self.loop, self._clock).start()",
+     "watch = LoopWatch(self.loop, self._clock)"),
+    ("final_read_dropped", "the loop is not read as the lane decides", CONTROLLER,
+     "if not (self._loop_now() and watch.stayed()", "if not (True and watch.stayed()"),
+    ("watch_error_trusted", "a failed loop read vouches for the car", WATCH,
+     "            with self._lock:\n                self._left = True\n            return\n",
+     "            return\n"),
+    ("deny_first_dropped", "an unsure read gets around the owner's deny", DECISION,
+     "    denied = owner_denies(cache, plate_seen(identity), stale=stale)\n",
+     "    denied = None\n"),
+    ("deny_on_read_dropped", "a denied read is presented", CONTROLLER,
+     "        if owner_denies(self.cache, plate_seen(identity), stale=stale) is not None:\n",
+     "        if False:\n"),
+    ("deny_on_qr_car_dropped", "the QR's denied car is let in", CONTROLLER,
+     '        if owner_denies(self.cache, _text(enrolment.get("qr_plate")), stale=stale) is not '
+     'None:\n', "        if False:\n"),
+    ("deny_normal_form_dropped", "a deny typed with a dash misses the QR's plate", DECISION,
+     "        key = normalise_identity(plate)\n",
+     "        return None\n        key = normalise_identity(plate)\n"),
+    ("pass_not_recorded", "the rule is not on vended", CONTROLLER,
+     '**({"qr_passed_by": passed_by} if passed_by else {}),', ""),
+    ("pictures_not_kept", "no pictures of a passed car", CONTROLLER,
+     "        if passed_by in QR_PASSES_KEPT:\n", "        if False:\n"),
+    ("plate_on_vended", "the QR's plate rides on vended", CONTROLLER,
+     '**({"qr_passed_by": passed_by} if passed_by else {}),',
+     '**({"qr_passed_by": passed_by, "qr_plate": enrolment.get("qr_plate")} '
+     'if passed_by else {}),'),
 ]
 
 
