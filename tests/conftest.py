@@ -4180,6 +4180,12 @@ def _break_the_settled_exit(monkeypatch):
 
         monkeypatch.setattr(LaneController, "retry_cancels", waits)
 
+    elif mode == "closed_cancel_retried":
+        # A cancel answered `exit_closed` (the case superseded) is not taken
+        # as confirmed.
+        monkeypatch.setattr(case_module, "CANCEL_CONFIRMED",
+                            case_module.CANCEL_CONFIRMED - {case_module.CANCEL_CLOSED})
+
     elif mode == "no_payment_retried":
         # A cancel answered `no_payment` is not taken as confirmed: asked
         # again for ever.

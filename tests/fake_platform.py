@@ -84,6 +84,9 @@ class FakePlatform:
         #: The refusal code `/pay/cancel` raises (409), as `exit_paid` or
         #: `payment_in_progress` (platform 0042); None cancels.
         self.exit_pay_cancel_refusal: str | None = None
+        #: The stay the platform's matcher finds for a case that names none
+        #: (0037), or None: none found (`method: none`).
+        self.exit_match_session: str | None = None
         #: What `redeem_enrolment` answers, and how many QRs were presented.
         self.qr_answer: dict = {"open": False, "outcome": "not_covered",
                                 "enrolment": {"refused": "REFUSAL_CREDENTIAL_UNKNOWN"},
@@ -372,6 +375,9 @@ class FakePlatform:
 
     def _case(self, exit_id: str) -> dict:
         case = self.exits[exit_id]
+        if case.get("ended"):
+            # Closed by the platform (superseded): it answers as it was closed.
+            return dict(case)
         case.update({k: v for k, v in self.exit_answer.items()})
         if case.get("settled"):
             case.pop("needs", None)
@@ -380,16 +386,32 @@ class FakePlatform:
         return dict(case)
 
     def open_exit(self, *, event_id: str, exit_at: str, session_id=None, id_fields=None) -> dict:
+        """As the platform opens a case (0037, 0045): the stay the lane named,
+        or the one its matcher finds (`exit_match_session`, None: none found).
+        A case for a stay that already has an open case SUPERSEDES it -- the
+        old case's payment canceled and the case closed, `ended` naming the
+        new one -- and ONLY then: a case that resolves to no stay is a case
+        of its own, and any other open case stays open."""
         self._check()
         self.exit_requests.append(("open", event_id, session_id, dict(id_fields or {})))
         for case in self.exits.values():
             if case["event_id"] == event_id:
                 return self._case(case["id"])
         exit_id = f"exit-{len(self.exits) + 1}"
+        stay = session_id or self.exit_match_session
+        if stay:
+            for prior in self.exits.values():
+                if prior.get("session_id") == stay and not prior.get("closed"):
+                    prior["closed"] = True
+                    prior["ended"] = {"why": "superseded", "superseded_by": exit_id}
+                    prior["settled"] = False
+                    if isinstance(prior.get("payment"), dict):
+                        prior["payment"] = {**prior["payment"], "status": "canceled"}
+                    self.exit_requests.append(("supersede", prior["id"], exit_id))
         self.exits[exit_id] = {
-            "id": exit_id, "event_id": event_id, "exit_at": exit_at, "session_id": session_id,
-            "method": "lane" if session_id else "single", "fee": None, "payment": None,
-            "closed": False,
+            "id": exit_id, "event_id": event_id, "exit_at": exit_at, "session_id": stay,
+            "method": "lane" if session_id else ("single" if stay else "none"), "fee": None,
+            "payment": None, "closed": False,
         }
         return self._case(exit_id)
 

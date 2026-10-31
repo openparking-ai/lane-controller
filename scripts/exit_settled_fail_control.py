@@ -78,6 +78,7 @@ not known to stay down for one.
   fee_not_held               the next car's fee goes on before the last car's cancel is confirmed.
   held_car_never_told        a car held behind an unconfirmed cancel never reaches a person.
   held_car_fee_sent          the held car's fee is sent once a person is told.
+  closed_cancel_retried      a cancel answered exit_closed is not taken as confirmed.
 """
 
 from __future__ import annotations
@@ -178,6 +179,7 @@ BREAKAGES = [
      "the next car's fee is handed to the reader before the last car's cancel is confirmed"),
     ("held_car_never_told", "a car held behind an unconfirmed cancel never reaches a person"),
     ("held_car_fee_sent", "the held car's fee is sent once a person has been told"),
+    ("closed_cancel_retried", "a cancel answered exit_closed is not taken as confirmed"),
 ]
 
 

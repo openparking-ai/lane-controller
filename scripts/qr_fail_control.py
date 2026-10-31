@@ -46,6 +46,11 @@ that drives it; no tracked file is edited.
   qr_not_sent               the transport leaves the QR off the open
   exit_direct_opener        a covered QR at an exit opens the barrier itself, case unsettled
   exit_case_not_reasked     a covered QR at an exit never asks the car's case again
+  exit_old_cancel_dropped   the old exit case's payment cancel is not queued
+  exit_no_stay_reasked      a case with no stay is asked again: a second open case
+  exit_card_taken_reasked   a case is asked again while its card is being taken
+  exit_qr_reused            the same QR asks the same car's case again and again
+  exit_rolled_on_ignored    a clear longer than a flicker before the QR is ignored
 """
 
 from __future__ import annotations
@@ -177,6 +182,17 @@ BREAKAGES = [
     ("exit_case_not_reasked", "the exit case is not asked again", CONTROLLER,
      "        self.deliver()\n        self._advance_exit_case(fresh)\n",
      "        self.deliver()\n"),
+    ("exit_old_cancel_dropped", "the old case's cancel is not queued", CONTROLLER,
+     "never left behind.\n        self._cancel_on_reader(case)\n", "never left behind.\n"),
+    ("exit_no_stay_reasked", "a case with no stay is asked again", CONTROLLER,
+     "            elif stay is None:\n", "            elif False:\n"),
+    ("exit_card_taken_reasked", "asked again mid-payment", CONTROLLER,
+     "            if exit_case.payment_status(case) not in exit_case.SUPERSEDE_PAYMENTS:\n",
+     "            if False:\n"),
+    ("exit_qr_reused", "the same QR asks again", CONTROLLER,
+     "            if key in case.qr_used:\n", "            if False:\n"),
+    ("exit_rolled_on_ignored", "a rolled-on car's QR asks again", CONTROLLER,
+     "                    rolled_on = True\n", "                    rolled_on = False\n"),
     ("plate_on_vended", "the QR's plate rides on vended", CONTROLLER,
      '**({"qr_passed_by": passed_by} if passed_by else {}),',
      '**({"qr_passed_by": passed_by, "qr_plate": enrolment.get("qr_plate")} '

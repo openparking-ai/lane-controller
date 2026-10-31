@@ -407,11 +407,13 @@ not change; how often each member appears does.
   same decision afterwards is refused `already_completed`, as for any.
 
   **What the platform is sent about a QR's opening** (beside this read
-  contract): `vended` carries `qr_passed_by` (how the pass module's rule passed
-  the QR: `same_plate`, `look_alike`, `one_difference`, `nothing_read`) and
-  `enrolment` (the QR's id), never a plate; a QR that opened on
-  `one_difference` or `nothing_read` has the car's pictures kept against that
-  `vended` event. The stay the QR opened -- `POST /api/v1/lane/sessions/open`
+  contract): at an entry, `vended` carries `qr_passed_by` (how the pass
+  module's rule passed the QR: `same_plate`, `look_alike`, `one_difference`,
+  `nothing_read`) and `enrolment` (the QR's id), never a plate; a QR that
+  opened on `one_difference` or `nothing_read` has the car's pictures kept
+  against that `vended` event. At an exit the opening is the exit case's (see
+  the next section): `vended` names the case, and the car's pictures are kept
+  under the case the QR asked again. The stay the QR opened -- `POST /api/v1/lane/sessions/open`
   at an entry, `/sessions/close` at an exit -- carries
   `qr: {"enrolment": "<id>", "passed_by": "<rule>", "qr_plate": "<the QR's
   plate, the pass module's normal form>"}`, each key only when the module
@@ -501,12 +503,24 @@ driver's word for when they came in, or let out by a person.
   only for the car still on the loop when its answer comes back. A 409
   `payment_in_progress` (a card being authorised) opens nothing either.
 - **A registration QR at the exit** opens nothing itself. A QR the pass
-  module answers covered asks the car's case again as a new case for the same
-  stay (a new `event_id`; the platform supersedes the old case and prices the
-  stay again, the module first), and the barrier opens only if that case is
-  settled, by the opener below; the close then carries `exit_id` and `qr`. A
-  QR the module does not cover, or a case still priced, leaves the car on
-  payment or a person.
+  module answers covered asks the car's case again as a new case for THE SAME
+  STAY -- a new `event_id` naming the stay the old case is for, the one the
+  lane priced or the one the platform answered as found (`session_id`) --
+  with the old case's ID fields and the car's pictures under its own event.
+  Naming the stay is what makes the platform supersede the old case (its
+  payment canceled and off the reader, the case closed) and price the stay
+  again, the module first; the lane queues the old case's payment cancel as
+  well, asked until confirmed (a superseded case answers canceled, or 409
+  `exit_closed`, both taken as confirmed). The barrier opens only if the new
+  case is settled, by the opener below; the close then carries `exit_id` and
+  `qr`. A QR the module does not cover, or a case still priced, leaves the car
+  on payment or a person. A case that names no stay is not asked again --
+  that would be a second open case matched from scratch -- and
+  `fallback_needs_human` says `needs: "qr_covered"` with its `exit_id` and
+  the QR's `enrolment`, once. Nothing is asked again while the old case's
+  payment is processing, captured or paid, nor twice for the same QR, and a
+  clear under the old case longer than a flicker drops it to a person
+  (`needs: "left"`) instead.
 - **When it is settled**, the barrier opens, `vended` names the case, and the
   stay's close names it too. Then a text receipt goes to the phone the driver
   gave, once, best effort: after the barrier, never before it.
@@ -533,7 +547,7 @@ cannot stand behind opens a case with no ID fields: that excludes no stay, and
 the platform's picker or the driver's word decides. The positioned characters
 are passed on unchecked until the identity service's contract for them lands.
 `tests/test_exit_case.py` holds this, and `scripts/exit_settled_fail_control.py`
-breaks it forty-two ways.
+breaks it seventy-four ways.
 
 ### The transit
 

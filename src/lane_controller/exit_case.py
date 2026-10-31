@@ -225,6 +225,9 @@ class ExitCase:
     fee_held: bool = False
     #: When this case's fee was first held, or None: not held now.
     held_since: float | None = None
+    #: The registration QRs (by enrolment id) a covered answer already acted on
+    #: for this car's case: a QR asks the case again, or tells a person, once.
+    qr_used: frozenset = frozenset()
     #: Whether a person was told this car waits on an earlier car's payment.
     held_told: bool = False
 
@@ -480,13 +483,16 @@ def send_receipt(case: ExitCase, platform, display: ExitDisplay | None) -> bool:
 CANCELED = "canceled"
 CANCEL_FOUND_PAID = "paid"
 CANCEL_NOTHING = "nothing"
+#: The platform closed the case (409 `exit_closed`) -- superseded by a later
+#: case for its stay, whose open canceled its payment first (platform 0045).
+CANCEL_CLOSED = "closed"
 CANCEL_IN_PROGRESS = "in_progress"
 CANCEL_FAILED = "failed"
 CANCEL_REFUSED = "refused"
 
 #: The platform has the payment off the reader, or never had one on it: the
 #: cancel is done and is not asked again.
-CANCEL_CONFIRMED = frozenset({CANCELED, CANCEL_FOUND_PAID, CANCEL_NOTHING})
+CANCEL_CONFIRMED = frozenset({CANCELED, CANCEL_FOUND_PAID, CANCEL_NOTHING, CANCEL_CLOSED})
 #: Asked again, with a bounded backoff, until the platform confirms
 #: (`PendingCancels`): never dropped, and never on the lane's thread.
 CANCEL_RETRY = frozenset({CANCEL_IN_PROGRESS, CANCEL_FAILED})
@@ -509,6 +515,32 @@ NEEDS_CANCEL_REFUSED = "cancel_refused"
 EXIT_FEE_HELD_TELL_SECONDS = 20.0
 #: What a person is told then, naming the waiting car's own case.
 NEEDS_FEE_HELD = "fee_held"
+
+#: What a person is told when a registration QR covers the car at the exit
+#: but its case names no stay the lane can ask again (`stay_of`): no stay was
+#: found, so the platform has nothing to price again. The case stays as it
+#: is -- payment or a person -- and nothing opens on the QR.
+NEEDS_QR_COVERED = "qr_covered"
+
+#: The payment states a case may be asked again in (superseded): none yet,
+#: one waiting on the reader (the platform's supersede cancels it first), or
+#: one already canceled. Never while a card is being processed or taken.
+SUPERSEDE_PAYMENTS = frozenset({None, "open", "canceled"})
+
+
+def stay_of(case: ExitCase) -> str | None:
+    """The stay this case is for: the one the lane named, or the one the
+    platform found and answered (`session_id`). None when there is none."""
+    if case.session_id:
+        return case.session_id
+    found = (case.answer or {}).get("session_id")
+    return found if isinstance(found, str) and found else None
+
+
+def payment_status(case: ExitCase) -> str | None:
+    """The case's payment status as last answered, or None: no payment."""
+    payment = (case.answer or {}).get("payment")
+    return payment.get("status") if isinstance(payment, dict) else None
 
 #: The vend authorities the platform's close takes as `let_out_by` (platform
 #: 0042; `human_open_and_flag` is marked flagged on its change-log line). It
@@ -551,6 +583,9 @@ def cancel_payment(exit_id: str, platform) -> str:
         if err.code == "no_payment":
             log.info("exit case: the case has no payment to cancel")
             return CANCEL_NOTHING
+        if err.code == "exit_closed":
+            log.info("exit case: the platform has closed the case; nothing is left to cancel")
+            return CANCEL_CLOSED
         if err.code == "payment_in_progress":
             log.info("exit case: a card is being authorised; the payment was not canceled yet")
             return CANCEL_IN_PROGRESS

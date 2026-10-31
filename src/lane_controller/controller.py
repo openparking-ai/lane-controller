@@ -1327,10 +1327,12 @@ class LaneController:
         place; the lane never compares plates for it.
 
         The platform asks the pass module, which answers this movement: `open`
-        on covered, and on nothing else. Open: the relay, `vended` (with
-        `qr_passed_by` and the QR's `enrolment` id, never a plate), and the
-        transit as any open -- at an exit with no local decision, so the close
-        asks the modules. A QR that opened on one difference or on nothing
+        on covered, and on nothing else. At an ENTRY, open: the relay,
+        `vended` (with `qr_passed_by` and the QR's `enrolment` id, never a
+        plate), and the transit as any open. At an EXIT a QR opens nothing
+        itself: a covered QR asks the car's exit case again as the same stay
+        (`_qr_settles_exit_case`), and the case's one opener opens when it is
+        settled. A QR that opened on one difference or on nothing
         read has its car's pictures kept against that `vended` event: the
         record is the event (the rule, the QR and the pictures), the stay
         (what was read, as every stay keeps it) and the QR's own row in the
@@ -1504,36 +1506,101 @@ class LaneController:
         return opened
 
     def _qr_settles_exit_case(self, qr_fields: dict | None) -> None:
-        """A QR the pass module answered covered, at an EXIT: the car's case
-        is asked again, and the barrier opens only if THAT says settled --
-        through `_advance_exit_case` and `_let_out`, the one opener, with its
-        loop watch, its final read and its lock.
+        """A QR the pass module answered covered, at an EXIT. The QR opens
+        nothing: the gate opens only when the car's case is settled, through
+        `_advance_exit_case` and `_let_out` -- the one opener, with its loop
+        watch, its final read and its lock.
 
-        The case is asked again as a NEW case for the same stay (a new
-        `event_id`, the same `session_id`, ID fields and fee as the lane had
-        them): the platform supersedes the old one -- its open payment
-        canceled at Stripe and off the reader first (platform 0045) -- and
-        prices the stay again, the pass module asked first, so the car the
-        QR now covers comes back covered. A case the platform still prices
-        stays on payment or a person, as any. No waiting case -- the car's
-        case was let go, or there is no platform -- is nothing to settle:
-        nothing opens. The close names the case and carries the QR (`qr`)."""
+        THE CASE IS ASKED AGAIN, AS THE SAME STAY, OR NOT AT ALL. The lane
+        opens a new case for the stay the old one is for (`exit_case.stay_of`:
+        the stay the lane named, or the one the platform found and answered),
+        with the old case's ID fields and fee. Naming the stay is what makes
+        the platform supersede the old case -- its payment canceled and off the
+        reader first, the case closed (platform 0045) -- and price the stay
+        again with the pass module first. An old case that names NO stay (none
+        was found: the driver's word, an unmatched car) is not asked again: a
+        second case would be a second open case on the platform, matched from
+        scratch, with the first one's payment still on the reader. The case
+        stays as it is (payment or a person) and a person is told the QR
+        covers the car (`needs: "qr_covered"`), once.
+
+        NEVER WHILE A CARD IS TAKEN, AND ONCE PER QR: not while the old case's
+        payment is being processed (`SUPERSEDE_PAYMENTS`), and a QR that has
+        already acted on this car's case does nothing more.
+
+        THE OLD CASE'S PAYMENT IS NEVER LEFT ON THE READER: whatever the
+        platform does with the new case, the old case's cancel is queued
+        (`_cancel_on_reader`, asked off the lane's thread until confirmed --
+        a superseded case answers canceled, or `exit_closed`).
+
+        THE ROLLED-ON CAR RULE HOLDS ACROSS THE SWAP: a clear under the old
+        case longer than a flicker drops it to a person, as
+        `observe_exit_case` does, and nothing is asked again for the car on
+        the loop now. The close names the case and carries the QR (`qr`)."""
         lane = self.config.lane_id
+        key = (qr_fields or {}).get("enrolment") or ""
+        rolled_on = False
+        tell = None
+        fresh = None
         with self._exit_lock:
             case = self._exit_case
             if case is None:
                 log.info("lane %s: a covered QR at the exit has no waiting case to settle; "
                          "nothing opens", lane)
                 return None
-            fresh = exit_case.ExitCase(
-                event_id=str(uuid.uuid4()),
-                exit_at=case.exit_at,
-                identity=case.identity,
-                pricing=case.pricing,
-                fields=case.fields,
-                session_id=case.session_id,
+            if key in case.qr_used:
+                log.info("lane %s: this QR already acted on the waiting case; nothing more",
+                         lane)
+                return None
+            if exit_case.payment_status(case) not in exit_case.SUPERSEDE_PAYMENTS:
+                log.info("lane %s: the waiting case's payment is being taken; a QR does not "
+                         "ask it again now", lane)
+                return None
+            if case.clear_since is not None:
+                if self._clock() - case.clear_since >= exit_case.EXIT_FLICKER_SECONDS:
+                    rolled_on = True
+                else:
+                    case.clear_since = None  # a flicker, as `observe_exit_case` reads it
+            stay = exit_case.stay_of(case)
+            if rolled_on:
+                pass
+            elif stay is None:
+                case.qr_used = case.qr_used | {key}
+                tell = case
+            else:
+                fresh = exit_case.ExitCase(
+                    event_id=str(uuid.uuid4()),
+                    exit_at=case.exit_at,
+                    identity=case.identity,
+                    pricing=case.pricing,
+                    fields=case.fields,
+                    session_id=stay,
+                    clear_since=case.clear_since,
+                    qr_used=case.qr_used | {key},
+                )
+                self._exit_case = fresh
+        if rolled_on:
+            self._leave_exit_case(
+                "the arming loop read clear under the waiting car for longer than a flicker "
+                "before its QR was answered; the car on it now was not read"
             )
-            self._exit_case = fresh
+            return None
+        if tell is not None:
+            self.events.record(
+                "fallback_needs_human",
+                lane,
+                reason="a registration QR covers this car, but its exit case names no stay "
+                "to ask again; the case stays as it is and a person decides",
+                fallback=Fallback.EXIT_NOT_SETTLED.value,
+                exit_id=tell.exit_id,
+                needs=exit_case.NEEDS_QR_COVERED,
+                **({"enrolment": key} if key else {}),
+            )
+            self.deliver()
+            return None
+        # THE OLD CASE: its payment off the reader, queued here and asked off
+        # this thread until the platform confirms it -- never left behind.
+        self._cancel_on_reader(case)
         if self._reader_case == case.exit_id:
             self._reader_case = None
         # The pictures the platform's picker is shown of this car, under the

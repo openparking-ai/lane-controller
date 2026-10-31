@@ -430,11 +430,19 @@ person). **At an entry the gate opens on `covered` and on nothing else**: the
 relay, `vended` with `registration_qr_covered`, and the transit as any open.
 **At an exit a QR opens nothing itself**: the gate opens only when the exit is
 settled, and only through the exit case's one opener. A QR the module covers
-asks the car's case again -- a new case for the same stay, which the platform
-supersedes and prices again with the pass module first, covering a stay a QR
-let in by the QR's plate -- and the barrier opens when that case says settled,
-with the case's own loop watch and final read; a case the platform still prices
-stays on payment or a person, and with no waiting case nothing opens. An opening the module passed on one difference or on
+asks the car's case again, AS THE SAME STAY: a new case naming the stay the old
+one is for (the one the lane priced, or the one the platform found), so the
+platform supersedes the old case -- its payment canceled and off the reader --
+and prices the stay again with the pass module first; the lane queues the old
+case's payment cancel too, so it is never left on the reader. The barrier opens
+when that case says settled, with the case's own loop watch and final read; a
+case still priced stays on payment or a person. A case that names no stay (an
+unmatched car, the driver's word) is not asked again -- that would be a second
+open case -- and a person is told the QR covers the car (`needs:
+"qr_covered"`); the platform cannot cover such a car by its QR yet. Never while
+the old case's card is being taken, once per QR, and a clear under the old case
+longer than a flicker drops it to a person instead. With no waiting case nothing
+opens. At an entry, an opening the module passed on one difference or on
 nothing read is recorded: `vended` names the rule (`qr_passed_by`) and the QR
 (`enrolment`), the car's pictures are kept against that event, the stay keeps
 what was read as every stay does, and the module keeps the QR's plate and what

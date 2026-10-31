@@ -1217,6 +1217,7 @@ def test_the_cancel_reads_exit_paid_as_paid_and_payment_in_progress_as_neither()
         (None, exit_case_module.CANCELED),
         ("exit_paid", exit_case_module.CANCEL_FOUND_PAID),
         ("no_payment", exit_case_module.CANCEL_NOTHING),
+        ("exit_closed", exit_case_module.CANCEL_CLOSED),
         ("payment_in_progress", exit_case_module.CANCEL_IN_PROGRESS),
         ("exit_on_another_lane", exit_case_module.CANCEL_REFUSED),
         ("payment_amount_mismatch", exit_case_module.CANCEL_REFUSED),
@@ -1873,3 +1874,16 @@ def test_a_person_lets_out_the_car_held_behind_a_cancel():
     clock.tick(5)
     status, said = person_opens(service, controller, key="KEY-EXIT-HELD")
     assert status == 202 and vend.vend_count == 1, said
+
+
+def test_a_pending_cancel_for_a_case_the_platform_closed_is_confirmed():
+    """A case the platform superseded is closed, its payment canceled by the
+    supersede: a cancel answered 409 `exit_closed` is done, never asked again."""
+    controller, vend, exits, clock = dropped_on_the_reader(1)
+    exits.exit_pay_cancel = lambda exit_id: (_ for _ in ()).throw(
+        PlatformRejected(409, "{}", "exit_closed"))
+    clock.tick(1)
+    assert controller.retry_cancels() == 1 and "exit-1" not in controller._cancels
+    clock.tick(60)
+    assert controller.retry_cancels() == 0
+    assert not told(controller, "cancel_refused")

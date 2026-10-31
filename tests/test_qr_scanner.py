@@ -28,8 +28,13 @@ this file to go red:
      says why -- except where the platform recorded it itself
   6  the token is kept nowhere: not in an event, a log line or the outbox;
      and no plate rides on `qr_presented`
-  7  an exit the lane did not let out is let out by a QR the module covers,
-     and the close carries no local decision, so the platform asks the modules
+  7  at an exit a QR opens nothing itself: a QR the module covers asks the
+     car's case again AS THE SAME STAY -- the old case superseded on the
+     platform, its payment's cancel queued, never left on the reader -- and
+     the gate opens only when that case is settled, through the exit case's
+     one opener; a case that names no stay is not asked again (a person is
+     told); never while a card is being taken; once per QR; the rolled-on
+     car rule holds across the swap
 """
 
 from __future__ import annotations
@@ -387,12 +392,20 @@ CASE_PAYMENT = {"settled": False, "needs": "payment", "payment": None,
                         "refused": False}}
 
 
-def an_exit_waiting(answer):
+#: The stay the platform found for the car at the exit.
+STAY = "stay-77"
+#: A read below the confidence, with a colour code: the case's one ID field.
+LOW_EXIT = VehicleIdentity(plate=STRANGER, confidence=0.42, presence=True, color_code="c-07")
+
+
+def an_exit_waiting(answer, *, stay=STAY, payment=None):
     """An exit lane with the platform's exit cases wired, the car's case on
-    payment: the gate shut until the case is settled."""
+    payment and its fee handed to the reader: the gate shut until the case is
+    settled. `stay`: the stay the platform found for the case (None: none)."""
     controller, vend, platform, scanner, presenter, loop = a_lane(
-        LOW, direction="exit", transient=True, exits=True, presenter=answer)
-    platform.exit_answer = dict(CASE_PAYMENT)
+        LOW_EXIT, direction="exit", transient=True, exits=True, presenter=answer)
+    platform.exit_match_session = stay
+    platform.exit_answer = {**CASE_PAYMENT, **({"payment": payment} if payment else {})}
     refused = controller.run_once()
     assert refused.fallback is Fallback.EXIT_NOT_SETTLED and vend.vend_count == 0
     assert controller._exit_case.exit_id == "exit-1"
@@ -400,31 +413,43 @@ def an_exit_waiting(answer):
 
 
 def opened_cases(platform):
-    return [r[1] for r in platform.exit_requests if r[0] == "open"]
+    return [r for r in platform.exit_requests if r[0] == "open"]
 
 
-def test_a_covered_qr_at_the_exit_settles_the_case_and_the_one_opener_opens_once():
-    """The rewiring: at an exit the QR opens nothing itself. A QR the module
-    covers asks the car's case again -- a new case for the same stay, which
-    the platform prices again with the pass module first -- and the barrier
-    opens through `_let_out` when that case says settled: once, its `vended`
-    naming the case, the close naming the case and the QR."""
+def requests(platform, kind):
+    return [r for r in platform.exit_requests if r[0] == kind]
+
+
+def requote_covered(holder):
+    """The platform, asked again after the QR bound the car, covers it."""
+    return lambda: holder["platform"].exit_answer.update({"settled": True, "why": "covered"})
+
+
+def test_a_covered_qr_at_the_exit_asks_the_same_stay_and_the_one_opener_opens_once():
+    """The rewiring, as the same stay: the new case names the stay the platform
+    found for the old one -- so the platform supersedes the old case -- with
+    the old case's ID fields, pictures under its own event, the old case's
+    payment cancel queued; the barrier opens through `_let_out` once."""
     holder = {}
-
-    def requoted():
-        holder["platform"].exit_answer = {"settled": True, "why": "covered"}
-
-    presenter = SlowPresenter(0.0, during=requoted, answer=passed("nothing_read"))
+    presenter = SlowPresenter(0.0, during=requote_covered(holder), answer=passed("nothing_read"))
     controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
     holder["platform"] = platform
+    assert ("pay", "exit-1") in platform.exit_requests, "the old fee is on the reader"
     scanner.scan(QR)
     controller.run_once()
+    first, second = opened_cases(platform)
+    assert second[2] == STAY, "the new case names the stay the platform found"
+    assert second[3] == first[3] == {"color_code": "c-07"}, "with the old case's ID fields"
+    assert requests(platform, "supersede") == [("supersede", "exit-1", "exit-2")]
+    assert ("pay_cancel", "exit-1") in platform.exit_requests, "the old payment's cancel"
+    assert "exit-1" not in controller._cancels
+    kept = [p for p in platform.pictures.values() if p["event_id"] == second[1]]
+    assert kept, "the car's pictures under the new case's own event"
+    assert controller._reader_case != "exit-1", "the reader is held for no stale case"
     assert vend.vend_count == 1
-    assert presenter.calls[0][1] is None, "below the confidence is nothing usable"
-    assert len(opened_cases(platform)) == 2, "the case was asked again as a new case"
     [vended] = [e for e in platform.events.values() if e["kind"] == "vended"]
-    assert vended["detail"]["exit_id"] == "exit-2"
-    assert vended["detail"]["reason"] == "the exit is settled: covered"
+    assert (vended["detail"]["exit_id"], vended["detail"]["reason"]) == (
+        "exit-2", "the exit is settled: covered")
     [closed] = platform.closed
     assert closed["exit_id"] == "exit-2"
     assert closed["qr"] == {"enrolment": "qr-1", "passed_by": "nothing_read",
@@ -440,26 +465,195 @@ def test_a_qr_the_module_covers_but_the_platform_still_prices_stays_on_payment()
     controller.run_once()
     assert vend.vend_count == 0, "the gate opened on the QR with the case unsettled"
     assert controller._exit_case is not None and controller._exit_case.exit_id == "exit-2"
+    assert requests(platform, "supersede") == [("supersede", "exit-1", "exit-2")]
     assert ("pay", "exit-2") in platform.exit_requests, "the fee goes to the reader"
+    assert ("pay_cancel", "exit-1") in platform.exit_requests
 
 
 def test_a_qr_the_module_does_not_cover_leaves_the_case_as_it_was():
     controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(NOT_COVERED))
     scanner.scan(QR)
     controller.run_once()
-    assert vend.vend_count == 0 and opened_cases(platform) == [opened_cases(platform)[0]]
+    assert vend.vend_count == 0 and len(opened_cases(platform)) == 1
     assert controller._exit_case.exit_id == "exit-1"
 
 
-def test_a_covered_qr_at_an_exit_with_no_case_to_settle_opens_nothing():
-    """No platform for exit cases: no case can be settled, so the QR that the
-    module covers opens nothing -- there is no other way out at an exit."""
-    controller, vend, platform, scanner, presenter, _ = a_lane(
-        LOW, direction="exit", transient=True, presenter=Presenter(passed("same_plate")))
+def test_a_covered_qr_with_the_cars_case_let_go_opens_nothing():
+    """The case was let go (here, to a person): there is nothing to settle, and
+    a QR the module covers opens nothing on its own."""
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("same_plate")))
+    controller._leave_exit_case("let go for the test")
+    assert controller._exit_case is None
+    scanner.scan(QR)
+    controller.run_once()
+    assert vend.vend_count == 0 and len(opened_cases(platform)) == 1
+
+
+def test_a_covered_qr_for_a_case_with_no_stay_asks_nothing_again_and_tells_a_person():
+    """Finding 1. No stay was found for the car (an unmatched car, the driver's
+    word): asking again would open a SECOND case on the platform, matched from
+    scratch, with the first one's payment on the reader. The case stays the
+    case -- its fee on the reader, payable -- and a person is told, once."""
+    controller, vend, platform, scanner, _ = an_exit_waiting(
+        Presenter(passed("nothing_read")), stay=None)
+    scanner.scan(QR)
     controller.run_once()
     scanner.scan(QR)
     controller.run_once()
-    assert len(presenter.calls) == 1 and vend.vend_count == 0
+    assert len(opened_cases(platform)) == 1 and requests(platform, "supersede") == []
+    assert requests(platform, "pay_cancel") == [], "the payable fee was taken off"
+    assert controller._exit_case.exit_id == "exit-1" and controller._reader_case == "exit-1"
+    [told] = [e for e in platform.events.values()
+              if e["kind"] == "fallback_needs_human" and e["detail"].get("needs") == "qr_covered"]
+    assert (told["detail"]["exit_id"], told["detail"]["enrolment"]) == ("exit-1", "qr-1")
+    platform.exit_answer = {"settled": True, "why": "paid"}
+    controller._exit_case.asked_at = None
+    controller.run_once()
+    assert vend.vend_count == 1, "the driver paid the case on the reader; it opens"
+
+
+def test_the_old_payment_is_cancelled_even_when_the_platform_drops_before_the_new_case():
+    """Finding 1, the probe: the fee on the reader, the QR covered, the
+    platform gone before the new case opens, then a person opens. The old
+    case's cancel was queued and is asked when the platform is back."""
+    from lane_controller.contract import VendAuthority
+    from lane_controller.service import LaneService
+    from lane_controller.vend import parse as parse_vend
+
+    holder = {}
+    presenter = SlowPresenter(
+        0.0, during=lambda: setattr(holder["platform"], "online", False),
+        answer=passed("same_plate"))
+    controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
+    holder["platform"] = platform
+    service = LaneService(controller)
+    scanner.scan(QR)
+    controller.run_once()
+    assert "exit-1" in controller._cancels, "the old case's cancel is queued"
+    body = {"authorised_by": VendAuthority.HUMAN_OPEN_NOW.value,
+            "identity": {"kind": "ticket", "ticket_ref": "TKT-4RS9WQ2M"},
+            "decision_at": controller.last_decision_at}
+    status, said = service.assisted.complete(parse_vend(body, "KEY-QR-EXIT"))
+    if service.assisted.settling is not None:
+        service.assisted.settling.join(timeout=5)
+    assert status == 202 and vend.vend_count == 1, said
+    platform.online = True
+    controller._cancels._pending["exit-1"].due = 0
+    controller.retry_cancels()
+    assert ("pay_cancel", "exit-1") in platform.exit_requests
+    assert "exit-1" not in controller._cancels
+
+
+@pytest.mark.parametrize("status", ["processing", "requires_capture", "succeeded"])
+def test_no_case_is_asked_again_while_its_card_is_being_taken(status):
+    """Finding 2: the old case's payment is being processed or taken -- no
+    supersede, which would cancel a card mid-way."""
+    controller, vend, platform, scanner, _ = an_exit_waiting(
+        Presenter(passed("same_plate")), payment={"status": status, "last_failure": None})
+    scanner.scan(QR)
+    controller.run_once()
+    assert len(opened_cases(platform)) == 1 and requests(platform, "supersede") == []
+    assert controller._exit_case.exit_id == "exit-1" and vend.vend_count == 0
+
+
+def test_the_same_qr_scanned_again_asks_the_case_again_once():
+    """Finding 2: four more scans of the same QR while the stay is still
+    priced do nothing more -- one supersede, one new fee hand-off."""
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("one_difference")))
+    for _ in range(5):
+        scanner.scan(QR)
+        controller.run_once()
+    assert len(opened_cases(platform)) == 2
+    assert requests(platform, "supersede") == [("supersede", "exit-1", "exit-2")]
+    assert requests(platform, "pay") == [("pay", "exit-1"), ("pay", "exit-2")]
+    assert vend.vend_count == 0
+
+
+def test_a_clear_longer_than_a_flicker_before_the_qr_drops_the_case_and_asks_nothing():
+    """Finding 3: the old case's loop read clear for longer than a flicker --
+    the car on the loop now may have rolled on -- and the QR answered for it
+    asks nothing again: the case goes to a person, as `observe_exit_case`
+    drops it. A shorter clear is a flicker, and the QR goes on."""
+    holder = {}
+    presenter = SlowPresenter(0.0, during=requote_covered(holder), answer=passed("same_plate"))
+    controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
+    holder["platform"] = platform
+    controller._exit_case.clear_since = NOW - 1.0
+    scanner.scan(QR)
+    controller.observe_qr()  # the turn's own read set the clear
+    assert len(opened_cases(platform)) == 1 and vend.vend_count == 0
+    assert controller._exit_case is None
+    assert ("pay_cancel", "exit-1") in platform.exit_requests, "its payment off the reader"
+
+
+def test_a_flicker_before_the_qr_does_not_stop_it():
+    holder = {}
+    presenter = SlowPresenter(0.0, during=requote_covered(holder), answer=passed("same_plate"))
+    controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
+    holder["platform"] = platform
+    controller._exit_case.clear_since = NOW - 0.2
+    scanner.scan(QR)
+    controller.observe_qr()  # the turn's own read set the clear
+    assert len(opened_cases(platform)) == 2 and vend.vend_count == 1
+
+
+def test_a_car_that_backs_off_while_its_exit_qr_is_checked_asks_nothing_again():
+    loop = ParkedLoop()
+    presenter = SlowPresenter(0.7, during=lambda: setattr(loop, "parked", False),
+                              answer=passed("same_plate"))
+    controller, vend, platform, scanner, _, _ = a_lane(
+        LOW_EXIT, direction="exit", transient=True, exits=True, presenter=presenter, loop=loop)
+    platform.exit_match_session = STAY
+    platform.exit_answer = dict(CASE_PAYMENT)
+    controller.run_once()
+    scanner.scan(QR)
+    controller.run_once()
+    assert len(opened_cases(platform)) == 1 and vend.vend_count == 0
+    assert len(left_events(platform)) == 1
+
+
+def test_the_owners_deny_on_the_qrs_car_holds_at_the_exit_too():
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("same_plate")))
+    controller.cache.load([Rule(plate=HOLDER, allow=False)], default_action="allow",
+                          now=time.time())
+    scanner.scan(QR)
+    controller.run_once()
+    assert len(opened_cases(platform)) == 1 and vend.vend_count == 0
+    assert [e for e in platform.events.values()
+            if e["kind"] == "decision" and "QR" in e["detail"]["reason"]]
+
+
+def test_a_refusal_a_person_completed_during_the_exit_qr_asks_nothing_again():
+    holder = {}
+    presenter = SlowPresenter(0.0, during=lambda: setattr(
+        holder["c"], "last_decision_completed_at", "2026-09-21T14:00:00+00:00"),
+        answer=passed("same_plate"))
+    controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
+    holder["c"] = controller
+    scanner.scan(QR)
+    controller.run_once()
+    assert len(opened_cases(platform)) == 1 and vend.vend_count == 0
+
+
+def test_the_case_is_swapped_under_the_exit_lock(monkeypatch):
+    """A person's vend takes the case under `_exit_lock`; the QR's swap takes
+    it under the same lock, so the two never both act on one case."""
+    seen = []
+    original = LaneController.__setattr__
+
+    def recording(self, name, value):
+        if name == "_exit_case" and value is not None and hasattr(self, "_exit_lock"):
+            seen.append(self._exit_lock.locked())
+        original(self, name, value)
+
+    holder = {}
+    presenter = SlowPresenter(0.0, during=requote_covered(holder), answer=passed("same_plate"))
+    controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
+    holder["platform"] = platform
+    monkeypatch.setattr(LaneController, "__setattr__", recording)
+    scanner.scan(QR)
+    controller.run_once()
+    assert seen and all(seen), "the case was swapped without the exit lock"
 
 
 def test_an_exit_closed_to_everyone_is_not_opened_by_a_qr():
@@ -798,10 +992,10 @@ def test_the_stay_a_qr_opened_carries_the_qr_and_how_it_passed(rule):
 
 def test_an_exit_a_qr_let_out_carries_the_qr_on_its_close():
     holder = {}
-    presenter = SlowPresenter(0.0, during=lambda: holder["p"].exit_answer.update(
-        {"settled": True, "why": "covered"}), answer=passed("nothing_read"))
+    presenter = SlowPresenter(0.0, during=requote_covered(holder),
+                              answer=passed("nothing_read"))
     controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
-    holder["p"] = platform
+    holder["platform"] = platform
     scanner.scan(QR)
     controller.run_once()
     [closed] = platform.closed
