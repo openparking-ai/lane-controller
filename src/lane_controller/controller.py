@@ -271,6 +271,13 @@ class LaneController:
         #: `_exit_lock`): a new case a QR just opened is left for them to
         #: take, and the lane does not step it -- no fee for a car being let out.
         self._vends_waiting = 0
+        #: A QR's ask-again by the case it asks again: old exit id -> the
+        #: event id of the new case. Carried on a close naming the old case
+        #: (`superseding_event`), so the transport can follow a supersede.
+        self._ask_again_events: dict[str, str] = {}
+        #: Old exit id -> the case that superseded it, for a close a person's
+        #: vend took on the old case while the ask-again was still out.
+        self._close_follows: dict[str, str] = {}
         #: The case whose fee the platform handed to this lane's reader: until
         #: its car's close the lane does not drive the reader for it.
         self._reader_case: str | None = None
@@ -332,6 +339,10 @@ class LaneController:
             else DecisionCache(max_age_seconds=config.rules_max_age_seconds)
         )
         self.events = events if events is not None else EventQueue()
+        # A CLOSE THE PLATFORM REFUSED, said to a person (`_close_refused`).
+        transport = self.events.transport
+        if transport is not None and hasattr(transport, "on_close_refused"):
+            transport.on_close_refused = self._close_refused
         # Injectable so a demo or a test can put a car through a three-hour
         # stay without waiting three hours. The lane's own clock is what stamps
         # session times, which is the point: the platform must price the stay
@@ -1638,6 +1649,10 @@ class LaneController:
             if case.qr_fresh_event is None:
                 case.qr_fresh_event = str(uuid.uuid4())
             fresh_event = case.qr_fresh_event
+            if case.exit_id is not None:
+                self._ask_again_events[case.exit_id] = fresh_event
+                while len(self._ask_again_events) > 100:  # bounded: the oldest go
+                    self._ask_again_events.pop(next(iter(self._ask_again_events)))
         fresh = exit_case.ExitCase(
             event_id=fresh_event,
             exit_at=case.exit_at,
@@ -1700,8 +1715,10 @@ class LaneController:
             with self._exit_lock:
                 case.qr_waiting = None
                 case.qr_used = case.qr_used | {key}
-            self._tell_qr_covered(case, key, f"the platform refused to ask the case again "
-                                  f"({err.code or err.status})")
+                taken = case.taken
+            if not taken:
+                self._tell_qr_covered(case, key, f"the platform refused to ask the case "
+                                      f"again ({err.code or err.status})")
             return False
         fresh.answer = answer
         fresh.exit_id = answer["id"]
@@ -1710,6 +1727,19 @@ class LaneController:
             if mine:
                 case.qr_waiting = None
                 self._exit_case = fresh
+                self._ask_again_events.pop(case.exit_id, None)
+            elif case.taken and case.exit_id is not None:
+                # A PERSON TOOK THE OLD CASE while this was out (past their
+                # wait), and the platform has superseded it with `fresh`: their
+                # close follows the supersede, so it names the case left open
+                # and the record of the car let out is written. `fresh` is not
+                # the lane's to step -- nothing opens for it again.
+                self._close_follows[case.exit_id] = fresh.exit_id
+                while len(self._close_follows) > 100:  # bounded: the oldest go
+                    self._close_follows.pop(next(iter(self._close_follows)))
+                held = self._let_out_by
+                if held is not None and held[0] == case.exit_id:
+                    self._let_out_by = (fresh.exit_id, held[1])
         return mine
 
     def _supersede_wait_seconds(self) -> float:
@@ -1720,6 +1750,32 @@ class LaneController:
         client_timeout = getattr(self.exits, "_timeout", None)
         floor = client_timeout + 2.0 if isinstance(client_timeout, int | float) else 0.0
         return max(exit_case.EXIT_SUPERSEDE_WAIT_SECONDS, floor)
+
+    def _close_refused(self, event, err) -> None:
+        """A close naming an exit case that the platform refused and the
+        transport could not follow (`sync.PlatformTransport`): the stay is not
+        closed and the record of the car let out is not written, so a person
+        is told -- never dropped silently. The case, who opened and when; no
+        plate. Called on the thread that drains the outbox."""
+        exit_id = event.detail.get("exit_id")
+        if not exit_id or getattr(err, "status", None) is None:
+            # No case named; or not a refusal by the platform at all -- a close
+            # it took without saying what it recorded, counted and logged by
+            # the transport as before.
+            return
+        self.events.record(
+            "fallback_needs_human",
+            self.config.lane_id,
+            reason="the close of a car let out at this exit was refused; its stay and the "
+            "record of it need a person",
+            fallback=Fallback.EXIT_NOT_SETTLED.value,
+            exit_id=exit_id,
+            needs="close_refused",
+            refused=getattr(err, "code", None) or err.status,
+            at=event.detail.get("at"),
+            **({"let_out_by": event.detail["let_out_by"]}
+               if event.detail.get("let_out_by") else {}),
+        )
 
     def _tell_qr_covered(self, case, key: str, why: str) -> None:
         """A covered QR the lane could not turn into an ask-again: a person is
@@ -2862,6 +2918,12 @@ class LaneController:
         # platform's reconciler re-derives the number from. A close with no
         # decision (an exit that read no plate) carries none, and the platform
         # prices it as it always has.
+        # A CLOSE ON A CASE A QR'S ASK-AGAIN SUPERSEDED follows it to the case
+        # left open (`_close_follows`), and carries the ask-again's event id so
+        # the transport can follow a supersede it learns of only on delivery.
+        asked_again = self._ask_again_events.pop(exit_id, None) if exit_id else None
+        if exit_id is not None:
+            exit_id = self._close_follows.pop(exit_id, exit_id)
         self.events.record(
             SESSION_CLOSE,
             lane,
@@ -2876,6 +2938,7 @@ class LaneController:
             # THE SETTLED CASE this car left on (platform 0037): the close
             # names it, and the platform writes the case's own figures.
             **({"exit_id": exit_id} if exit_id else {}),
+            **({"superseding_event": asked_again} if asked_again else {}),
             # A person opened for it: on what authority (platform 0042).
             **self._take_let_out_by(exit_id),
             at=at,
