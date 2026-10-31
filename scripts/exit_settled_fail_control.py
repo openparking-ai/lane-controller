@@ -76,6 +76,8 @@ not known to stay down for one.
   no_payment_retried         a cancel answered no_payment is asked again for ever.
   first_cancel_on_lane_thread  the first cancel waits on the lane's thread.
   fee_not_held               the next car's fee goes on before the last car's cancel is confirmed.
+  held_car_never_told        a car held behind an unconfirmed cancel never reaches a person.
+  held_car_fee_sent          the held car's fee is sent once a person is told.
 """
 
 from __future__ import annotations
@@ -174,6 +176,8 @@ BREAKAGES = [
      "the first cancel is asked, and waited on, on the lane's thread"),
     ("fee_not_held",
      "the next car's fee is handed to the reader before the last car's cancel is confirmed"),
+    ("held_car_never_told", "a car held behind an unconfirmed cancel never reaches a person"),
+    ("held_car_fee_sent", "the held car's fee is sent once a person has been told"),
 ]
 
 

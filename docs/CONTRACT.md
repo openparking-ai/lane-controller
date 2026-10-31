@@ -465,7 +465,9 @@ driver's word for when they came in, or let out by a person.
   (`needs: "cancel_refused"`). When the next car arrived, the cancel is
   queued after the next car's frames are taken, and no other case's fee is
   handed to the reader until it is confirmed (`no_payment` counts as
-  confirmed: nothing was on the reader). A
+  confirmed: nothing was on the reader). A car held that way for 20 seconds
+  gets `fallback_needs_human` with `needs: "fee_held"` and its own `exit_id`,
+  once; its fee goes on waiting. A
   409 `exit_paid` means the card had already paid: the platform settles the
   case as paid, and the lane takes it as paid, not as a failure, and does not
   ask again. It opens nothing by itself: a case is let go only once its car

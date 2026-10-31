@@ -1799,3 +1799,77 @@ def test_the_next_cars_fee_waits_for_the_last_cars_cancel_under_the_runner():
     controller.observe_exit_case()
     assert pays(exits) == [("pay", "exit-1"), ("pay", "exit-2")]
     assert vend.vend_count == 0
+
+
+def test_a_car_held_behind_a_cancel_that_never_confirms_reaches_a_person_and_its_fee_waits():
+    """Review 3: the earlier car's cancel never confirms. Its own alert names
+    the earlier case; past `EXIT_FEE_HELD_TELL_SECONDS` the HELD car is sent to
+    a person too, once, by its own case id -- and its fee still never goes on
+    the reader while the earlier cancel is unconfirmed. Ten minutes of it."""
+    from lane_controller.platform_client import PlatformUnreachable
+
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.set_drain(lambda: None)
+    controller.run_once()
+
+    def never(exit_id):
+        exits.exit_requests.append(("pay_cancel", exit_id))
+        raise PlatformUnreachable("timed out")
+
+    exits.exit_pay_cancel = never
+    controller.loop.clear()
+    controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
+    controller.loop = SimulatedLoopInput(arrivals=1)
+    controller.run_once()  # the next car, with a fee of its own: held
+    held = controller._exit_case
+    assert held is not None and held.exit_id == "exit-2" and held.held_since is not None
+    waited = 0.0
+    while waited < exit_case_module.EXIT_FEE_HELD_TELL_SECONDS - 1:
+        clock.tick(1)
+        waited += 1
+        controller.retry_cancels()
+        controller.observe_exit_case()
+    assert told(controller, exit_case_module.NEEDS_FEE_HELD) == [], "told before the bound"
+    for _ in range(600):
+        clock.tick(1)
+        controller.retry_cancels()
+        controller.observe_exit_case()
+    [said] = told(controller, exit_case_module.NEEDS_FEE_HELD)
+    assert said["detail"]["exit_id"] == "exit-2", "the alert names the held car's own case"
+    assert "TRNS" not in json.dumps(said)
+    assert [e["detail"]["exit_id"] for e in told(controller, "cancel_pending")] == ["exit-1"]
+    assert pays(exits) == [("pay", "exit-1")], "the held car's fee was sent"
+    assert vend.vend_count == 0
+    # THE EARLIER CANCEL CONFIRMS: the held fee goes on, as before
+    exits.exit_pay_cancel = lambda exit_id: exits._case(exit_id)
+    clock.tick(31)
+    controller.retry_cancels()
+    clock.tick()
+    controller.observe_exit_case()
+    assert pays(exits) == [("pay", "exit-1"), ("pay", "exit-2")]
+    assert len(told(controller, exit_case_module.NEEDS_FEE_HELD)) == 1
+
+
+def test_a_person_lets_out_the_car_held_behind_a_cancel():
+    from lane_controller.platform_client import PlatformUnreachable
+
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    service = LaneService(controller)
+    controller.set_drain(lambda: None)
+    controller.run_once()
+    exits.exit_pay_cancel = lambda exit_id: (_ for _ in ()).throw(PlatformUnreachable("x"))
+    controller.loop.clear()
+    controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
+    controller.loop = SimulatedLoopInput(arrivals=1)
+    controller.run_once()
+    for _ in range(25):
+        clock.tick(1)
+        controller.observe_exit_case()
+    assert len(told(controller, exit_case_module.NEEDS_FEE_HELD)) == 1
+    clock.tick(5)
+    status, said = person_opens(service, controller, key="KEY-EXIT-HELD")
+    assert status == 202 and vend.vend_count == 1, said

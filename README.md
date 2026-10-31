@@ -219,7 +219,11 @@ A person's close names the case and the authority they opened on
 (`let_out_by`), and a close answered 503 `payment_unsettled` is sent again.
 The last car's cancel is queued after the next car's frames are taken, and the
 next car's fee is not handed to the reader while an earlier case's cancel is
-unconfirmed: it goes on once the drain has the cancel confirmed. The fee
+unconfirmed: it goes on once the drain has the cancel confirmed. A car whose fee
+has waited 20 seconds (`EXIT_FEE_HELD_TELL_SECONDS`) is sent to a person, once,
+by its own case (`needs: "fee_held"`, "car waiting: the reader is still busy
+with an earlier car's payment"); its fee still waits, and a person's let-out or
+the cancel confirming ends the wait. The fee
 is offered to the reader again while it waits for a card, and a person is told
 after three attempts, or after five `reader_busy` answers in a row. An answer
 opens nothing unless it names the case and the car's own event. The driver's

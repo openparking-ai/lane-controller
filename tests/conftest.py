@@ -4175,6 +4175,22 @@ def _break_the_settled_exit(monkeypatch):
         # is still unconfirmed.
         monkeypatch.setattr(case_module.PendingCancels, "others", lambda self, exit_id: False)
 
+    elif mode == "held_car_never_told":
+        # A car whose fee waits on an earlier car's unconfirmed cancel is
+        # never sent to a person, however long it waits.
+        monkeypatch.setattr(case_module, "EXIT_FEE_HELD_TELL_SECONDS", float("inf"))
+
+    elif mode == "held_car_fee_sent":
+        # After the person is told, the held car's fee is sent anyway.
+        original = LaneController._tell_fee_held
+
+        def releases(self, case):
+            original(self, case)
+            if case.held_told:
+                self._cancels.others = lambda exit_id: False
+
+        monkeypatch.setattr(LaneController, "_tell_fee_held", releases)
+
     elif mode == "payment_guard_removed":
         # `_act` hands the fee to the reader whatever the payment's status.
         original = case_module._act

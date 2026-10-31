@@ -1040,6 +1040,29 @@ class LaneController:
             self._let_out(case, watch)
             return
         self._tell_exit_case(case)
+        self._tell_fee_held(case)
+
+    def _tell_fee_held(self, case: exit_case.ExitCase) -> None:
+        """A car whose fee has waited `EXIT_FEE_HELD_TELL_SECONDS` on an
+        earlier car's unconfirmed cancel: a person is told, once, naming THIS
+        car's case -- the earlier case's own alert (`cancel_pending`) names
+        the earlier one. The fee goes on waiting."""
+        if (
+            case.held_since is None
+            or case.held_told
+            or self._clock() - case.held_since < exit_case.EXIT_FEE_HELD_TELL_SECONDS
+        ):
+            return
+        case.held_told = True
+        self.events.record(
+            "fallback_needs_human",
+            self.config.lane_id,
+            reason="car waiting: the reader is still busy with an earlier car's payment",
+            fallback=Fallback.EXIT_NOT_SETTLED.value,
+            exit_id=case.exit_id,
+            needs=exit_case.NEEDS_FEE_HELD,
+        )
+        self.deliver()
 
     def _tell_exit_case(self, case: exit_case.ExitCase) -> None:
         """A case that needs a person -- or that cannot be asked, or that the

@@ -223,6 +223,10 @@ class ExitCase:
     #: Set before each step: an earlier case's cancel is unconfirmed, so this
     #: case's fee is not handed to the reader yet.
     fee_held: bool = False
+    #: When this case's fee was first held, or None: not held now.
+    held_since: float | None = None
+    #: Whether a person was told this car waits on an earlier car's payment.
+    held_told: bool = False
 
     @property
     def needs(self) -> str | None:
@@ -398,8 +402,12 @@ def _act(case: ExitCase, platform, display: ExitDisplay | None, *, now: float) -
             # is queued and not yet confirmed (`PendingCancels`). This car's
             # fee waits for it, so the next driver is never shown the last
             # one's -- the order the lane used to keep by asking the cancel on
-            # its own thread. The case waits; nothing blocks.
+            # its own thread. The case waits; nothing blocks. Past
+            # `EXIT_FEE_HELD_TELL_SECONDS` a person is told about this car.
+            if case.held_since is None:
+                case.held_since = now
             return
+        case.held_since = None
         failure = payment.get("last_failure")
         due = (
             case.sent_at is None
@@ -493,6 +501,14 @@ EXIT_CANCEL_TELL_AFTER = 5
 #: What a person is told then, and when the platform refuses a cancel outright.
 NEEDS_CANCEL_PENDING = "cancel_pending"
 NEEDS_CANCEL_REFUSED = "cancel_refused"
+
+#: How long a car's fee may wait for an earlier case's unconfirmed cancel
+#: (`ExitCase.fee_held`) before a person is told about THIS car, once. The
+#: fee goes on waiting: it is never sent while an earlier cancel is
+#: unconfirmed; a person's let-out or the cancel confirming ends the wait.
+EXIT_FEE_HELD_TELL_SECONDS = 20.0
+#: What a person is told then, naming the waiting car's own case.
+NEEDS_FEE_HELD = "fee_held"
 
 #: The vend authorities the platform's close takes as `let_out_by` (platform
 #: 0042; `human_open_and_flag` is marked flagged on its change-log line). It
