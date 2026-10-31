@@ -621,11 +621,18 @@ class PlatformTransport(EventTransport):
         ):
             return None
         try:
-            ended = (self._client.get_exit(exit_id).get("ended") or {})
-            moved = ended.get("superseded_by")
-            if not moved:
+            case = self._client.get_exit(exit_id)
+            ended = case.get("ended") if isinstance(case, dict) else None
+            # ANSWERED IN ANY OTHER SHAPE, it cannot be followed: the close
+            # stays the refusal it was (and a person is told), never an error
+            # out of the drain that would hold the outbox behind it.
+            if not isinstance(ended, dict):
                 return None
-            if self._client.get_exit(moved).get("event_id") != asked_again:
+            moved = ended.get("superseded_by")
+            if not isinstance(moved, str) or not moved:
+                return None
+            taken = self._client.get_exit(moved)
+            if not isinstance(taken, dict) or taken.get("event_id") != asked_again:
                 return None
         except PlatformRejected:
             return None

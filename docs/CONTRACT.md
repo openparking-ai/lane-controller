@@ -541,7 +541,13 @@ driver's word for when they came in, or let out by a person.
   - a close naming a case that the platform refuses and that cannot be
     followed is never dropped silently: `fallback_needs_human` says
     `needs: "close_refused"` with its `exit_id`, the person's `let_out_by`,
-    the time and the refusal's code. The barrier opens only if the new
+    the time and the refusal's code. A close is followed only for a 409
+    `exit_closed`, only when it carries the ask-again's event id, and only
+    when the old case answers `ended` as an object naming `superseded_by` as
+    text; anything else is a close that cannot be followed, never an error
+    that holds the outbox. Where the close follows and who opened are read
+    together, under the lock the re-point takes, so a re-point never lands
+    between them. The barrier opens only if the new
   case is settled, by the opener below; the close then carries `exit_id` and
   `qr`. A QR the module does not cover, or a case still priced, leaves the car
   on payment or a person. A case that names no stay is not asked again --

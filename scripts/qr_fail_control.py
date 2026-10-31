@@ -69,6 +69,12 @@ that drives it; no tracked file is edited.
   close_409_not_followed    the transport drops a close the platform refused as superseded
   close_followed_anywhere   a close is followed to a case that is not the lane's ask-again
   close_refused_silent      a close that cannot land is dropped without telling a person
+  close_reads_unlocked      the close reads where it follows and who opened apart
+  close_ended_shape         a supersede answered in another shape jams the outbox
+  close_moved_shape         a superseded_by that is not text jams the outbox
+  close_any_409_followed    a close refused for another reason is followed
+  close_no_event_followed   a close carrying no ask-again event id is followed
+  ask_again_taken_alarm     a refused ask-again on a case a person took tells a person
 """
 
 from __future__ import annotations
@@ -272,11 +278,31 @@ BREAKAGES = [
      'event.detail.get("superseding_event"))',
      "            moved = None"),
     ("close_followed_anywhere", "followed without the own-ask-again check", SYNC,
-     "            if self._client.get_exit(moved).get(\"event_id\") != asked_again:\n"
-     "                return None\n", ""),
+     "            if not isinstance(taken, dict) or taken.get(\"event_id\") != asked_again:\n",
+     "            if not isinstance(taken, dict):\n"),
     ("close_refused_silent", "a refused close dropped silently", SYNC,
      "                        self.on_close_refused(event, self.last_refused)",
      "                        pass"),
+    ("close_reads_unlocked", "the close's reads apart", CONTROLLER,
+     "        with self._exit_lock:\n"
+     "            asked_again = self._ask_again_events.pop(exit_id, None) if exit_id else None\n"
+     "            if exit_id is not None:\n"
+     "                exit_id = self._close_follows.pop(exit_id, exit_id)\n"
+     "            let_out_by = self._take_let_out_by(exit_id)\n",
+     "        asked_again = self._ask_again_events.pop(exit_id, None) if exit_id else None\n"
+     "        if exit_id is not None:\n"
+     "            exit_id = self._close_follows.pop(exit_id, exit_id)\n"
+     "        let_out_by = self._take_let_out_by(exit_id)\n"),
+    ("close_ended_shape", "ended's shape not checked", SYNC,
+     "            if not isinstance(ended, dict):\n                return None\n", ""),
+    ("close_moved_shape", "superseded_by's shape not checked", SYNC,
+     "            if not isinstance(moved, str) or not moved:\n", "            if not moved:\n"),
+    ("close_any_409_followed", "the exit_closed code not checked", SYNC,
+     '            or getattr(err, "code", None) != "exit_closed"\n', ""),
+    ("close_no_event_followed", "no ask-again event, followed", SYNC,
+     "            or not asked_again\n", ""),
+    ("ask_again_taken_alarm", "a taken case's refused ask-again tells", CONTROLLER,
+     "            if not taken:\n", "            if True:\n"),
     ("plate_on_vended", "the QR's plate rides on vended", CONTROLLER,
      '**({"qr_passed_by": passed_by} if passed_by else {}),',
      '**({"qr_passed_by": passed_by, "qr_plate": enrolment.get("qr_plate")} '
