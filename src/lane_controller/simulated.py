@@ -214,3 +214,43 @@ class ExactBannedMatcher:
     def match(self, descriptor: str, banned) -> str | None:
         self.asked += 1
         return next((b["id"] for b in banned if b["descriptor"] == descriptor), None)
+
+
+class SimulatedExitDisplay:
+    """An `ExitDisplay` for tests and the demo: it keeps what it was shown and
+    hands back, once each, the entry time and the receipt phone it was given."""
+
+    def __init__(self, entry_time: str | None = None, receipt_phone: str | None = None) -> None:
+        self.shown: list = []
+        self._entry_time = entry_time
+        self._receipt_phone = receipt_phone
+        self.asked_entry = 0
+
+    def show_exit(self, view: dict | None) -> None:
+        self.shown.append(view)
+
+    def entry_time(self) -> str | None:
+        self.asked_entry += 1
+        given, self._entry_time = self._entry_time, None
+        return given
+
+    def receipt_phone(self) -> str | None:
+        given, self._receipt_phone = self._receipt_phone, None
+        return given
+
+    def give_entry_time(self, entry_at: str) -> None:
+        self._entry_time = entry_at
+
+
+class SimulatedQrScanner:
+    """A `QrScanner` a test or the demo scans into: `scan(text)` is a driver
+    holding a QR up; `poll()` hands it to the lane once."""
+
+    def __init__(self) -> None:
+        self._scanned: list[str] = []
+
+    def scan(self, text: str) -> None:
+        self._scanned.append(text)
+
+    def poll(self) -> str | None:
+        return self._scanned.pop(0) if self._scanned else None

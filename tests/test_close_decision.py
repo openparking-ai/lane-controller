@@ -104,6 +104,7 @@ def lane(platform, plate, *, direction="exit", crossings=None, clock=None):
         cache=a_cache(platform),
         events=EventQueue(Spy(platform)),
         clock=clock or (lambda: NOW),
+        exits=platform,
     )
     return controller
 

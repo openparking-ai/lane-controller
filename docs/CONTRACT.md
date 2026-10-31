@@ -385,16 +385,43 @@ not change; how often each member appears does.
 - **A monthly/pass-only garage** decides `allow` for a car its registers cover
   today and `deny` for every other car whose plate it read with confidence,
   full or not. `human_open_now` overrides that `deny` exactly as it overrides
-  any (see `not_completable` below); a display code does not. Where a scanned
-  registration QR will be presented is that `deny`; this version has no scanner.
-  Until there is one, a car whose pass this lane cannot confirm -- its plate
-  unread or read below the confidence (`low_confidence`, `no_plate_read`,
-  `engine_unreachable`), or no register held at all (`stale_rules`) -- is
-  decided `fallback`, a person's case, and at such a garage's entry
-  **`display_code_confirmed` is refused `not_completable`**, as at a closed lane:
-  a display code is a driver serving themselves, and this garage takes no
-  stranger.
-- **A garage that has not stated it**, and **every exit**, decide as before.
+  any (see `not_completable` below); a display code does not. A car whose pass
+  this lane cannot confirm -- its plate unread or read below the confidence
+  (`low_confidence`, `no_plate_read`, `engine_unreachable`), or no register held
+  at all (`stale_rules`) -- is decided `fallback`, a person's case, and at such a
+  garage's entry **`display_code_confirmed` is refused `not_completable`**, as at
+  a closed lane: a display code is a driver serving themselves, and this garage
+  takes no stranger. **A registration QR** the driver scans while the car is
+  still at the arming loop may open either refusal, when the garage is not
+  full: the lane presents it through the platform to the pass module, with the
+  plate it read at its confidence or nothing, and opens on `covered` only, for
+  the car still on the arming loop. A plate the owner denied -- read at any
+  confidence, or the plate the QR was made for -- is `deny` first and is never
+  opened by a QR, whatever the age of the lane's rules: a deny always wins
+  (2026-10-30; an allow rule is still applied only from a trusted cache), and
+  a deny applied from rules past their age carries `stale_deny: true` on its
+  `decision` event. The same holds at every entry, a garage that has not
+  stated what it takes included. That open is not on this contract as a new decision: the
+  refused decision stays the last one, `decision.completed` becomes its time,
+  and `vended` carries `registration_qr_covered`. A person's completion of the
+  same decision afterwards is refused `already_completed`, as for any.
+
+  **What the platform is sent about a QR's opening** (beside this read
+  contract): `vended` carries `qr_passed_by` (how the pass module's rule passed
+  the QR: `same_plate`, `look_alike`, `one_difference`, `nothing_read`) and
+  `enrolment` (the QR's id), never a plate; a QR that opened on
+  `one_difference` or `nothing_read` has the car's pictures kept against that
+  `vended` event. The stay the QR opened -- `POST /api/v1/lane/sessions/open`
+  at an entry, `/sessions/close` at an exit -- carries
+  `qr: {"enrolment": "<id>", "passed_by": "<rule>", "qr_plate": "<the QR's
+  plate, the pass module's normal form>"}`, each key only when the module
+  answered it, beside the plate as read. It is there for the platform to store
+  on the stay and to close the stay by the QR, so a car let in on one
+  difference or on nothing read is the pass's car at the exit; a platform that
+  does not store it yet ignores it, and the open and close are otherwise
+  byte-identical to before.
+- **A garage that has not stated it** decides as before. Exits: see the next
+  section.
 
 Whatever was decided, every car the loops see go in -- the one the lane opened
 for, a second car through the same opening, a refused car that drove in anyway
@@ -402,6 +429,111 @@ for, a second car through the same opening, a refused car that drove in anyway
 (with what was read below the confidence kept beside it, never as an identity),
 and a car no open command let in is marked `no_open_command`. None of it is on
 this contract: session actions never are.
+
+### What an exit decides: the gate opens only when settled
+
+The owner's exit rule (2026-10-27). An EXIT lane opens on its own copy for a
+car that is **settled there**: covered by a register today, or priced at a fee
+of zero. Nothing on that path touches the network. **Every other car at an
+exit is a case on the platform**, and the barrier opens only when the platform
+says the case is settled: paid at this lane's card reader, priced on the
+driver's word for when they came in, or let out by a person.
+
+- **The decision** for a car the lane could not settle is `fallback`, with
+  `fallback` `exit_not_settled`, and its `decision` event names the case
+  (`exit_id`). That covers a stay priced above zero, a stay the lane's copy does
+  not hold (`no_cached_entry`), rules or facts too old to price from, an engine
+  that refused, and a plate read below the lane's confidence or not read. A
+  case the platform settles on its first answer is decided `allow`, its reason
+  `the exit is settled: <why>`. **There is no "open and collect nothing" at an
+  exit any more.**
+- **While the case waits**, the lane asks the platform how it stands on its
+  idle turns, at most every two seconds, for as long as the car is on the
+  arming loop: it hands the fee to the reader (at once after a new decline,
+  and again every six seconds while the intent waits for a card, since a
+  second identical decline or a reader that timed out with no tap looks the
+  same in the answer; a reader still showing the fee answers `reader_busy`,
+  which is not an attempt), and passes on the entry time the driver gives at
+  the exit display. That time must carry a timezone offset: one without is
+  refused at the lane (`entry_time_without_offset`) and never sent; in the
+  hour the clocks go back, the offset the display sends decides which of the
+  two local times it was. `fallback_needs_human` is recorded once each time
+  the case needs a person (`needs`: `person`, `unanswered` when the platform
+  could not be reached, `refused` when it would not act or answered for
+  another case or another event (`another_exit_case`: every answer must name
+  the case's id and the car's own `event_id`), `payment_attempts` with
+  `attempts` once the fee has reached the reader three times unpaid,
+  `reader_busy` after five `reader_busy` answers in a row, `left` when the car
+  left the loop unsettled). A car counts as gone when the arming loop has read
+  clear for two seconds; while it reads clear the case is not moved on, and a
+  car that left is let out by nobody here. A clear of half a second or more
+  that ends with the loop occupied again also drops the case (`left`): the car
+  on the loop may be another one that rolled on without arming, and it is read
+  when it arms. While a car waits the loop is sampled every quarter second, so
+  a flicker reads as one clear sample. That includes the time the lane spends
+  waiting on the platform, which can be up to the client's timeout: a settled
+  answer opens the barrier only if the loop is occupied when it comes back and
+  read no clear longer than a flicker while the platform was asked. Otherwise
+  the case is dropped (`left`), its payment comes off the reader, and nothing
+  opens. This holds for a case settled on its first answer too.
+- **The reader is the platform's** once it has handed the case's PaymentIntent
+  to it: the lane does not drive its own reader screen for that car, before or
+  after the vend. A case the lane lets go of without opening for it (the car
+  left, the next car arrived, a person opened at the lane) has its payment
+  canceled at Stripe and taken off the reader through the platform (`POST
+  /api/v1/lane/exits/:id/pay/cancel`), until the platform confirms it: a
+  cancel that did not reach the platform, got a 5xx or a 429, or met a card
+  being authorised (`payment_in_progress`) is asked again with a backoff of 1,
+  2, 4, 8, 16 and then 30 seconds; every ask, the first included, is made off
+  the lane's thread (the lane's thread only queues it), and it survives a
+  restart; after five failed asks `fallback_needs_human` says
+  `needs: "cancel_pending"` once; a cancel refused outright is not asked again
+  (`needs: "cancel_refused"`). When the next car arrived, the cancel is
+  queued after the next car's frames are taken, and no other case's fee is
+  handed to the reader until it is confirmed (`no_payment` counts as
+  confirmed: nothing was on the reader). A car held that way for 20 seconds
+  gets `fallback_needs_human` with `needs: "fee_held"` and its own `exit_id`,
+  once; its fee goes on waiting. A
+  409 `exit_paid` means the card had already paid: the platform settles the
+  case as paid, and the lane takes it as paid, not as a failure, and does not
+  ask again. It opens nothing by itself: a case is let go only once its car
+  has left the loop or a person has opened, and a paid case opens the barrier
+  only for the car still on the loop when its answer comes back. A 409
+  `payment_in_progress` (a card being authorised) opens nothing either.
+- **A registration QR at the exit** opens nothing itself. A QR the pass
+  module answers covered asks the car's case again as a new case for the same
+  stay (a new `event_id`; the platform supersedes the old case and prices the
+  stay again, the module first), and the barrier opens only if that case is
+  settled, by the opener below; the close then carries `exit_id` and `qr`. A
+  QR the module does not cover, or a case still priced, leaves the car on
+  payment or a person.
+- **When it is settled**, the barrier opens, `vended` names the case, and the
+  stay's close names it too. Then a text receipt goes to the phone the driver
+  gave, once, best effort: after the barrier, never before it.
+- **A person can always open it**: `POST /v1/lane/vend` at the lane, or the
+  case's let-out on the platform. The lane drops the case when a person opens
+  for the car, the close of that car names the case, and the barrier moves
+  once: the vend claims the decision under the lock the case's own opening
+  takes, and one that finds it already completed is refused
+  `already_completed` with nothing moved. That close carries `let_out_by`,
+  the authority the person opened on: `display_code_confirmed`,
+  `human_open_now` or `human_open_and_flag`, which the platform's change log
+  marks flagged. The lane holds no name for the person: the platform's change
+  log names this lane computer. A close the platform
+  answers 503 `payment_unsettled` (the case's payment could not be settled
+  with Stripe yet) stays in the outbox and is sent again, as any 5xx is.
+- **Offline**, a covered car still leaves; every other car waits for a person.
+
+What the case carries about the car is its ID -- the plate's positioned
+characters, the colour code and the size -- and never the plate text; a plate
+read below the confidence sends no characters at all. The car's pictures at
+the exit are sent before the case is opened, under the case's own event.
+Today the identity service fills none of those three, so a plate the lane
+cannot stand behind opens a case with no ID fields: that excludes no stay, and
+the platform's picker or the driver's word decides. The positioned characters
+are passed on unchecked until the identity service's contract for them lands.
+`tests/test_exit_case.py` holds this, and `scripts/exit_settled_fail_control.py`
+breaks it forty-two ways.
 
 ### The transit
 

@@ -17,6 +17,7 @@ import json
 
 from rate_engine.currency import MINOR_UNIT_DIGITS
 
+from fake_platform import FakePlatform
 from lane_consumer import LaneConsumer
 from lane_controller import reader as reader_module
 from lane_controller.interfaces import VehicleIdentity
@@ -432,6 +433,7 @@ def test_an_exit_that_decides_nothing_about_money_takes_the_last_cars_fee_down()
                   VehicleIdentity(plate="TRNS-9", plate_region="FL", make=None, model=None,
                                   color=None, confidence=0.42)):
         reader = ReadsTheState()
+        exits = FakePlatform()
         controller = LaneController(
             a_config(closing_loops=2),
             loop=SimulatedLoopInput(arrivals=2),
@@ -441,6 +443,7 @@ def test_an_exit_that_decides_nothing_about_money_takes_the_last_cars_fee_down()
             closing_loops=ScriptedClosingLoops([(ClosingSequence.REVERSE, 1.0)]),
             cache=a_cache(a_capped_platform(stays=[("s-9", "TRNS-9", ENTRY)])),
             events=EventQueue(),
+            exits=exits,
             clock=lambda: NOW,
             reader=reader,
         )
@@ -449,6 +452,8 @@ def test_an_exit_that_decides_nothing_about_money_takes_the_last_cars_fee_down()
             reader.consumer = consumer
             first = controller.run_once()
             between = consumer.state()
+            # A's case was settled (paid); B's waits for a person.
+            exits.exit_answer = {"settled": False, "needs": "person"}
             second = controller.run_once()
             after = consumer.state()
         assert first.exit_pricing.to_detail()["fee_minor"] == 500
@@ -481,6 +486,7 @@ def test_an_entry_lane_publishes_no_fee():
         identifier=StubVehicleIdentifier([VehicleIdentity(plate="TRNS-9", confidence=0.99)]),
         cache=a_cache(a_platform()),
         events=EventQueue(),
+        exits=FakePlatform(),
         clock=lambda: NOW,
         reader=ReadsTheState(),
     )

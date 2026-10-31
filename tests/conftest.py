@@ -3458,8 +3458,34 @@ def _break_the_entry_stay(monkeypatch):
 
         monkeypatch.setattr(decision_module.DecisionCache, "clear", reopening)
 
+    elif mode == "stale_deny_skipped":
+        # A deny in rules past their age is not applied: a ban lapses with
+        # the cache (the owner's decision of 2026-10-30 says it never does).
+        original = decision_module.owner_denies
+
+        def lapsing(cache, *plates):
+            return None if cache.is_stale() else original(cache, *plates)
+
+        monkeypatch.setattr(decision_module, "owner_denies", lapsing)
+
+    elif mode == "stale_deny_unrecorded":
+        # A deny from rules past their age is applied but not said to be stale.
+        original = decision_module._denied
+        monkeypatch.setattr(decision_module, "_denied",
+                            lambda rule, identity, *, stale: original(rule, identity, stale=False))
+
+    elif mode == "deny_skipped_unstated":
+        # The deny is asked only at a garage that has said what it takes.
+        original = decision_module.owner_denies
+
+        def stated_only(cache, *plates):
+            return original(cache, *plates) if cache.transient_available is not None else None
+
+        monkeypatch.setattr(decision_module, "owner_denies", stated_only)
+
     elif mode == "stale_rule_applied":
-        # E3: an owner's rule is applied from a cache past its age.
+        # E3, kept for an allow: an owner's ALLOW rule is applied from a cache
+        # past its age.
         original = decision_module._decide_entry
 
         def trusting(identity, cache, **kwargs):
@@ -3564,3 +3590,654 @@ def _break_the_entry_stay(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_ENTRY_STAY mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the exit-settled fail-control (the owner's rule for
+# the exit, 2026-10-27: the gate opens only when settled).
+#
+# scripts/exit_settled_fail_control.py sets BREAK_EXIT_SETTLED and requires
+# tests/test_exit_case.py to FAIL. An exit nobody has seen open for an unpaid
+# car is not known to stay down for one.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_settled_exit(monkeypatch):
+    mode = os.environ.get("BREAK_EXIT_SETTLED")
+    if not mode:
+        return
+
+    from lane_controller import exit_case as case_module
+    from lane_controller.controller import LaneController
+    from lane_controller.exit_pricing import PRICED
+
+    if mode == "priced_opens":
+        # A car with a fee to pay is let out on the lane's copy, unpaid.
+        original = LaneController._exit_settlement
+
+        def priced_settles(self, decision, identity, frames):
+            pricing = decision.exit_pricing
+            if decision.should_vend and pricing is not None and pricing.status == PRICED:
+                return decision, None
+            return original(self, decision, identity, frames)
+
+        monkeypatch.setattr(LaneController, "_exit_settlement", priced_settles)
+
+    elif mode == "unanswered_opens":
+        # A platform that cannot be reached is taken as a settled case.
+        original = case_module.advance
+
+        def hopeful(case, platform, display, *, now):
+            outcome = original(case, platform, display, now=now)
+            return case_module.SETTLED if outcome == case_module.UNANSWERED else outcome
+
+        monkeypatch.setattr(case_module, "advance", hopeful)
+
+    elif mode == "no_platform_opens":
+        # A lane with no platform wired opens for the car it could not settle.
+        def settles_alone(self, case):
+            case.outcome = case_module.SETTLED
+            return case.outcome
+
+        original = LaneController._step
+
+        def step(self, case):
+            return settles_alone(self, case) if self.exits is None else original(self, case)
+
+        monkeypatch.setattr(LaneController, "_step", step)
+
+    elif mode == "plate_in_case":
+        # The case carries the plate text.
+        original = case_module.id_fields
+
+        def with_plate(identity, *, plate_confident):
+            return {**original(identity, plate_confident=plate_confident), "plate": identity.plate}
+
+        monkeypatch.setattr(case_module, "id_fields", with_plate)
+
+    elif mode == "unsure_plate_sent":
+        # A plate read below the lane's confidence is sent as the car's ID.
+        original = case_module.id_fields
+        monkeypatch.setattr(
+            case_module, "id_fields",
+            lambda identity, *, plate_confident: original(identity, plate_confident=True),
+        )
+
+    elif mode == "pictures_after_case":
+        # The case is opened before its pictures are sent.
+        original = LaneController._exit_settlement
+
+        def case_first(self, decision, identity, frames):
+            self.deliver = lambda: None
+            try:
+                return original(self, decision, identity, frames)
+            finally:
+                del self.deliver
+
+        monkeypatch.setattr(LaneController, "_exit_settlement", case_first)
+
+    elif mode == "polled_too_fast":
+        # The case is asked about on every turn, faster than Stripe is read.
+        monkeypatch.setattr(case_module, "EXIT_POLL_SECONDS", 0.0)
+
+    elif mode == "pay_every_turn":
+        # The fee is handed to the reader again on every answer.
+        original = case_module._act
+
+        def again(case, platform, display, *, now):
+            case.sent_at = None
+            return original(case, platform, display, now=now)
+
+        monkeypatch.setattr(case_module, "_act", again)
+
+    elif mode == "decline_not_resent":
+        # After a decline the fee is never handed to the reader again.
+        original = case_module._act
+
+        def once(case, platform, display, *, now):
+            if case.needs == case_module.NEEDS_PAYMENT and case.sent_at is not None:
+                return None
+            return original(case, platform, display, now=now)
+
+        monkeypatch.setattr(case_module, "_act", once)
+
+    elif mode == "reader_driven_after_intent":
+        # The lane drives its reader screen for a car whose case has handed
+        # its fee to the reader, taking the PaymentIntent off it.
+        original = LaneController._note_exit_screen
+
+        def drives(self, record):
+            original(self, record)
+            if self.reader is not None:
+                self.reader.present_exit(record)
+
+        monkeypatch.setattr(LaneController, "_note_exit_screen", drives)
+
+    elif mode == "left_payment_stays_on_reader":
+        # A case the lane lets go of keeps its payment on the reader.
+        monkeypatch.setattr(case_module, "cancel_on_reader", lambda case, platform: False)
+
+    elif mode == "person_close_unnamed":
+        # A person's vend leaves its case off the car's close.
+        monkeypatch.setattr(LaneController, "take_completion_exit_id", lambda self, at: None)
+
+    elif mode == "same_decline_not_resent":
+        # The fee goes back on the reader only on a new failure code: a second
+        # identical decline, or a reader that timed out, is never offered again.
+        monkeypatch.setattr(case_module, "EXIT_RESEND_SECONDS", float("inf"))
+
+    elif mode == "attempts_not_counted":
+        # The fee reaching the reader is never counted, so a person is never
+        # told the driver has tried and failed.
+        monkeypatch.setattr(case_module, "EXIT_PAY_ATTEMPTS", 10**9)
+
+    elif mode == "busy_reader_refused":
+        # A reader still showing the fee is taken as the platform refusing it.
+        monkeypatch.setattr(case_module, "_PAY_NOT_REFUSED", frozenset())
+
+    elif mode == "vend_claims_outside_lock":
+        # `complete_vend` takes the case without checking `completed` under the
+        # exit lock: a case that settled between the route's check and the
+        # vend has moved the barrier, and the person's vend moves it again.
+        original = LaneController.complete_vend
+
+        def unclaimed(self, identity, **kwargs):
+            self.last_decision_completed_at = None
+            return original(self, identity, **kwargs)
+
+        monkeypatch.setattr(LaneController, "complete_vend", unclaimed)
+
+    elif mode == "entry_without_offset_sent":
+        # The driver's entry time goes to the platform without its offset.
+        monkeypatch.setattr(case_module, "has_offset", lambda entry_at: True)
+
+    elif mode == "refusal_settles":
+        # A platform refusal (4xx) of the case is taken as settled.
+        original = case_module.advance
+
+        def refused_opens(case, platform, display, *, now):
+            outcome = original(case, platform, display, now=now)
+            return case_module.SETTLED if case.refused else outcome
+
+        monkeypatch.setattr(case_module, "advance", refused_opens)
+
+    elif mode == "settled_truthy":
+        # `settled` is read as truthy, not as `True`.
+        monkeypatch.setattr(
+            case_module.ExitCase, "settled",
+            property(lambda self: bool(self.answer and self.answer.get("settled"))),
+        )
+
+    elif mode == "let_out_ignores_person":
+        # `_let_out` opens whether or not a person took the case first.
+        original = LaneController._let_out
+
+        def regardless(self, case):
+            with self._exit_lock:
+                self._exit_case = case
+            return original(self, case)
+
+        monkeypatch.setattr(LaneController, "_let_out", regardless)
+
+    elif mode == "other_case_answer":
+        # An answer naming another case is taken for this one.
+        monkeypatch.setattr(case_module, "_own", lambda case, answer: answer)
+
+    elif mode == "receipt_before_vend":
+        # The text receipt goes before the barrier opens, adding its network
+        # call to a paid car's wait.
+        original = LaneController._let_out
+
+        def receipt_first(self, case):
+            case_module.send_receipt(case, self.exits, self.exit_display)
+            return original(self, case)
+
+        monkeypatch.setattr(LaneController, "_let_out", receipt_first)
+
+    elif mode == "loop_flicker_drops":
+        # One clear sample of the arming loop drops the waiting car's case.
+        monkeypatch.setattr(case_module, "EXIT_LEFT_SECONDS", 0.0)
+
+    elif mode == "left_case_opens":
+        # A car that left the loop keeps its case, and the barrier opens for nobody.
+        def regardless(self):
+            if self._exit_case is not None:
+                self._advance_exit_case(self._exit_case)
+
+        monkeypatch.setattr(LaneController, "observe_exit_case", regardless)
+
+    elif mode == "person_said_every_turn":
+        # A case that needs a person says so on every turn.
+        original = LaneController._tell_exit_case
+
+        def again(self, case):
+            case.told = None
+            return original(self, case)
+
+        monkeypatch.setattr(LaneController, "_tell_exit_case", again)
+
+    elif mode == "person_and_case_both_open":
+        # A person opens for the car and its case opens the barrier again.
+        original = LaneController.complete_vend
+
+        def keeps_case(self, identity, **kwargs):
+            case = self._exit_case
+            at = original(self, identity, **kwargs)
+            self._exit_case = case
+            return at
+
+        monkeypatch.setattr(LaneController, "complete_vend", keeps_case)
+
+    elif mode == "close_not_named":
+        # The close does not name the case the car left on.
+        original = LaneController._settle_transit
+
+        def unnamed(self, identity, at, **kwargs):
+            kwargs.pop("exit_id", None)
+            return original(self, identity, at, **kwargs)
+
+        monkeypatch.setattr(LaneController, "_settle_transit", unnamed)
+
+    elif mode == "no_receipt":
+        # The text receipt the driver asked for is never sent.
+        monkeypatch.setattr(case_module, "send_receipt", lambda case, platform, display: False)
+
+    elif mode == "rolled_on_car_let_out":
+        # A clear of any length under the two seconds is taken for a flicker:
+        # a car that rolls on unarmed after the paid car backed off leaves on
+        # that car's case.
+        monkeypatch.setattr(case_module, "EXIT_FLICKER_SECONDS", float("inf"))
+
+    elif mode == "flicker_ends_case":
+        # Any clear sample ends the case's right to open, flicker or not.
+        monkeypatch.setattr(case_module, "EXIT_FLICKER_SECONDS", 0.0)
+
+    elif mode == "loop_sampled_slowly":
+        # The loop is sampled at the caller's turn while a car waits, too
+        # seldom to tell a flicker from a car that backed off.
+        monkeypatch.setattr(case_module, "EXIT_SAMPLE_SECONDS", float("inf"))
+
+    elif mode == "busy_reader_never_told":
+        # A reader that answers `reader_busy` for good keeps the car waiting
+        # and nobody is told.
+        monkeypatch.setattr(case_module, "EXIT_READER_BUSY", 10**9)
+
+    elif mode == "unpriced_case_reader_driven":
+        # The lane drives its reader screen for a case car it could not
+        # price, taking the platform's PaymentIntent off the reader.
+        original = LaneController._note_exit_screen
+
+        def drives_unpriced(self, record):
+            original(self, record)
+            case = self._exit_case
+            if case is not None and case.session_id is None and self.reader is not None:
+                self.reader.present_exit(record)
+
+        monkeypatch.setattr(LaneController, "_note_exit_screen", drives_unpriced)
+
+    elif mode == "pay_answer_not_owned" or mode == "first_answer_not_owned":
+        # The answer to the /pay (or to the case's opening) is taken without
+        # checking it is this case's, under this car's own event.
+        import sys
+
+        original = case_module._own
+        unchecked = "_act" if mode == "pay_answer_not_owned" else "advance"
+
+        def owned_elsewhere(case, answer):
+            if sys._getframe(1).f_code.co_name == unchecked:
+                return answer
+            return original(case, answer)
+
+        monkeypatch.setattr(case_module, "_own", owned_elsewhere)
+
+    elif mode == "route_busy_after_already_completed":
+        # The vend route stays `busy` for good after it refused
+        # `already_completed`: no person can open for the next car.
+        from lane_controller.contract import VendRefusal
+        from lane_controller.vend import AssistedVend
+
+        original = AssistedVend._accept
+
+        def stays_taken(self, request):
+            status, body = original(self, request)
+            if body.get("code") == VendRefusal.ALREADY_COMPLETED.value:
+                self._in_progress = True
+            return status, body
+
+        monkeypatch.setattr(AssistedVend, "_accept", stays_taken)
+
+    elif mode == "cancel_before_next_frames":
+        # The last car's payment comes off the reader before the next car's
+        # frames are taken, so a slow platform holds up the read.
+        original = LaneController._drop_exit_case
+
+        def at_once(self, reason):
+            original(self, reason)
+            self._free_reader()
+
+        monkeypatch.setattr(LaneController, "_drop_exit_case", at_once)
+
+    elif mode == "left_during_call_let_out":
+        # A settled answer opens whether or not the car is still on the loop
+        # after the platform was asked.
+        monkeypatch.setattr(LaneController, "_still_there", lambda self, watch: True)
+
+    elif mode == "loop_unwatched_during_call":
+        # The loop is read before and after a platform call and never during
+        # it, so a car swapped on while the call ran is not seen.
+        monkeypatch.setattr(case_module.LoopWatch, "_run", lambda self: None)
+
+    elif mode == "flicker_doubled":
+        # A clear of up to a second is taken for a flicker.
+        monkeypatch.setattr(case_module, "EXIT_FLICKER_SECONDS", 1.0)
+
+    elif mode == "busy_not_reset":
+        # The busy count is not reset when the reader takes the fee, so busy
+        # answers from before the take are counted towards telling a person.
+        original = case_module._act
+
+        def keeps_count(case, platform, display, *, now):
+            before = case.busy
+            original(case, platform, display, now=now)
+            if before and case.busy == 0:
+                case.busy = before
+
+        monkeypatch.setattr(case_module, "_act", keeps_count)
+
+    elif mode == "word_answer_not_owned":
+        # The answer to the driver's word is taken without checking it is
+        # this case's, under this car's own event.
+        import sys
+
+        original = case_module._own
+
+        def word_unchecked(case, answer):
+            caller = sys._getframe(1)
+            if (caller.f_code.co_name == "_act"
+                    and caller.f_locals.get("needs") == case_module.NEEDS_DRIVER_WORD):
+                return answer
+            return original(case, answer)
+
+        monkeypatch.setattr(case_module, "_own", word_unchecked)
+
+    elif mode == "watcher_error_trusted":
+        # A loop read that raises on the watcher's thread kills it, and the
+        # watch then vouches from its last good sample.
+        def dies(self, err):
+            raise err
+
+        monkeypatch.setattr(case_module.LoopWatch, "_fail", dies)
+
+    elif mode == "loop_read_under_lock":
+        # The loop is read holding `_exit_lock`, so a stalled read holds up
+        # a person's vend.
+        original = LaneController._let_out
+        there = LaneController._still_there
+
+        def reads_under_lock(self, case, watch):
+            with self._exit_lock:
+                seen = there(self, watch)
+            self._still_there = lambda watch: seen
+            try:
+                return original(self, case, watch)
+            finally:
+                del self._still_there
+
+        monkeypatch.setattr(LaneController, "_let_out", reads_under_lock)
+
+    elif mode == "stop_flicker_drops":
+        # The watch's reading as the call returns is not read again when
+        # clear, so one flicker then drops a paid car.
+        def stops_once(self):
+            self._stop.set()
+            if self._thread.is_alive():
+                self._thread.join()
+            self._sample()
+
+        monkeypatch.setattr(case_module.LoopWatch, "stop", stops_once)
+
+    elif mode == "decide_flicker_drops":
+        # The lane's reading as it decides is not read again when clear.
+        monkeypatch.setattr(LaneController, "_loop_now", lambda self: self.loop.is_occupied())
+
+    elif mode == "three_clear_samples":
+        # Three clear samples in a row are needed for a car gone, not two.
+        monkeypatch.setattr(case_module, "EXIT_CLEAR_SAMPLES", 3)
+
+    elif mode == "watch_not_stopped_on_raise":
+        # The watch is stopped only when the platform call returns, so a
+        # call that raises leaves its watcher thread running.
+        def unguarded(self, case):
+            watch = case_module.LoopWatch(self.loop, self._clock).start()
+            settled = self._step(case) == case_module.SETTLED
+            watch.stop()
+            return settled, watch
+
+        monkeypatch.setattr(LaneController, "_watched_step", unguarded)
+
+    elif mode == "decide_not_read_now":
+        # The lane decides from the watch alone, without reading the loop
+        # at that moment.
+        monkeypatch.setattr(LaneController, "_loop_now", lambda self: True)
+
+    elif mode == "no_final_sample":
+        # The watch stops without reading the loop as the call returns.
+        def stops_blind(self):
+            self._stop.set()
+            if self._thread.is_alive():
+                self._thread.join()
+
+        monkeypatch.setattr(case_module.LoopWatch, "stop", stops_blind)
+
+    elif mode == "person_checked_before_read":
+        # Whether a person took the case first is checked before the loop
+        # read and not again after it, so a person's vend during the read
+        # is followed by the case opening the barrier again.
+        original = LaneController._let_out
+        there = LaneController._still_there
+
+        def checks_then_reads(self, case, watch):
+            with self._exit_lock:
+                if self._exit_case is not case:
+                    return
+            seen = there(self, watch)
+            with self._exit_lock:
+                self._exit_case = case
+            self._still_there = lambda watch: seen
+            try:
+                return original(self, case, watch)
+            finally:
+                del self._still_there
+
+        monkeypatch.setattr(LaneController, "_let_out", checks_then_reads)
+
+    elif mode == "cancel_paid_failure":
+        # A cancel answered `exit_paid` is read as a failed cancel.
+        original = case_module.cancel_payment
+
+        def failed(exit_id, platform):
+            outcome = original(exit_id, platform)
+            if outcome == case_module.CANCEL_FOUND_PAID:
+                case_module.log.warning("exit case: the payment could not be canceled: exit_paid")
+                return case_module.CANCEL_FAILED
+            return outcome
+
+        monkeypatch.setattr(case_module, "cancel_payment", failed)
+
+    elif mode in ("cancel_paid_opens", "in_progress_lets_out", "cancel_paid_asked_again"):
+        # A dropped case's cancel opens the barrier when it finds the card
+        # paid, or one still being authorised; or is asked again until it
+        # answers canceled.
+        cancel = case_module.cancel_on_reader
+        opens_on = {"cancel_paid_opens": case_module.CANCEL_FOUND_PAID,
+                    "in_progress_lets_out": case_module.CANCEL_IN_PROGRESS}.get(mode)
+
+        def free_reader(self):
+            case, self._left_on_reader = self._left_on_reader, None
+            if case is None:
+                return
+            outcome = cancel(case, self.exits)
+            if opens_on is not None and outcome == opens_on:
+                self.vend.vend("the cancel found the card paid")
+            if opens_on is None and outcome != case_module.CANCELED:
+                self._left_on_reader = case
+                return
+            if self._reader_case == case.exit_id:
+                self._reader_case = None
+
+        monkeypatch.setattr(LaneController, "_free_reader", free_reader)
+
+    elif mode == "close_unsettled_dropped":
+        # A close answered 503 `payment_unsettled` is taken as a refusal, and
+        # dropped from the outbox instead of sent again.
+        from lane_controller import platform_client as client_module
+
+        original = client_module.PlatformClient._request
+
+        def refused(self, method, path, payload=None):
+            try:
+                return original(self, method, path, payload)
+            except client_module.PlatformUnreachable as err:
+                if "payment_unsettled" in str(err):
+                    raise client_module.PlatformRejected(
+                        503, str(err), "payment_unsettled") from err
+                raise
+
+        monkeypatch.setattr(client_module.PlatformClient, "_request", refused)
+
+    elif mode == "let_out_by_not_sent":
+        # The close after a person's vend does not say what they opened on.
+        monkeypatch.setattr(LaneController, "_take_let_out_by", lambda self, exit_id: {})
+
+    elif mode == "flagged_let_out_dropped":
+        # A close after a flagged opening goes without `let_out_by`, as it
+        # had to before the platform took `human_open_and_flag`.
+        monkeypatch.setattr(case_module, "LET_OUT_AUTHORITIES",
+                            case_module.LET_OUT_AUTHORITIES - {"human_open_and_flag"})
+
+    elif mode == "cancel_dropped":
+        # A cancel the platform did not confirm is dropped and never asked
+        # again: another car's fee stays on the reader.
+        monkeypatch.setattr(case_module.PendingCancels, "add", lambda self, exit_id: None)
+
+    elif mode == "cancel_backoff_unbounded":
+        # The wait before a cancel is asked again doubles without a bound.
+        monkeypatch.setattr(
+            case_module, "cancel_backoff",
+            lambda attempts: case_module.EXIT_CANCEL_RETRY_FIRST_SECONDS
+            * 2 ** max(0, attempts - 1),
+        )
+
+    elif mode == "cancel_retried_on_lane_thread":
+        # The lane's own thread asks the pending cancels again on every
+        # delivery, drain or no drain: a slow platform holds the next car.
+        original = LaneController.deliver
+
+        def delivers_and_retries(self):
+            original(self)
+            if self._drain is not None:
+                self.retry_cancels()
+
+        monkeypatch.setattr(LaneController, "deliver", delivers_and_retries)
+
+    elif mode == "cancel_not_kept_on_disk":
+        # A pending cancel lives in memory only: a restart forgets it.
+        from lane_controller.events import EventQueue
+
+        monkeypatch.setattr(EventQueue, "keep_cancel", lambda self, exit_id, at: None)
+
+    elif mode == "cancel_not_asked_after_restart":
+        # The cancels held on disk are not asked again after a restart.
+        from lane_controller.events import EventQueue
+
+        monkeypatch.setattr(EventQueue, "held_cancels", lambda self: [])
+
+    elif mode == "cancel_pending_never_told":
+        # A cancel that keeps failing never tells a person.
+        original = case_module.PendingCancels.failed
+
+        def silent(self, exit_id):
+            attempts, _tell = original(self, exit_id)
+            return attempts, False
+
+        monkeypatch.setattr(case_module.PendingCancels, "failed", silent)
+
+    elif mode == "cancel_refused_retried":
+        # A cancel the platform refuses outright is asked again for ever,
+        # and nobody is told.
+        monkeypatch.setattr(case_module, "CANCEL_RETRY",
+                            case_module.CANCEL_RETRY | {case_module.CANCEL_REFUSED})
+
+    elif mode == "cancel_retry_blocks":
+        # A second retry pass waits for the one in flight.
+        original = LaneController.retry_cancels
+
+        def waits(self):
+            with self._retrying:
+                pass
+            return original(self)
+
+        monkeypatch.setattr(LaneController, "retry_cancels", waits)
+
+    elif mode == "no_payment_retried":
+        # A cancel answered `no_payment` is not taken as confirmed: asked
+        # again for ever.
+        monkeypatch.setattr(case_module, "CANCEL_CONFIRMED",
+                            case_module.CANCEL_CONFIRMED - {case_module.CANCEL_NOTHING})
+
+    elif mode == "first_cancel_on_lane_thread":
+        # The first cancel is asked on the thread that let the case go -- the
+        # lane's -- and waits there for the platform, as it used to.
+        def asks_here(self, case):
+            outcome = case_module.cancel_on_reader(case, self.exits)
+            if outcome in case_module.CANCEL_RETRY:
+                self._cancels.add(case.exit_id)
+
+        monkeypatch.setattr(LaneController, "_cancel_on_reader", asks_here)
+
+    elif mode == "fee_not_held":
+        # The next car's fee goes to the reader while the last car's cancel
+        # is still unconfirmed.
+        monkeypatch.setattr(case_module.PendingCancels, "others", lambda self, exit_id: False)
+
+    elif mode == "held_car_never_told":
+        # A car whose fee waits on an earlier car's unconfirmed cancel is
+        # never sent to a person, however long it waits.
+        monkeypatch.setattr(case_module, "EXIT_FEE_HELD_TELL_SECONDS", float("inf"))
+
+    elif mode == "held_car_fee_sent":
+        # After the person is told, the held car's fee is sent anyway.
+        original = LaneController._tell_fee_held
+
+        def releases(self, case):
+            original(self, case)
+            if case.held_told:
+                self._cancels.others = lambda exit_id: False
+
+        monkeypatch.setattr(LaneController, "_tell_fee_held", releases)
+
+    elif mode == "payment_guard_removed":
+        # `_act` hands the fee to the reader whatever the payment's status.
+        original = case_module._act
+
+        def unguarded(case, platform, display, *, now):
+            payment = (case.answer or {}).get("payment")
+            if isinstance(payment, dict) and payment.get("status") not in (None, "open"):
+                case.answer = {**case.answer, "payment": {**payment, "status": "open"}}
+            return original(case, platform, display, now=now)
+
+        monkeypatch.setattr(case_module, "_act", unguarded)
+
+    elif mode == "plate_logged":
+        # The case's step writes the plate into a log line.
+        original = case_module.advance
+
+        def chatty(case, platform, display, *, now):
+            case_module.log.info("exit case for %s", case.identity.plate)
+            return original(case, platform, display, now=now)
+
+        monkeypatch.setattr(case_module, "advance", chatty)
+
+    else:
+        raise RuntimeError(f"unknown BREAK_EXIT_SETTLED mode: {mode}")

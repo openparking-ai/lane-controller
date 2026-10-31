@@ -44,7 +44,10 @@ and the review's fixes:
   taken_sent_again              a picture whose removal failed is sent again
   exit_stay_identity            an exit's pending close is made unreadable like an entry's
   closing_reopens_at_the_bound  the closing goes with the personal data
-  stale_rule_applied            an owner's rule is applied from a stale cache
+  stale_rule_applied            an owner's allow rule is applied from a stale cache
+  stale_deny_skipped            a deny in rules past their age lets the car in
+  stale_deny_unrecorded         a deny applied from stale rules does not say so
+  deny_skipped_unstated         a deny is not asked at a garage that has not stated itself
   assisted_arming_dropped       a car a person lets in keeps none of its arming read
   refused_arming_dropped        a refused car that drives in keeps none of its arming read
   refused_arming_any_car        a refused car's arming read goes with another car's stay
@@ -100,7 +103,10 @@ BREAKAGES = [
     ("taken_sent_again", "a picture whose removal failed is sent again"),
     ("exit_stay_identity", "an exit's pending close is made unreadable"),
     ("closing_reopens_at_the_bound", "the closing goes with the personal data"),
-    ("stale_rule_applied", "an owner's rule is applied from a stale cache"),
+    ("stale_rule_applied", "an owner's allow rule is applied from a stale cache"),
+    ("stale_deny_skipped", "a deny in rules past their age lets the car in"),
+    ("stale_deny_unrecorded", "a deny applied from stale rules does not say it was stale"),
+    ("deny_skipped_unstated", "a deny is not asked at a garage that has not stated itself"),
     ("assisted_arming_dropped", "a car a person lets in keeps none of its arming read"),
     ("refused_arming_dropped", "a refused car that drives in keeps none of its arming read"),
     ("refused_arming_any_car", "a refused car's arming read goes with another car's stay"),

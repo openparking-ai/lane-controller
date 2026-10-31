@@ -242,10 +242,16 @@ def test_get_stays_asks_the_stays_route_with_and_without_a_cursor():
     # the whole client surface, so a new method is a deliberate addition. The
     # seventh, `claim_validation`, is the reader's: the validation claimed when
     # the phone is entered (platform 0019, amendment A1). The eighth,
-    # `post_picture`, is a picture kept with an entry (U7f).
+    # `post_picture`, is a picture kept with an entry (U7f). The six `exit`
+    # methods are the exit case: open it, ask how it stands, the driver's
+    # word, the fee to the reader, the fee taken off the reader, and the
+    # text receipt. `redeem_enrolment` is a registration QR scanned at the
+    # lane (1b).
     assert sorted(m for m in vars(PlatformClient) if not m.startswith("_")) == [
-        "claim_validation", "close_session", "find_open_session", "get_rules", "get_stays",
-        "open_session", "post_events", "post_picture",
+        "claim_validation", "close_session", "exit_pay", "exit_pay_cancel", "exit_receipt",
+        "exit_word",
+        "find_open_session", "get_exit", "get_rules", "get_stays", "open_exit",
+        "open_session", "post_events", "post_picture", "redeem_enrolment",
     ]
 
 

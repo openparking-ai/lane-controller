@@ -70,6 +70,25 @@ class FakePlatform:
         #: When True, `get_stays` leaves both out: a platform that carries them
         #: on the slow read only. The fail-control's plant, and a test's.
         self.lane_on_slow_read_only = False
+        #: THE EXIT CASES (platform 0037, 0038), by id, and every request made
+        #: of them in order. A case opens answering `exit_answer` -- by default
+        #: settled as paid, a car whose fee the reader took before it was
+        #: asked about -- and a test moves `exit_answer` to change how cases
+        #: stand from the next ask on.
+        self.exits: dict[str, dict] = {}
+        self.exit_requests: list[tuple] = []
+        self.exit_answer: dict = {"settled": True, "why": "paid"}
+        #: What `/pay` answers `sent` as, or the refusal code it raises (409).
+        self.exit_pay_sent: object = True
+        self.exit_pay_refusal: str | None = None
+        #: The refusal code `/pay/cancel` raises (409), as `exit_paid` or
+        #: `payment_in_progress` (platform 0042); None cancels.
+        self.exit_pay_cancel_refusal: str | None = None
+        #: What `redeem_enrolment` answers, and how many QRs were presented.
+        self.qr_answer: dict = {"open": False, "outcome": "not_covered",
+                                "enrolment": {"refused": "REFUSAL_CREDENTIAL_UNKNOWN"},
+                                "answer": {"outcome": "not_covered"}}
+        self.qr_presentations = 0
 
     def _lane_fields(self, *, fast: bool) -> dict:
         if fast and self.lane_on_slow_read_only:
@@ -148,6 +167,13 @@ class FakePlatform:
                 return self.stays[i]
         raise KeyError(session_id)
 
+    def redeem_enrolment(self, token: str, vehicle: str | None, presented_at: str) -> dict:
+        """`POST /lane/redeem-enrolment`: the answer a test set in
+        `qr_answer`, or the gate shut on an unknown QR. The token is not kept."""
+        self._check()
+        self.qr_presentations += 1
+        return dict(self.qr_answer)
+
     def post_events(self, events: list[dict]) -> dict:
         self._check()
         for event in events:
@@ -202,6 +228,7 @@ class FakePlatform:
         no_open_command: bool = False,
         unsure_plate: str | None = None,
         unsure_plate_confidence: float | None = None,
+        qr: dict | None = None,
     ) -> dict:
         self._check()
         if unsure_plate is not None and not plate_unreadable:
@@ -235,6 +262,7 @@ class FakePlatform:
                 "no_open_command": no_open_command,
                 "unsure_plate": unsure_plate,
                 "unsure_plate_confidence": unsure_plate_confidence,
+                **({"qr": qr} if qr is not None else {}),
             }
         )
         # Keyed on the event, exactly as the platform is. An entry replayed
@@ -282,8 +310,20 @@ class FakePlatform:
         descriptor: str | None = None,
         local_decision: dict | None = None,
         reader_shown: dict | None = None,
+        exit_id: str | None = None,
+        let_out_by: str | None = None,
+        qr: dict | None = None,
     ) -> dict:
         self._check()
+        who = {"let_out_by": let_out_by} if let_out_by is not None else {}
+        if exit_id and not plate and not ticket_ref:
+            # A case with no car named: closed on the case, as the platform
+            # closes a case with no stay.
+            self.closed.append({"event_id": event_id, "exit_id": exit_id, "exit_at": exit_at,
+                                "exit_confirmation": exit_confirmation,
+                                "local_decision": local_decision, **who})
+            self.exits[exit_id]["closed"] = True
+            return {"session": None, "exit": dict(self.exits[exit_id]), "closed": True}
         identity = self._identity(plate, ticket_ref)
         if exit_confirmation not in ACCEPTED_EXIT_CONFIRMATIONS:
             raise PlatformRejected(400, f"exit_confirmation {exit_confirmation!r} is not one of "
@@ -299,6 +339,9 @@ class FakePlatform:
                 "descriptor": descriptor,
                 "local_decision": local_decision,
                 **({"reader_shown": reader_shown} if reader_shown is not None else {}),
+                **({"exit_id": exit_id} if exit_id else {}),
+                **who,
+                **({"qr": qr} if qr is not None else {}),
             }
         )
         if event_id in self.sessions_by_close_event:
@@ -324,6 +367,59 @@ class FakePlatform:
         }
         self.sessions_by_close_event[event_id] = session
         return {"session": session, "closed": True}
+
+    # -- the exit case ---------------------------------------------------
+
+    def _case(self, exit_id: str) -> dict:
+        case = self.exits[exit_id]
+        case.update({k: v for k, v in self.exit_answer.items()})
+        if case.get("settled"):
+            case.pop("needs", None)
+        else:
+            case.pop("why", None)
+        return dict(case)
+
+    def open_exit(self, *, event_id: str, exit_at: str, session_id=None, id_fields=None) -> dict:
+        self._check()
+        self.exit_requests.append(("open", event_id, session_id, dict(id_fields or {})))
+        for case in self.exits.values():
+            if case["event_id"] == event_id:
+                return self._case(case["id"])
+        exit_id = f"exit-{len(self.exits) + 1}"
+        self.exits[exit_id] = {
+            "id": exit_id, "event_id": event_id, "exit_at": exit_at, "session_id": session_id,
+            "method": "lane" if session_id else "single", "fee": None, "payment": None,
+            "closed": False,
+        }
+        return self._case(exit_id)
+
+    def get_exit(self, exit_id: str) -> dict:
+        self._check()
+        self.exit_requests.append(("get", exit_id))
+        return self._case(exit_id)
+
+    def exit_word(self, exit_id: str, entry_at: str) -> dict:
+        self._check()
+        self.exit_requests.append(("word", exit_id, entry_at))
+        return self._case(exit_id)
+
+    def exit_pay(self, exit_id: str):
+        self._check()
+        self.exit_requests.append(("pay", exit_id))
+        if self.exit_pay_refusal is not None:
+            raise PlatformRejected(409, "{}", self.exit_pay_refusal)
+        return self._case(exit_id), self.exit_pay_sent
+
+    def exit_pay_cancel(self, exit_id: str) -> dict:
+        self._check()
+        self.exit_requests.append(("pay_cancel", exit_id))
+        if self.exit_pay_cancel_refusal is not None:
+            raise PlatformRejected(409, "{}", self.exit_pay_cancel_refusal)
+        return self._case(exit_id)
+
+    def exit_receipt(self, exit_id: str, phone: str) -> None:
+        self._check()
+        self.exit_requests.append(("receipt", exit_id, phone))
 
     # -- what the tests assert on -----------------------------------------
 

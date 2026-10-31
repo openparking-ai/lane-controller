@@ -17,6 +17,7 @@ import json
 
 import pytest
 
+from fake_platform import FakePlatform
 from lane_controller import (
     CameraConfig,
     DecisionCache,
@@ -63,6 +64,7 @@ def build(
     rules=(),
     rules_max_age: float | None = None,
     loops_impl: ClosingLoops | None = None,
+    exits=None,
     clock=None,
     closed: str | None = None,
 ):
@@ -99,6 +101,7 @@ def build(
     else:
         loops = ScriptedClosingLoops(crossings) if closing_loops == 2 else None
     extra = {"clock": clock} if clock is not None else {}
+    exits = exits if exits is not None else FakePlatform()
     controller = LaneController(
         config,
         loop=SimulatedLoopInput(arrivals=1),
@@ -112,6 +115,7 @@ def build(
         ),
         closing_loops=loops,
         cache=cache,
+        exits=exits,
         **extra,
     )
     return controller, vend, loops
@@ -567,7 +571,15 @@ PLATE_LEAK_CASES = [
     "lane_closed",
     "lane_closed_full",
     "lane_closed_exit",
+    "exit_not_settled",
 ]
+
+
+def _waiting_platform():
+    """A platform that keeps every exit case waiting for a person."""
+    platform = FakePlatform()
+    platform.exit_answer = {"settled": False, "needs": "person"}
+    return platform
 
 
 def test_every_fallback_branch_is_in_that_list():
@@ -645,6 +657,9 @@ def test_no_log_event_carries_plate_text(case):
         "lane_closed": dict(closed="everyone"),
         "lane_closed_full": dict(closed="full"),
         "lane_closed_exit": dict(direction="exit", closed="everyone"),
+        # AN EXIT CASE THE PLATFORM KEEPS WAITING: the barrier stays down, the
+        # case is opened with the car's ID fields, and a person is asked for.
+        "exit_not_settled": dict(direction="exit", exits=_waiting_platform()),
     }[case]
     settings.setdefault("identities", [seen])
     settings.setdefault("crossings", [(ClosingSequence.FORWARD, 3.0)])

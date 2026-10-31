@@ -59,6 +59,7 @@ And what the independent review of this round asked for:
 
 from __future__ import annotations
 
+import json
 import stat
 import threading
 import time
@@ -945,13 +946,47 @@ def test_a_closed_exit_stays_closed_past_the_bound_and_its_gate_was_shut_there_b
     assert exit_lane.vend.vend_count == 0
 
 
-def test_a_stale_owners_rule_is_never_applied():
-    """E3: reverted to what it was before this round -- an owner's rule for a
-    plate is used only while the cache is trusted."""
-    stale, vend, _ = a_lane([SEEN], rules=[Rule(plate=STRANGER, allow=False)], stale=True)
-    assert stale.run_once().outcome is Outcome.ALLOW, "a stale deny rule was applied"
-    fresh, vend, _ = a_lane([SEEN], rules=[Rule(plate=STRANGER, allow=False)])
-    assert fresh.run_once().outcome is Outcome.DENY, "the control: a fresh one is"
+@pytest.mark.parametrize("transient", [True, False], ids=["takes transients", "pass only"])
+@pytest.mark.parametrize("read", [SEEN, LOW], ids=["read", "below the confidence"])
+def test_a_stale_deny_still_wins_and_says_it_was_stale(transient, read):
+    """The owner's decision of 2026-10-30, replacing E3 for a deny: a ban is a
+    ban. A deny in rules past their age keeps the gate shut -- a person opens
+    by hand -- and the decision and its event say it was applied stale."""
+    stale, vend, platform = a_lane([read], rules=[Rule(plate=STRANGER, allow=False)],
+                                   stale=True, transient=transient, crossings=())
+    decision = stale.run_once()
+    assert decision.outcome is Outcome.DENY and decision.stale_deny
+    assert "past their age" in decision.reason and vend.vend_count == 0
+    stale.events.flush()
+    [said] = [e for e in platform.events.values() if e["kind"] == "decision"]
+    assert said["detail"]["stale_deny"] is True and STRANGER not in json.dumps(said)
+    fresh, vend, platform = a_lane([read], rules=[Rule(plate=STRANGER, allow=False)],
+                                   transient=transient, crossings=())
+    decision = fresh.run_once()
+    assert decision.outcome is Outcome.DENY and not decision.stale_deny, "the control"
+    fresh.events.flush()
+    [said] = [e for e in platform.events.values() if e["kind"] == "decision"]
+    assert "stale_deny" not in said["detail"]
+
+
+def test_a_stale_allow_is_still_never_applied():
+    """An ALLOW rule is still used only from a trusted cache (E3 stands for it):
+    at a pass-only garage a stale allow lets nobody in on it."""
+    stale, vend, _ = a_lane([SEEN], rules=[Rule(plate=STRANGER, allow=True)], stale=True,
+                            transient=False, register=a_register(), crossings=())
+    assert stale.run_once().outcome is not Outcome.ALLOW and vend.vend_count == 0
+    fresh, vend, _ = a_lane([SEEN], rules=[Rule(plate=STRANGER, allow=True)], transient=False,
+                            register=a_register())
+    assert fresh.run_once().outcome is Outcome.ALLOW, "the control: a fresh allow opens"
+
+
+def test_a_deny_wins_at_a_garage_that_has_not_said_what_it_takes():
+    """A ban is a ban at every entry, stated or not: a deny on a plate read below
+    the confidence used to fall back to a person there, and it is a deny."""
+    lane, vend, _ = a_lane([LOW], rules=[Rule(plate=STRANGER, allow=False)], crossings=())
+    lane.cache.transient_available = None
+    decision = lane.run_once()
+    assert decision.outcome is Outcome.DENY and vend.vend_count == 0
 
 
 # ---------------------------------------------------------------------------

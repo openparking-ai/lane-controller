@@ -55,9 +55,11 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
+from . import exit_case
 from .config import LaneConfig
 from .contract import TransitState
 from .decision import (
@@ -68,20 +70,27 @@ from .decision import (
     closed_to,
     decide,
     normalise_identity,
+    owner_denies,
     plate_read,
+    plate_seen,
+    qr_may_open,
 )
 from .events import EventQueue, LaneEvent
-from .exit_pricing import price_exit
+from .exit_pricing import COVERED, PRICED, price_exit
 from .interfaces import (
     BannedMatcher,
     CameraFeed,
     ClosingLoops,
     ClosingSequence,
+    ExitDisplay,
     LoopInput,
+    QrScanner,
     VehicleIdentifier,
     VehicleIdentity,
     VendOutput,
 )
+from .loop_watch import LoopWatch
+from .platform_client import PlatformRejected, PlatformUnreachable
 from .reader import ReaderScreen
 from .sync import (
     ARMED,
@@ -101,6 +110,10 @@ from .sync import (
     EXIT_PENDING,
     EXIT_UNCONFIRMABLE,
     HELD,
+    QR_NOT_LINKED,
+    QR_PRESENTED,
+    QR_STALE,
+    QR_UNANSWERED,
     REASON_ARMING_INCOMPLETE,
     REASON_BANNED,
     REASON_CLOSING_LOOP_OCCUPIED,
@@ -108,6 +121,7 @@ from .sync import (
     REASON_LOOP_DRIVER_TIMEOUT,
     REASON_NO_CLOSING_LOOPS,
     REASON_NO_PENDING_ENTRY,
+    REASON_QR_OPENED,
     REASON_REVERSE,
     REASON_VEHICLE_TOO_CLOSE,
     REASON_WINDOW_ELAPSED,
@@ -197,6 +211,22 @@ BETWEEN_PICTURES = 2
 CLOSING_PICTURES = 2
 REFUSED_PICTURES = 2
 
+#: How the pass module's rule passed a QR (its answer's `passed_by`) when the
+#: opening is kept with the car's pictures: the read was not the QR's plate --
+#: one character off, or nothing usable was read.
+QR_PASSES_KEPT = frozenset({"one_difference", "nothing_read"})
+
+
+def _text(value) -> str | None:
+    """A non-empty string out of an answer, or None."""
+    return value if isinstance(value, str) and value else None
+
+
+class DecisionAlreadyCompleted(Exception):
+    """`complete_vend` found the decision already completed -- by an exit case
+    that settled, or by another completion -- and moved nothing. The assisted
+    vend answers it `already_completed`."""
+
 
 class LaneController:
     def __init__(
@@ -215,8 +245,35 @@ class LaneController:
         clock: Callable[[], float] = time.time,
         reader: ReaderScreen | None = None,
         banned_matcher: BannedMatcher | None = None,
+        exits=None,
+        exit_display: ExitDisplay | None = None,
+        qr_scanner: QrScanner | None = None,
+        qr_presenter: Callable[[str, str | None, str], dict] | None = None,
     ) -> None:
         self.config = config
+        # THE EXIT CASE (platform 0037, 0038): who is asked about a car at
+        # this exit the lane could not settle on its own copy -- the platform
+        # client -- and the driver's screen for it. No `exits`: such a car
+        # waits for a person, and the gate stays down (`exit_case`).
+        self.exits = exits
+        self.exit_display = exit_display
+        #: The one car at this exit whose case is not settled, or None.
+        self._exit_case: exit_case.ExitCase | None = None
+        #: Who takes the case to open the barrier: the lane's turn when the
+        #: case settles, or a person's vend at the lane. Exactly one does.
+        self._exit_lock = threading.Lock()
+        #: The case whose fee the platform handed to this lane's reader: until
+        #: its car's close the lane does not drive the reader for it.
+        self._reader_case: str | None = None
+        #: A dropped case whose payment is still to come off the reader.
+        self._left_on_reader: exit_case.ExitCase | None = None
+        # The QR scanner and what a scan is presented to: the platform's
+        # `POST /lane/redeem-enrolment` (`PlatformClient.redeem_enrolment`).
+        # Either absent: no QR is read here, and a refusal stands as it is.
+        self.qr_scanner = qr_scanner
+        self.qr_presenter = qr_presenter
+        #: The QR that opened the transit begun at this instant, for its stay.
+        self._qr_opening: tuple[str, dict] | None = None
         # The banned-car comparison (U7f). None: this lane refuses no car as
         # banned, whatever list it holds.
         self.banned_matcher = banned_matcher
@@ -271,6 +328,13 @@ class LaneController:
         # session times, which is the point: the platform must price the stay
         # from when the car was there, not from when it heard about it.
         self._clock = clock
+        #: THE CANCELS THE PLATFORM HAS NOT CONFIRMED, asked again with a
+        #: bounded backoff until it does (`retry_cancels`), on the drain's
+        #: thread -- never the lane's -- and on disk with the outbox, so a
+        #: restart asks again. A failed cancel was once dropped and left
+        #: another car's fee on the reader.
+        self._cancels = exit_case.PendingCancels(clock, self.events)
+        self._retrying = threading.Lock()
         # THE READ SIDE, and it is deliberately nothing more than this. The
         # contract publishes the last decision and the current transit, and
         # both live here, in memory, for exactly as long as this process does.
@@ -512,6 +576,11 @@ class LaneController:
         #: (`take_completion_arming`).
         self._held_arming: tuple[str, list] | None = None
         self._completion_arming: tuple[str, list] | None = None
+        #: The exit case a person's completion took, as `(at, exit_id)`.
+        self._completion_exit: tuple[str, str] | None = None
+        #: The authority that person opened on, for that case's close, as
+        #: `(exit_id, authority)`.
+        self._let_out_by: tuple[str, str] | None = None
 
     def now(self) -> float:
         """This lane's clock, which is the authority for WHEN.
@@ -526,6 +595,11 @@ class LaneController:
     def handle_arrival(self) -> Decision:
         """One vehicle, from arming to vend. Assumes the loop has already armed."""
         lane = self.config.lane_id
+        # A loop reports one arrival per vehicle: a new one is a new car, and
+        # the one before it left with its case unsettled. Its payment comes
+        # off the reader after this car's frames are taken and before this
+        # car's own fee can reach the reader (`_free_reader`).
+        self._drop_exit_case("a new car arrived before the exit was settled")
 
         frames = self.camera.grab(self.config.camera.frames_per_read)
         self.events.record("frames_captured", lane, count=len(frames), camera=self.camera.camera_id)
@@ -564,12 +638,9 @@ class LaneController:
             direction=self.config.direction,
             day_at=self.now(),
         )
-        # THE QR SEAM (Phase 1b, not built): at a monthly/pass-only garage a
-        # car no register covers is decided DENY with `REASON_NOT_REGISTERED`.
-        # That decision is where a registration QR scanned at this lane will be
-        # presented to the pass module's enrolment, before the gate's answer is
-        # final; a QR it accepts turns the DENY into an open for this car.
-        # Today there is no scanner seam, and the DENY stands.
+        # THE QR SEAM: a refusal `qr_may_open` names stays a refusal here. A
+        # registration QR the driver then scans is read on the idle turns that
+        # follow, while the car is still at the arming loop (`observe_qr`).
         banned = self._banned(identity) if decision.should_vend else None
         if banned is not None:
             # A CAR ON THE GARAGE'S BANNED LIST (U7f): the gate stays shut,
@@ -586,6 +657,13 @@ class LaneController:
             decision = replace(
                 decision, exit_pricing=price_exit(identity.plate, self.cache, now=self.now())
             )
+        case = None
+        if self.config.direction == "exit":
+            # THE GATE OPENS ONLY WHEN SETTLED: covered or a fee of zero, here
+            # and now; every other car at an exit is a case (`exit_case`),
+            # opened before the decision is recorded so the decision says
+            # whether the barrier moved on it.
+            decision, case = self._exit_settlement(decision, identity, frames)
         decided = self.events.record(
             "decision",
             lane,
@@ -593,11 +671,15 @@ class LaneController:
             reason=decision.reason,
             fallback=decision.fallback.value if decision.fallback else None,
             rate_plan=decision.rate_plan,
+            # A DENY FROM RULES PAST THEIR AGE, applied anyway (2026-10-30).
+            **({"stale_deny": True} if decision.stale_deny else {}),
             **(
                 {"exit_pricing": decision.exit_pricing.to_detail()}
                 if decision.exit_pricing is not None
                 else {}
             ),
+            # The platform's case for a car this exit could not settle alone.
+            **({"exit_id": case.exit_id} if case is not None and case.exit_id else {}),
             # A CAR LET IN WITH NO READ AT ALL -- the engine not reached, no
             # frames -- says which failure, as `fallback_needs_human` does for
             # one that was not let in: somebody has to go and fix it, and the
@@ -636,14 +718,31 @@ class LaneController:
             # words the `decision` event above carries and the close will
             # carry as `local_decision`; a car this lane made no money
             # decision about hands `None`, which takes down whatever the
-            # reader was showing for the car before it.
-            self.show_reader(
+            # reader was showing for the car before it. A CAR WHOSE CASE HAS
+            # HANDED ITS FEE TO THE READER leaves the reader alone: the
+            # platform's PaymentIntent is on it, and a cart or a clear sent
+            # now would take that off.
+            record = (
                 decision.exit_pricing.to_detail() if decision.exit_pricing is not None else None
             )
+            if case is None or case.sent_at is None:
+                self.show_reader(record)
+            else:
+                self._note_exit_screen(record)
+
+        if case is not None and not decision.should_vend:
+            # WAITING: the barrier stays down, and the case is moved on at the
+            # lane's idle turns while the car is on the arming loop.
+            self._tell_exit_case(case)
+            self.deliver()
+            return decision
 
         if decision.should_vend:
             self.vend.vend(decision.reason)
             self.events.record("vended", lane, reason=decision.reason)
+            if case is not None and self.exits is not None:
+                # After the barrier: the receipt is a network call.
+                exit_case.send_receipt(case, self.exits, self.exit_display)
 
             # The vend is where the ticket comes out, and the ticket is NOT the
             # entry. What goes on the queue here is a PENDING entry; the loops
@@ -660,7 +759,9 @@ class LaneController:
             # two differed by the relay's time, and the platform's reconciler,
             # which compares them to the millisecond, flagged nearly every
             # lane-priced close `inputs_disagree` with the fee right.
-            exit_at = getattr(decision.exit_pricing, "exit_at", None)
+            exit_at = case.exit_at if case is not None else getattr(
+                decision.exit_pricing, "exit_at", None
+            )
             at = exit_at if exit_at else to_iso(self._clock())
             # The arming read's frames ride with the transit, to be kept with
             # the stay it opens -- and with nothing if it opens none.
@@ -669,6 +770,7 @@ class LaneController:
                 at,
                 exit_pricing=decision.exit_pricing,
                 arming=frames if self.config.direction == "entry" else (),
+                exit_id=case.exit_id if case is not None else None,
             )
 
         elif decision.outcome is Outcome.NO_VEHICLE:
@@ -726,8 +828,10 @@ class LaneController:
             )
 
         # Best effort, and after the barrier has already been told what to do.
-        # Nothing above this line waits on the network.
+        # Nothing above this line waits on the network. A car with no case of
+        # its own takes the last car's payment off the reader only now.
         self.deliver()
+        self._free_reader()
         return decision
 
     # ------------------------------------------------------------------
@@ -765,6 +869,16 @@ class LaneController:
         whatever time anything else eventually hears about it.
         """
         lane = self.config.lane_id
+        # A PERSON AT THE LANE DECIDED: a car whose exit case was waiting is
+        # theirs now, and the lane's turn will not open for it as well. THE
+        # DECISION IS CLAIMED HERE, under the lock the case's own opening
+        # takes: the route checked `completed` without it, and a case that
+        # settled in between has already moved the barrier for this car.
+        with self._exit_lock:
+            if self.last_decision_completed_at is not None:
+                raise DecisionAlreadyCompleted(self.last_decision_completed_at)
+            self.last_decision_completed_at = to_iso(self._clock())
+            case, self._exit_case = self._exit_case, None
         # FIRST, and before anything moves. Held on the controller as well as
         # recorded, because the record is what an operator reads and this is
         # what the session action is built from.
@@ -780,8 +894,24 @@ class LaneController:
         # without consuming and nothing can consume without vending.
         arming = self._take_held_arming()
         self._completion_arming = (at, arming) if arming else None
+        # The case the person took is named on this car's close
+        # (`take_completion_exit_id`), and its payment comes off the reader.
+        self._completion_exit = (at, case.exit_id) if case is not None and case.exit_id else None
+        # And the authority the person opened on rides that close as
+        # `let_out_by`, when the platform takes it (`LET_OUT_AUTHORITIES`).
+        # The lane holds no name for the person: only this authority.
+        self._let_out_by = (
+            (case.exit_id, str(authorised_by))
+            if self._completion_exit is not None
+            and str(authorised_by) in exit_case.LET_OUT_AUTHORITIES
+            else None
+        )
         self.last_decision_completed_at = at
         self.begin_transit(identity, at)
+        if case is not None:
+            self._cancel_on_reader(case)
+            if self.exit_display is not None:
+                self.exit_display.show_exit(None)
 
         # AND THE RECORD LEAVES THE BOX, exactly as `handle_arrival` ends.
         # `EventQueue.record` appends to two in-memory deques and nothing else;
@@ -799,6 +929,648 @@ class LaneController:
         # `tests/test_vend.py` and stated in `docs/CONTRACT.md`.
         self.deliver()
         return at
+
+    # ------------------------------------------------------------------
+    # The exit case: a car this lane could not settle on its own copy.
+    # ------------------------------------------------------------------
+
+    #: The fallbacks at an exit that are a case: a car is there and the lane
+    #: could not settle it from what it holds. A lane closed, a banned car, a
+    #: plate an owner's rule denies and nothing there are not.
+    _CASE_FALLBACKS = frozenset({
+        Fallback.LOW_CONFIDENCE,
+        Fallback.NO_PLATE_READ,
+        Fallback.UNKNOWN_VEHICLE,
+        Fallback.STALE_RULES,
+        Fallback.ENGINE_UNREACHABLE,
+    })
+
+    def _exit_settlement(
+        self, decision: Decision, identity, frames
+    ) -> tuple[Decision, exit_case.ExitCase | None]:
+        """The exit's decision, and its case when it has one.
+
+        Settled here: covered, or priced at a fee of zero -- the barrier opens
+        now, as before, and there is no case. Every other car that would have
+        opened, and every car this lane could not read or price, is a case,
+        opened now: settled on its first answer, the barrier opens on it;
+        otherwise the decision is `exit_not_settled` and the barrier stays
+        down until the case is settled.
+        """
+        if decision.should_vend:
+            pricing = decision.exit_pricing
+            if pricing is not None and (
+                pricing.status == COVERED or (pricing.status == PRICED and pricing.fee_minor == 0)
+            ):
+                return decision, None
+            why = pricing.status if pricing is not None else "no plate to price"
+        elif decision.outcome is Outcome.FALLBACK and decision.fallback in self._CASE_FALLBACKS:
+            why = decision.reason
+        else:
+            return decision, None
+        pricing = decision.exit_pricing
+        confident = (
+            identity.unavailable is None
+            and identity.confidence >= self.config.confidence_threshold
+        )
+        case = exit_case.ExitCase(
+            event_id=str(uuid.uuid4()),
+            exit_at=getattr(pricing, "exit_at", None) or to_iso(self._clock()),
+            identity=identity,
+            pricing=pricing,
+            fields=exit_case.id_fields(identity, plate_confident=confident),
+            session_id=exit_case.named_stay(pricing),
+        )
+        # THE PICTURES THE PICKER IS SHOWN of this car at this exit, kept
+        # under the case's own event and sent before the case is opened.
+        self.events.queue_pictures(case.event_id, frames)
+        self.deliver()
+        # The last car's payment off the reader before this car's can go on.
+        self._free_reader()
+        settled, watch = self._watched_step(case)
+        if settled and self._still_there(watch):
+            if not decision.should_vend:
+                decision = replace(
+                    decision,
+                    outcome=Outcome.ALLOW,
+                    reason=f"the exit is settled: {case.why}",
+                    fallback=None,
+                )
+            return decision, case
+        with self._exit_lock:
+            self._exit_case = case
+        if settled:
+            # Settled on its first answer, but the car backed off the loop
+            # while the platform was asked: nothing opens for whoever is there.
+            self._leave_exit_case(self._LEFT_DURING_CALL)
+            why = "the car left the loop while the platform was asked"
+        return replace(
+            decision,
+            outcome=Outcome.FALLBACK,
+            reason=f"the exit is not settled: {why}",
+            fallback=Fallback.EXIT_NOT_SETTLED,
+        ), case
+
+    def _step(self, case: exit_case.ExitCase) -> str:
+        """One step of a case: `exit_case.advance`, or UNANSWERED with no platform."""
+        if self.exits is None:
+            case.outcome = exit_case.UNANSWERED
+            if self.exit_display is not None:
+                self.exit_display.show_exit({"needs": exit_case.NEEDS_PERSON, "fee": None})
+        else:
+            case.fee_held = self._cancels.others(case.exit_id)
+            case.outcome = exit_case.advance(
+                case, self.exits, self.exit_display, now=self._clock()
+            )
+            if case.sent_at is not None:
+                self._reader_case = case.exit_id
+        return case.outcome
+
+    #: Why a settled case was dropped rather than opened for.
+    _LEFT_DURING_CALL = (
+        "the arming loop read clear while the platform was asked about the case; "
+        "the car on it now was not read"
+    )
+
+    def _watched_step(self, case: exit_case.ExitCase) -> tuple[bool, exit_case.LoopWatch]:
+        """One step of the case with the arming loop watched while it runs:
+        whether it settled, and the watch."""
+        watch = exit_case.LoopWatch(self.loop, self._clock).start()
+        try:
+            settled = self._step(case) == exit_case.SETTLED
+        finally:
+            watch.stop()
+        return settled, watch
+
+    def _still_there(self, watch: exit_case.LoopWatch) -> bool:
+        """Whether the car the case was asked about is still the car on the
+        loop: occupied now, and no clear longer than a flicker while the
+        platform was asked. Reads the loop, so never under `_exit_lock`: a
+        stalled read must not hold up a person's vend."""
+        return self._loop_now() and watch.stayed()
+
+    def _loop_now(self) -> bool:
+        """The arming loop now. A clear reading is read once more after
+        `EXIT_SAMPLE_SECONDS`: one clear sample is a flicker, two a car gone.
+        A read that raises is a car gone."""
+        try:
+            if self.loop.is_occupied():
+                return True
+            time.sleep(exit_case.EXIT_SAMPLE_SECONDS)
+            return self.loop.is_occupied()
+        except Exception:  # noqa: BLE001 -- an unread loop fails shut
+            log.warning("exit case: the arming loop could not be read; nothing opens")
+            return False
+
+    def _advance_exit_case(self, case: exit_case.ExitCase) -> None:
+        """One step of the waiting case; the barrier opens when it is settled."""
+        settled, watch = self._watched_step(case)
+        if settled:
+            self._let_out(case, watch)
+            return
+        self._tell_exit_case(case)
+        self._tell_fee_held(case)
+
+    def _tell_fee_held(self, case: exit_case.ExitCase) -> None:
+        """A car whose fee has waited `EXIT_FEE_HELD_TELL_SECONDS` on an
+        earlier car's unconfirmed cancel: a person is told, once, naming THIS
+        car's case -- the earlier case's own alert (`cancel_pending`) names
+        the earlier one. The fee goes on waiting."""
+        if (
+            case.held_since is None
+            or case.held_told
+            or self._clock() - case.held_since < exit_case.EXIT_FEE_HELD_TELL_SECONDS
+        ):
+            return
+        case.held_told = True
+        self.events.record(
+            "fallback_needs_human",
+            self.config.lane_id,
+            reason="car waiting: the reader is still busy with an earlier car's payment",
+            fallback=Fallback.EXIT_NOT_SETTLED.value,
+            exit_id=case.exit_id,
+            needs=exit_case.NEEDS_FEE_HELD,
+        )
+        self.deliver()
+
+    def _tell_exit_case(self, case: exit_case.ExitCase) -> None:
+        """A case that needs a person -- or that cannot be asked, or that the
+        platform refused -- says so, once for each. Paying and the driver's
+        word are the driver's to do, and say nothing here."""
+        if case.outcome == exit_case.UNANSWERED:
+            need = "unanswered"
+        elif case.refused and case.needs != exit_case.NEEDS_DRIVER_WORD:
+            need = "refused"
+        elif (
+            case.needs == exit_case.NEEDS_PAYMENT
+            and case.busy >= exit_case.EXIT_READER_BUSY
+        ):
+            need = exit_case.NEEDS_READER_BUSY
+        elif (
+            case.needs == exit_case.NEEDS_PAYMENT
+            and case.attempts >= exit_case.EXIT_PAY_ATTEMPTS
+        ):
+            need = exit_case.NEEDS_PAY_ATTEMPTS
+        else:
+            need = case.needs
+        told = ("unanswered", "refused", exit_case.NEEDS_PERSON, exit_case.NEEDS_PAY_ATTEMPTS,
+                exit_case.NEEDS_READER_BUSY)
+        if need in told and need != case.told:
+            case.told = need
+            self.events.record(
+                "fallback_needs_human",
+                self.config.lane_id,
+                reason=f"the exit is not settled: {need}",
+                fallback=Fallback.EXIT_NOT_SETTLED.value,
+                exit_id=case.exit_id,
+                needs=need,
+                **({"refused": case.refused} if need == "refused" else {}),
+                **(
+                    {"attempts": case.attempts}
+                    if need == exit_case.NEEDS_PAY_ATTEMPTS
+                    else {}
+                ),
+            )
+            self.deliver()
+
+    def _let_out(self, case: exit_case.ExitCase, watch: exit_case.LoopWatch) -> None:
+        """The case is settled: the barrier opens, and the close names the case
+        -- if its car is still the car on the loop. One that backed off while
+        the platform was asked leaves the case to a person, and nothing opens.
+        The loop is read before the lock is taken; the decision is made under
+        it."""
+        there = self._still_there(watch)
+        with self._exit_lock:
+            if self._exit_case is not case:
+                # A person at the lane opened for this car first.
+                return
+            if there:
+                self._exit_case = None
+                self.last_decision_completed_at = to_iso(self._clock())
+        if not there:
+            self._leave_exit_case(self._LEFT_DURING_CALL)
+            return
+        lane = self.config.lane_id
+        reason = f"the exit is settled: {case.why}"
+        self.vend.vend(reason)
+        self.events.record("vended", lane, reason=reason, exit_id=case.exit_id)
+        if self.exits is not None:
+            # After the barrier: the receipt is a network call.
+            exit_case.send_receipt(case, self.exits, self.exit_display)
+        if self.exit_display is not None:
+            self.exit_display.show_exit(None)
+        self._settle_transit(
+            case.identity, case.exit_at, exit_pricing=case.pricing, exit_id=case.exit_id
+        )
+        self.deliver()
+
+    def observe_exit_case(self) -> None:
+        """On an idle turn: the waiting case, while its car is on the arming
+        loop. A car that has left -- the loop clear for `EXIT_LEFT_SECONDS`
+        -- leaves its case to a person. While the loop reads clear and that
+        time has not passed, the case is not moved on: nothing opens for a
+        car the loop does not see.
+
+        A CLEAR LONGER THAN A FLICKER ENDS THE CASE'S RIGHT TO OPEN. The loop
+        occupied again after reading clear for `EXIT_FLICKER_SECONDS` or more
+        may be another car that rolled on without arming, and a case settled
+        for the car that backed off would open the barrier for it. The case is
+        dropped and left to a person; the car on the loop is read when it
+        arms. A clear shorter than that is a flicker, and the case goes on."""
+        self._free_reader()
+        case = self._exit_case
+        if case is None:
+            return
+        now = self._clock()
+        if not self.loop.is_occupied():
+            if case.clear_since is None:
+                case.clear_since = now
+            if now - case.clear_since >= exit_case.EXIT_LEFT_SECONDS:
+                self._leave_exit_case("the car left the exit before it was settled")
+            return
+        if case.clear_since is not None:
+            cleared_for, case.clear_since = now - case.clear_since, None
+            if cleared_for >= exit_case.EXIT_FLICKER_SECONDS:
+                self._leave_exit_case(
+                    "the arming loop read clear under the waiting car for longer than a "
+                    "flicker; the car on it now was not read"
+                )
+                return
+        self._advance_exit_case(case)
+
+    def _leave_exit_case(self, reason: str) -> None:
+        """Drop the waiting case, if any, and take its payment off the reader."""
+        self._drop_exit_case(reason)
+        self._free_reader()
+        self.deliver()
+
+    def _drop_exit_case(self, reason: str) -> None:
+        """Drop the waiting case, if any, and say so: the platform keeps it for
+        a person, and nothing opens for it here. A case that handed its fee to
+        the reader is held for `_free_reader`, which takes its payment off
+        through the platform; the lane drives the reader only when it never
+        did."""
+        with self._exit_lock:
+            case, self._exit_case = self._exit_case, None
+        if case is None:
+            return
+        self.events.record(
+            "fallback_needs_human",
+            self.config.lane_id,
+            reason=reason,
+            fallback=Fallback.EXIT_NOT_SETTLED.value,
+            exit_id=case.exit_id,
+            needs="left",
+        )
+        if self.exit_display is not None:
+            self.exit_display.show_exit(None)
+        if case.sent_at is None:
+            self.show_reader(None)
+            return
+        self._note_exit_screen(None)
+        self._free_reader()
+        self._left_on_reader = case
+
+    def _free_reader(self) -> None:
+        """Take a dropped case's payment off the reader (`cancel_on_reader`):
+        before the next car's fee can reach the reader, and after that car's
+        frames are taken, so a slow platform does not hold up the read."""
+        case, self._left_on_reader = self._left_on_reader, None
+        if case is None:
+            return
+        self._cancel_on_reader(case)
+        if self._reader_case == case.exit_id:
+            self._reader_case = None
+
+    def _cancel_on_reader(self, case: exit_case.ExitCase) -> None:
+        """QUEUE the case's payment cancel -- only a case whose fee was handed
+        to the reader -- and hand it to whoever drains: the drain's thread
+        under `LaneRunner` asks it (`retry_cancels`), first time and every
+        time, so the lane's thread never waits on a cancel (it used to ask the
+        first one itself, up to the client's timeout). A bare controller asks
+        it now, inline (`deliver`). Until it is confirmed, no other case's fee
+        is handed to the reader (`ExitCase.fee_held`)."""
+        if self.exits is None or case.exit_id is None or case.sent_at is None:
+            return
+        self._cancels.add(case.exit_id)
+        self.deliver()
+
+    def retry_cancels(self) -> int:
+        """Ask the platform again for every pending cancel that is due, until
+        it confirms: on the drain's thread under `LaneRunner` (its every
+        turn), inline only on a bare controller (`deliver`). Never on the
+        lane's thread under the runner, so a slow or failing platform never
+        holds a car. One retry pass at a time. Returns how many were asked."""
+        if self.exits is None or not self._retrying.acquire(blocking=False):
+            return 0
+        try:
+            asked = 0
+            for exit_id in self._cancels.due():
+                asked += 1
+                # The first ask and every ask after it: here, never on the
+                # lane's thread under the runner.
+                outcome = exit_case.cancel_payment(exit_id, self.exits)
+                if outcome in exit_case.CANCEL_CONFIRMED:
+                    self._cancels.settle(exit_id)
+                elif outcome in exit_case.CANCEL_RETRY:
+                    attempts, tell = self._cancels.failed(exit_id)
+                    if tell:
+                        self._tell_cancel(exit_id, exit_case.NEEDS_CANCEL_PENDING,
+                                          attempts=attempts)
+                else:
+                    # refused outright: no ask can change it, a person finishes it
+                    self._cancels.settle(exit_id)
+                    self._tell_cancel(exit_id, exit_case.NEEDS_CANCEL_REFUSED)
+            return asked
+        finally:
+            self._retrying.release()
+
+    def _tell_cancel(self, exit_id: str, need: str, **detail) -> None:
+        """A payment that may still be on the reader, said to a person once."""
+        self.events.record(
+            "fallback_needs_human",
+            self.config.lane_id,
+            reason=f"the exit case's payment could not be taken off the reader: {need}",
+            fallback=Fallback.EXIT_NOT_SETTLED.value,
+            exit_id=exit_id,
+            needs=need,
+            **detail,
+        )
+
+    # ------------------------------------------------------------------
+    # A registration QR, scanned for the car the lane just refused.
+    # ------------------------------------------------------------------
+
+    def observe_qr(self) -> Decision | None:
+        """Read the scanner once; present a QR for the car at the barrier.
+
+        Called on the idle turns of `run_once`. A scan is presented only for
+        THE CAR THE LANE LAST REFUSED, still at the arming loop with nothing
+        held behind it, whose refusal a QR may open (`decision.qr_may_open`)
+        and that nobody has completed -- otherwise it is read, dropped, and
+        nothing is recorded: a QR waved at an empty lane, or at a car already
+        let through, is nobody's.
+
+        THE OWNER'S DENY FIRST AND ALWAYS (2026-10-30): a deny rule for the
+        plate the camera read, AT ANY CONFIDENCE, keeps the QR from being
+        presented at all; and a deny rule for the plate the QR was made for
+        (`enrolment.qr_plate` in the answer) keeps the gate shut after the
+        module answered -- with nothing read, the car let in on a QR is the
+        QR's car. Neither is a QR's to overrule, and a deny wins whatever the
+        cache's age (`owner_denies`): applied stale, it is recorded so.
+
+        WHAT IS PRESENTED is the plate this lane stands behind (`plate_read`)
+        or nothing: a plate below the confidence, no plate and no read are
+        "nothing usable", which the pass module's rule passes for a valid QR
+        (similar enough gets a pass: a look-alike, one difference, or nothing
+        read; `passed_by` in its answer). The decision is the module's, in one
+        place; the lane never compares plates for it.
+
+        The platform asks the pass module, which answers this movement: `open`
+        on covered, and on nothing else. Open: the relay, `vended` (with
+        `qr_passed_by` and the QR's `enrolment` id, never a plate), and the
+        transit as any open -- at an exit with no local decision, so the close
+        asks the modules. A QR that opened on one difference or on nothing
+        read has its car's pictures kept against that `vended` event: the
+        record is the event (the rule, the QR and the pictures), the stay
+        (what was read, as every stay keeps it) and the QR's own row in the
+        pass module (its plate, and what it was handed). Shut: the refusal
+        stands, and a person is still the way past it.
+
+        THIS IS THE ONE LANE READ THAT WAITS ON THE NETWORK, and it has to: a
+        QR is a credential only the module can check. While it waits, the
+        arming loop is WATCHED (`LoopWatch`), and the barrier opens only for
+        the car that was there when the QR was scanned: the loop occupied now,
+        no clear longer than a flicker while the platform was asked, both
+        arming loops still occupied and nothing on the deactivate loop. A car
+        that backed off -- and whoever rolled on after it -- gets nothing
+        opened; a person is told (`fallback_needs_human`, `needs: "left"`).
+        Offline -- the platform unreachable or the module unable to answer --
+        the gate stays shut and a `qr_presented` with `answered: false` says
+        why; the platform recorded every one it answered itself.
+
+        THE TOKEN IS KEPT NOWHERE: not in an event, not in a log line, not on
+        this controller. Neither is a plate on the events this writes, nor in
+        a log line.
+
+        A person's completion (`POST /v1/lane/vend`) of the same refusal at
+        the same moment is checked against once more, just before the relay,
+        by `last_decision_completed_at`; the vend route checks the same value
+        on its own thread, so two completions in the same instant are not
+        excluded by a lock. Stated, not guarded.
+        """
+        if self.qr_scanner is None:
+            return None
+        token = self.qr_scanner.poll()
+        if not token:
+            return None
+        decision = self.last_decision
+        if (
+            self.qr_presenter is None
+            or decision is None
+            or self.last_decision_completed_at is not None
+            or not qr_may_open(decision, self.config.direction)
+            or not self._car_at_the_barrier()
+        ):
+            log.info(
+                "lane %s: a QR was scanned with no refused car to present it for",
+                self.config.lane_id,
+            )
+            return None
+        lane = self.config.lane_id
+        decided_at = self.last_decision_at
+        identity = decision.identity
+        if self._banned(identity) is not None:
+            # A refusal that was not a vend never asked the banned list
+            # (`handle_arrival` asks it of a car about to be let in), so it is
+            # asked here, before a QR can let this car in.
+            log.info("lane %s: a QR was scanned for a banned car; not presented", lane)
+            return None
+        if owner_denies(self.cache, plate_seen(identity)) is not None:
+            # THE OWNER'S DENY ON WHAT WAS READ, AT ANY CONFIDENCE: before the
+            # QR goes anywhere. The decision already denies a car read this
+            # way; the cache may have learned the rule since.
+            log.info("lane %s: a QR was scanned for a car the owner's rule denies; not "
+                     "presented", lane)
+            self._qr_denied("the owner's rule denies this car; a QR does not overrule the "
+                            "owner")
+            return None
+        # NOTHING USABLE IS NOTHING: below the confidence is not a read.
+        vehicle = plate_read(identity, self.config.confidence_threshold) or None
+        unanswered = None
+        watch = LoopWatch(self.loop, self._clock).start()
+        try:
+            answer = self.qr_presenter(token, vehicle, to_iso(self._clock()))
+        except PlatformUnreachable as err:
+            # A 503 the platform named is the module unable to answer, and the
+            # platform recorded that itself.
+            unanswered = None if err.code == QR_UNANSWERED else "platform unreachable"
+            answer = None
+        except PlatformRejected as err:
+            unanswered = {
+                QR_NOT_LINKED: "garage not linked to the pass module",
+                QR_STALE: "presented too late",
+            }.get(err.code, "rate limited" if err.status == 429 else "refused by the platform")
+            answer = None
+        finally:
+            watch.stop()
+        if answer is None:
+            if unanswered is not None:
+                self.events.record(
+                    QR_PRESENTED,
+                    lane,
+                    answered=False,
+                    reason=unanswered,
+                    direction=self.config.direction,
+                    read_identity=vehicle is not None,
+                )
+            log.info("lane %s: a QR could not be checked; the gate stays shut", lane)
+            self.deliver()
+            return None
+        enrolment = answer.get("enrolment") if isinstance(answer.get("enrolment"), dict) else {}
+        if answer.get("open") is not True:
+            log.info(
+                "lane %s: the pass module answered %s for a QR (refused: %s); the gate stays shut",
+                lane,
+                answer.get("outcome"),
+                enrolment.get("refused"),
+            )
+            return None
+        if owner_denies(self.cache, _text(enrolment.get("qr_plate"))) is not None:
+            # THE OWNER'S DENY ON THE QR'S CAR: with nothing read, or a read
+            # one character off, the car the QR lets in is the car it was
+            # made for -- and the owner denied that car. Shut; a person.
+            log.info("lane %s: the owner's rule denies the car a QR was made for; the gate "
+                     "stays shut", lane)
+            self._qr_denied("the owner's rule denies the car this QR was made for; a QR does "
+                            "not overrule the owner")
+            return None
+        if self.last_decision_at != decided_at or self.last_decision_completed_at is not None:
+            log.warning(
+                "lane %s: a QR was answered for a refusal already completed; not vended", lane
+            )
+            return None
+        if not (self._loop_now() and watch.stayed() and self._car_at_the_barrier(read=False)):
+            # THE CAR LEFT WHILE THE PLATFORM WAS ASKED -- or another rolled
+            # on, or one pulled up too close behind: nothing opens for whoever
+            # is there now. The refusal stands for a person.
+            log.info("lane %s: the car left the arming loop while its QR was checked; nothing "
+                     "opened", lane)
+            self.events.record(
+                "fallback_needs_human", lane,
+                reason="a QR was answered covered, but the car it was scanned for left the "
+                "arming loop while the platform was asked; nothing opened",
+                fallback=decision.fallback.value if decision.fallback else None,
+                needs="left",
+            )
+            self.deliver()
+            return None
+        passed_by = _text(enrolment.get("passed_by"))
+        qr_id = _text(enrolment.get("enrolment"))
+        qr_fields = None if qr_id is None else {
+            "enrolment": qr_id,
+            **({"passed_by": passed_by} if passed_by else {}),
+            **({"qr_plate": enrolment["qr_plate"]} if _text(enrolment.get("qr_plate")) else {}),
+        }
+        if self.config.direction == "exit":
+            # AT AN EXIT A QR OPENS NOTHING ITSELF: the gate opens only when
+            # the exit is settled, and only through the one opener
+            # (`_let_out`). The QR settles the car's case instead.
+            return self._qr_settles_exit_case(qr_fields)
+        self.vend.vend(REASON_QR_OPENED)
+        vended = self.events.record(
+            "vended", lane, reason=REASON_QR_OPENED,
+            **({"qr_passed_by": passed_by} if passed_by else {}),
+            **({"enrolment": enrolment["enrolment"]}
+               if isinstance(enrolment.get("enrolment"), str) else {}),
+        )
+        if passed_by in QR_PASSES_KEPT:
+            # OPENED ON A READ THAT WAS NOT THE QR'S PLATE: the car's pictures,
+            # kept against this very `vended` event -- the picture reference.
+            self.events.queue_pictures(vended.event_id, self._take_pictures(REFUSED_PICTURES))
+        at = to_iso(self._clock())
+        arming = self._take_held_arming()
+        self.last_decision_completed_at = at
+        # WHICH QR LET THIS CAR IN, AND HOW, ON ITS STAY: the open at an entry,
+        # the close at an exit (`_record_session`). The stay keeps the plate
+        # as read; these let the platform tie it to the QR -- and its plate --
+        # so a car let in on one difference or on nothing read is the pass's
+        # car at the exit too.
+        if qr_fields is not None:
+            self._qr_opening = (at, qr_fields)
+        opened = Decision(outcome=Outcome.ALLOW, reason=REASON_QR_OPENED, identity=identity)
+        self._settle_transit(identity, at, exit_pricing=None, arming=arming)
+        self.deliver()
+        return opened
+
+    def _qr_settles_exit_case(self, qr_fields: dict | None) -> None:
+        """A QR the pass module answered covered, at an EXIT: the car's case
+        is asked again, and the barrier opens only if THAT says settled --
+        through `_advance_exit_case` and `_let_out`, the one opener, with its
+        loop watch, its final read and its lock.
+
+        The case is asked again as a NEW case for the same stay (a new
+        `event_id`, the same `session_id`, ID fields and fee as the lane had
+        them): the platform supersedes the old one -- its open payment
+        canceled at Stripe and off the reader first (platform 0045) -- and
+        prices the stay again, the pass module asked first, so the car the
+        QR now covers comes back covered. A case the platform still prices
+        stays on payment or a person, as any. No waiting case -- the car's
+        case was let go, or there is no platform -- is nothing to settle:
+        nothing opens. The close names the case and carries the QR (`qr`)."""
+        lane = self.config.lane_id
+        with self._exit_lock:
+            case = self._exit_case
+            if case is None:
+                log.info("lane %s: a covered QR at the exit has no waiting case to settle; "
+                         "nothing opens", lane)
+                return None
+            fresh = exit_case.ExitCase(
+                event_id=str(uuid.uuid4()),
+                exit_at=case.exit_at,
+                identity=case.identity,
+                pricing=case.pricing,
+                fields=case.fields,
+                session_id=case.session_id,
+            )
+            self._exit_case = fresh
+        if self._reader_case == case.exit_id:
+            self._reader_case = None
+        # The pictures the platform's picker is shown of this car, under the
+        # new case's own event, as `_exit_settlement` keeps them.
+        self.events.queue_pictures(fresh.event_id, self._take_pictures(REFUSED_PICTURES))
+        if qr_fields is not None:
+            self._qr_opening = (fresh.exit_at, qr_fields)
+        self.deliver()
+        self._advance_exit_case(fresh)
+        return None
+
+    def _qr_denied(self, reason: str) -> None:
+        """The owner's deny keeping a QR's car out, recorded as a `decision`
+        -- stale when the cache is past its age. No plate."""
+        self.events.record(
+            "decision", self.config.lane_id, outcome=Outcome.DENY.value, reason=reason,
+            fallback=None, rate_plan=None,
+            **({"stale_deny": True} if self.cache.is_stale() else {}),
+        )
+        self.deliver()
+
+    def _take_qr_opening(self, at: str) -> dict:
+        """`{"qr": ...}` for the stay a QR opened at `at`, once; `{}` otherwise."""
+        held, self._qr_opening = self._qr_opening, None
+        if held is None or held[0] != at:
+            return {}
+        return {"qr": held[1]}
+
+    def _car_at_the_barrier(self, *, read: bool = True) -> bool:
+        """A car on the arming loop (read now, unless `read` is False: the
+        caller just read it), both arming loops occupied where there are two,
+        and nothing on the deactivate loop behind it."""
+        return (
+            (not read or self._loop_now())
+            and self.arming_complete(self.arming_loop_b)
+            and not self.held_by_deactivate_loop(self.deactivate_loop)
+        )
 
     # ------------------------------------------------------------------
     # From the vend to the session, or to one of the three other answers.
@@ -919,7 +1691,9 @@ class LaneController:
             return "ticket"
         return "plate" if identity.plate else "unread"
 
-    def _settle_transit(self, identity, at: str, *, exit_pricing=None, arming=()) -> None:
+    def _settle_transit(
+        self, identity, at: str, *, exit_pricing=None, arming=(), exit_id=None
+    ) -> None:
         """Record the pending entry, then let the closing loops decide its fate.
 
         Two halves, called as one here and separately by the assisted vend --
@@ -935,7 +1709,9 @@ class LaneController:
         arming read, handed down for the same reason, to be kept with its stay.
         """
         self.begin_transit(identity, at)
-        self.resolve_transit(identity, at, exit_pricing=exit_pricing, arming=arming)
+        self.resolve_transit(
+            identity, at, exit_pricing=exit_pricing, arming=arming, exit_id=exit_id
+        )
 
     def begin_transit(self, identity, at: str) -> None:
         """The vend created a PENDING entry. Nothing has decided its fate yet."""
@@ -964,7 +1740,7 @@ class LaneController:
         self._transit(TransitState.PENDING, at)
 
     def resolve_transit(
-        self, identity, at: str, *, claim=None, exit_pricing=None, arming=()
+        self, identity, at: str, *, claim=None, exit_pricing=None, arming=(), exit_id=None
     ) -> None:
         """What the loops after the barrier made of the pending entry.
 
@@ -1007,7 +1783,8 @@ class LaneController:
             )
             self._transit(TransitState.UNCONFIRMABLE, at)
             opened = self._record_session(
-                identity, at, confirmation=UNCONFIRMABLE, exit_pricing=exit_pricing
+                identity, at, confirmation=UNCONFIRMABLE, exit_pricing=exit_pricing,
+                exit_id=exit_id,
             )
             if opened is not None and arming:
                 # No closing loop to picture the car at: the arming read's
@@ -1052,7 +1829,7 @@ class LaneController:
             )
             self._transit(TransitState.CONFIRMED, at)
             opened = self._record_session(
-                identity, at, confirmation=CONFIRMED, exit_pricing=exit_pricing
+                identity, at, confirmation=CONFIRMED, exit_pricing=exit_pricing, exit_id=exit_id
             )
             if opened is not None:
                 # The arming read's frames, and at the closing loop the car
@@ -1102,7 +1879,9 @@ class LaneController:
             # are for. It closes, it bills, and it says `held` with the
             # `exit_held` event above beside it: a flag for a human, not a hole
             # in the ledger.
-            self._record_session(identity, at, confirmation=HELD, exit_pricing=exit_pricing)
+            self._record_session(
+                identity, at, confirmation=HELD, exit_pricing=exit_pricing, exit_id=exit_id
+            )
 
     def transit_timed_out(self, identity, at: str, deadline: float) -> None:
         """The loop driver did not return inside this lane's own deadline.
@@ -1592,6 +2371,7 @@ class LaneController:
         if self._drain is None:
             self.events.flush()
             self.events.flush_pictures()
+            self.retry_cancels()
         else:
             self._drain()
 
@@ -1744,6 +2524,15 @@ class LaneController:
                           self.config.lane_id)
             return False
 
+    def take_completion_exit_id(self, at: str) -> str | None:
+        """The exit case a person's completion took, for the close of the
+        transit that completion began at `at` -- taken once, like the arming
+        read. The assisted vend's settle hands it to `resolve_transit`."""
+        held, self._completion_exit = self._completion_exit, None
+        if held is None or held[0] != at:
+            return None
+        return held[1]
+
     def take_completion_arming(self, at: str) -> list:
         """The arming read of the car a person's completion let in, for the
         transit that completion began at `at` -- taken once (`complete_vend`
@@ -1825,6 +2614,7 @@ class LaneController:
         exit_pricing=None,
         tailgater: bool = False,
         no_open_command: bool = False,
+        exit_id: str | None = None,
     ) -> LaneEvent | None:
         """Put the session action on the queue, saying what confirmed it -- and,
         at an exit, what the barrier decided (`local_decision`). Returns the
@@ -1842,6 +2632,7 @@ class LaneController:
                 **self._identity_detail(identity, with_region=True),
                 **self._session_descriptor(identity),
                 **unsure,
+                **self._take_qr_opening(at),
                 at=at,
                 entry_confirmation=confirmation,
                 # A car no vend let in whose plate was READ (U7f). Only when
@@ -1875,11 +2666,17 @@ class LaneController:
             lane,
             **self._identity_detail(identity, with_region=False),
             **self._session_descriptor(identity),
+            **self._take_qr_opening(at),
             **({"local_decision": exit_pricing.to_detail()} if exit_pricing is not None else {}),
             # What the reader put up for this stay, SEALED as the close is
             # recorded (A2.2): the platform records a held validation only
             # when this is its discounted fee.
             **self._reader_shown(exit_pricing),
+            # THE SETTLED CASE this car left on (platform 0037): the close
+            # names it, and the platform writes the case's own figures.
+            **({"exit_id": exit_id} if exit_id else {}),
+            # A person opened for it: on what authority (platform 0042).
+            **self._take_let_out_by(exit_id),
             at=at,
             session_id=session_id,
             exit_confirmation=confirmation,
@@ -1892,8 +2689,23 @@ class LaneController:
             self.cache.drop_stay(exit_pricing.session_id)
         # The car this fee belonged to has gone through: the reader shows
         # nothing until the next exit decision, so the next driver never
-        # reads this one's fee.
-        self.show_reader(None)
+        # reads this one's fee. A car whose case handed its fee to the reader
+        # had nothing of the lane's on it, and a clear sent late would land
+        # on the next car's PaymentIntent.
+        if exit_id is not None and exit_id == self._reader_case:
+            self._reader_case = None
+            self._note_exit_screen(None)
+        else:
+            self.show_reader(None)
+
+    def _take_let_out_by(self, exit_id: str | None) -> dict:
+        """`{"let_out_by": ...}` for the close of the case a person opened
+        for, taken once; {} for any other close."""
+        held = self._let_out_by
+        if exit_id is None or held is None or held[0] != exit_id:
+            return {}
+        self._let_out_by = None
+        return {"let_out_by": held[1]}
 
     def _reader_shown(self, exit_pricing) -> dict:
         """`{"reader_shown": ...}` from a screen that keeps what it showed, or {}."""
@@ -1903,6 +2715,17 @@ class LaneController:
             return {}
         shown = seal(session_id)
         return {"reader_shown": shown} if shown is not None else {}
+
+    def _note_exit_screen(self, record: dict | None) -> None:
+        """What this lane decided to put in front of the driver, for the read
+        contract, whether or not a reader is fitted or driven: an exit with a
+        display and no reader still has a fee. Alone -- the reader left
+        alone -- for a car whose exit case handed its fee to the reader."""
+        self.exit_screen = (
+            (self.last_decision_at, record)
+            if record is not None and self.last_decision_at is not None
+            else None
+        )
 
     def set_reader_hand(self, hand: Callable[[dict | None], None] | None) -> None:
         """Install who presents to the reader -- `LaneRunner` hands its own
@@ -1919,14 +2742,7 @@ class LaneController:
         a reader that raises costs its own screen and nothing else: the vend
         and the record go on without it.
         """
-        # RECORDED FIRST, and whether or not a reader is fitted: what goes on
-        # the read contract is what this lane decided to put in front of the
-        # driver, and an exit with a display and no reader still has a fee.
-        self.exit_screen = (
-            (self.last_decision_at, record)
-            if record is not None and self.last_decision_at is not None
-            else None
-        )
+        self._note_exit_screen(record)
         if self.reader is None:
             return
         if self._reader_hand is not None:
@@ -1945,7 +2761,17 @@ class LaneController:
         them. One loop alone arms nothing, and it is RECORDED -- a lane being
         worked by somebody laying metal on a loop shows up as a pattern in the
         log rather than as silence.
+
+        While a car waits on its exit case the turn is no longer than
+        `EXIT_SAMPLE_SECONDS`, so a loop flicker under it reads as one clear
+        sample and a car that backed off reads as more (`observe_exit_case`).
         """
+        if self._exit_case is not None:
+            timeout = (
+                exit_case.EXIT_SAMPLE_SECONDS
+                if timeout is None
+                else min(timeout, exit_case.EXIT_SAMPLE_SECONDS)
+            )
         if not self.loop.wait_for_vehicle(timeout=timeout):
             # SAMPLED ON EVERY POLL, arrival or not. A loop that is reading
             # occupied with nothing on it never produces an arrival, so the
@@ -1969,6 +2795,15 @@ class LaneController:
                 elif not self.held_by_deactivate_loop(self.deactivate_loop):
                     self._release_arming(SUPPRESSION_ENDED_ARMED, geometry)
                     return self._arm(geometry)
+            # THE CAR WAITING AT THE EXIT, on the idle turns: its case is
+            # asked about and moved on while it is still on the arming loop.
+            self.observe_exit_case()
+            # A QR SCANNED for the car the lane just refused, still at the
+            # arming loop: the driver scans after the refusal, so it is an
+            # idle turn that reads it.
+            opened = self.observe_qr()
+            if opened is not None:
+                return opened
             # THE LOOPS AFTER THE GATE, on the idle turns. Every turn that
             # serves no arrival asks them whether anything crossed since they
             # were last read, and a lane with its barrier up is a lane where
