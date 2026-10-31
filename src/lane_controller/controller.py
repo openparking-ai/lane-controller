@@ -989,6 +989,7 @@ class LaneController:
             if self.exit_display is not None:
                 self.exit_display.show_exit({"needs": exit_case.NEEDS_PERSON, "fee": None})
         else:
+            case.fee_held = self._cancels.others(case.exit_id)
             case.outcome = exit_case.advance(
                 case, self.exits, self.exit_display, now=self._clock()
             )
@@ -1190,14 +1191,17 @@ class LaneController:
             self._reader_case = None
 
     def _cancel_on_reader(self, case: exit_case.ExitCase) -> None:
-        """Ask once (`exit_case.cancel_on_reader`); a cancel the platform did
-        not confirm goes on the pending list, to be asked again off this
-        thread; one it refused outright is a person's to finish."""
-        outcome = exit_case.cancel_on_reader(case, self.exits)
-        if outcome in exit_case.CANCEL_RETRY:
-            self._cancels.add(case.exit_id)
-        elif outcome == exit_case.CANCEL_REFUSED:
-            self._tell_cancel(case.exit_id, exit_case.NEEDS_CANCEL_REFUSED)
+        """QUEUE the case's payment cancel -- only a case whose fee was handed
+        to the reader -- and hand it to whoever drains: the drain's thread
+        under `LaneRunner` asks it (`retry_cancels`), first time and every
+        time, so the lane's thread never waits on a cancel (it used to ask the
+        first one itself, up to the client's timeout). A bare controller asks
+        it now, inline (`deliver`). Until it is confirmed, no other case's fee
+        is handed to the reader (`ExitCase.fee_held`)."""
+        if self.exits is None or case.exit_id is None or case.sent_at is None:
+            return
+        self._cancels.add(case.exit_id)
+        self.deliver()
 
     def retry_cancels(self) -> int:
         """Ask the platform again for every pending cancel that is due, until
@@ -1211,17 +1215,20 @@ class LaneController:
             asked = 0
             for exit_id in self._cancels.due():
                 asked += 1
+                # The first ask and every ask after it: here, never on the
+                # lane's thread under the runner.
                 outcome = exit_case.cancel_payment(exit_id, self.exits)
                 if outcome in exit_case.CANCEL_CONFIRMED:
                     self._cancels.settle(exit_id)
-                elif outcome == exit_case.CANCEL_REFUSED:
-                    self._cancels.settle(exit_id)
-                    self._tell_cancel(exit_id, exit_case.NEEDS_CANCEL_REFUSED)
-                else:
+                elif outcome in exit_case.CANCEL_RETRY:
                     attempts, tell = self._cancels.failed(exit_id)
                     if tell:
                         self._tell_cancel(exit_id, exit_case.NEEDS_CANCEL_PENDING,
                                           attempts=attempts)
+                else:
+                    # refused outright: no ask can change it, a person finishes it
+                    self._cancels.settle(exit_id)
+                    self._tell_cancel(exit_id, exit_case.NEEDS_CANCEL_REFUSED)
             return asked
         finally:
             self._retrying.release()

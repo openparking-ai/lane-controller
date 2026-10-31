@@ -73,6 +73,9 @@ not known to stay down for one.
   cancel_retry_blocks        a second retry pass waits on the one in flight.
   payment_guard_removed      a payment that is not open is handed to the reader again.
   plate_logged               the plate is written into a log line.
+  no_payment_retried         a cancel answered no_payment is asked again for ever.
+  first_cancel_on_lane_thread  the first cancel waits on the lane's thread.
+  fee_not_held               the next car's fee goes on before the last car's cancel is confirmed.
 """
 
 from __future__ import annotations
@@ -166,6 +169,11 @@ BREAKAGES = [
     ("cancel_retry_blocks", "a second retry pass waits on the one in flight"),
     ("payment_guard_removed", "a payment that is not open is handed to the reader again"),
     ("plate_logged", "the plate is written into a log line"),
+    ("no_payment_retried", "a cancel answered no_payment is not taken as confirmed"),
+    ("first_cancel_on_lane_thread",
+     "the first cancel is asked, and waited on, on the lane's thread"),
+    ("fee_not_held",
+     "the next car's fee is handed to the reader before the last car's cancel is confirmed"),
 ]
 
 

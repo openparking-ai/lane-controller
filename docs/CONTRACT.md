@@ -458,12 +458,14 @@ driver's word for when they came in, or let out by a person.
   /api/v1/lane/exits/:id/pay/cancel`), until the platform confirms it: a
   cancel that did not reach the platform, got a 5xx or a 429, or met a card
   being authorised (`payment_in_progress`) is asked again with a backoff of 1,
-  2, 4, 8, 16 and then 30 seconds, off the lane's thread, and survives a
+  2, 4, 8, 16 and then 30 seconds; every ask, the first included, is made off
+  the lane's thread (the lane's thread only queues it), and it survives a
   restart; after five failed asks `fallback_needs_human` says
   `needs: "cancel_pending"` once; a cancel refused outright is not asked again
-  (`needs: "cancel_refused"`). When the next car arrived,
-  that call is made after the next car's frames are taken: before its case can
-  hand a fee to the reader, and after the barrier for a car with no case. A
+  (`needs: "cancel_refused"`). When the next car arrived, the cancel is
+  queued after the next car's frames are taken, and no other case's fee is
+  handed to the reader until it is confirmed (`no_payment` counts as
+  confirmed: nothing was on the reader). A
   409 `exit_paid` means the card had already paid: the platform settles the
   case as paid, and the lane takes it as paid, not as a failure, and does not
   ask again. It opens nothing by itself: a case is let go only once its car

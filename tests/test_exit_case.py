@@ -1417,7 +1417,8 @@ def cancel_fails(exits, times, *, how="unreachable"):
 def dropped_on_the_reader(exits_times=1, *, how="unreachable", drain=True, events=None):
     """A case whose fee is on the reader, dropped because its car left, with
     the first cancel failing. `drain`: a `LaneRunner`-shaped drain is
-    installed, so `deliver()` is a signal and the lane's thread never asks."""
+    installed, so `deliver()` is a signal and the lane's thread never asks:
+    the first ask is the drain's (`retry_cancels`), made here."""
     controller, vend, exits, clock, order = an_exit(answer=PAYMENT)
     if events is not None:
         events._transport = PlatformTransport(exits)
@@ -1431,7 +1432,10 @@ def dropped_on_the_reader(exits_times=1, *, how="unreachable", drain=True, event
     controller.observe_exit_case()
     clock.tick(EXIT_LEFT_SECONDS)
     controller.observe_exit_case()
-    assert len(cancels(exits)) == 1, "the first ask, as the case was dropped"
+    if drain:
+        assert cancels(exits) == [], "the lane's thread asked the cancel"
+        assert controller.retry_cancels() == 1, "the drain's first ask"
+    assert len(cancels(exits)) == 1, "the first ask"
     return controller, vend, exits, clock
 
 
@@ -1536,6 +1540,7 @@ def test_a_cancel_the_platform_refuses_outright_is_not_asked_again_and_a_person_
     controller.observe_exit_case()
     clock.tick(EXIT_LEFT_SECONDS)
     controller.observe_exit_case()
+    assert controller.retry_cancels() == 1, "the drain asks"
     assert "exit-1" not in controller._cancels
     assert [e["detail"]["exit_id"] for e in told(controller, "cancel_refused")] == ["exit-1"]
     clock.tick(60)
@@ -1685,3 +1690,112 @@ def test_a_person_at_the_lane_lets_out_the_car_a_dead_reader_kept_waiting(reader
     assert vend.vend_count == 0 and len(told(controller, need)) == 1
     status, said = person_opens(service, controller)
     assert status == 202 and vend.vend_count == 1, said
+
+
+# ---------------------------------------------------------------------------
+# `no_payment` is confirmed (review 2, item 4); the first cancel is the
+# drain's, and the next fee waits for it (review 2, item 5).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("drain", [True, False], ids=["runner", "bare"])
+def test_a_cancel_answered_no_payment_is_confirmed_and_never_asked_again(drain):
+    """The case had no payment to cancel: nothing is on the reader, so the
+    cancel is done -- not asked again, and nobody told."""
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    if drain:
+        controller.set_drain(lambda: None)
+    controller.run_once()
+    exits.exit_pay_cancel_refusal = "no_payment"
+    controller.loop.clear()
+    controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
+    controller.retry_cancels()
+    assert len(cancels(exits)) == 1 and "exit-1" not in controller._cancels
+    for _ in range(10):
+        clock.tick(60)
+        controller.retry_cancels()
+    assert len(cancels(exits)) == 1, "a cancel answered no_payment was asked again"
+    assert not told(controller, "cancel_pending") and not told(controller, "cancel_refused")
+
+
+def test_a_pending_cancel_answered_no_payment_on_a_later_ask_is_settled():
+    controller, vend, exits, clock = dropped_on_the_reader(1)
+    exits.exit_pay_cancel = lambda exit_id: (_ for _ in ()).throw(
+        PlatformRejected(409, "{}", "no_payment"))
+    clock.tick(1)
+    assert controller.retry_cancels() == 1 and "exit-1" not in controller._cancels
+    clock.tick(60)
+    assert controller.retry_cancels() == 0
+
+
+def test_the_lane_thread_never_waits_on_a_cancel_not_even_the_first():
+    """The first cancel used to be asked on the lane's thread, up to the
+    client's timeout, as the car left or the next car came. Now the lane's
+    thread only queues it: with the platform hung on the cancel, the lane
+    lets the car go and serves the next car at once, and only the drain asks."""
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.set_drain(lambda: None)
+    controller.run_once()
+    release, threads = threading.Event(), []
+    real = exits.exit_pay_cancel
+
+    def hung(exit_id):
+        threads.append(threading.current_thread().name)
+        release.wait(10)
+        return real(exit_id)
+
+    exits.exit_pay_cancel = hung
+    began = time.monotonic()
+    controller.loop.clear()
+    controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
+    # and the next car, covered, at the same lane
+    controller.identifier = StubVehicleIdentifier([VehicleIdentity(
+        plate="PASS-1", plate_region="FL", make=None, model=None, color=None,
+        confidence=0.99)])
+    controller.loop = SimulatedLoopInput(arrivals=1)
+    assert controller.run_once().should_vend and vend.vend_count == 1
+    assert time.monotonic() - began < 2.0, "the lane waited on a cancel"
+    assert threads == [], "the lane's thread asked the cancel"
+    assert "exit-1" in controller._cancels, "queued for the drain"
+    worker = threading.Thread(target=controller.retry_cancels, name="outbox-drain")
+    worker.start()
+    for _ in range(100):
+        if threads:
+            break
+        time.sleep(0.02)
+    assert threads == ["outbox-drain"]
+    release.set()
+    worker.join(5)
+
+
+def test_the_next_cars_fee_waits_for_the_last_cars_cancel_under_the_runner():
+    """The order finding 2 set -- the last car's payment off the reader before
+    the next car's goes on -- kept with the cancel off the lane's thread: the
+    next case's fee is not handed over while the last case's cancel is
+    unconfirmed, and goes on once the drain has it confirmed."""
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    controller.set_drain(lambda: None)
+    controller.run_once()
+    assert pays(exits) == [("pay", "exit-1")]
+    controller.loop.clear()
+    controller.observe_exit_case()
+    clock.tick(EXIT_LEFT_SECONDS)
+    controller.observe_exit_case()
+    # the next car, with a fee of its own
+    controller.loop = SimulatedLoopInput(arrivals=1)
+    controller.identifier = StubVehicleIdentifier([VehicleIdentity(
+        plate="TRNS-7", plate_region="FL", make=None, model=None, color=None,
+        confidence=0.99)])
+    controller.run_once()
+    assert pays(exits) == [("pay", "exit-1")], "the next fee went on before the cancel"
+    assert cancels(exits) == []
+    controller.retry_cancels()  # the drain confirms the last car's cancel
+    assert cancels(exits) == [("pay_cancel", "exit-1")]
+    clock.tick()
+    controller.observe_exit_case()
+    assert pays(exits) == [("pay", "exit-1"), ("pay", "exit-2")]
+    assert vend.vend_count == 0

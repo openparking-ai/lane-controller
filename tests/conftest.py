@@ -4028,16 +4028,16 @@ def _break_the_settled_exit(monkeypatch):
 
     elif mode == "cancel_paid_failure":
         # A cancel answered `exit_paid` is read as a failed cancel.
-        original = case_module.cancel_on_reader
+        original = case_module.cancel_payment
 
-        def failed(case, platform):
-            outcome = original(case, platform)
+        def failed(exit_id, platform):
+            outcome = original(exit_id, platform)
             if outcome == case_module.CANCEL_FOUND_PAID:
                 case_module.log.warning("exit case: the payment could not be canceled: exit_paid")
                 return case_module.CANCEL_FAILED
             return outcome
 
-        monkeypatch.setattr(case_module, "cancel_on_reader", failed)
+        monkeypatch.setattr(case_module, "cancel_payment", failed)
 
     elif mode in ("cancel_paid_opens", "in_progress_lets_out", "cancel_paid_asked_again"):
         # A dropped case's cancel opens the barrier when it finds the card
@@ -4153,6 +4153,27 @@ def _break_the_settled_exit(monkeypatch):
             return original(self)
 
         monkeypatch.setattr(LaneController, "retry_cancels", waits)
+
+    elif mode == "no_payment_retried":
+        # A cancel answered `no_payment` is not taken as confirmed: asked
+        # again for ever.
+        monkeypatch.setattr(case_module, "CANCEL_CONFIRMED",
+                            case_module.CANCEL_CONFIRMED - {case_module.CANCEL_NOTHING})
+
+    elif mode == "first_cancel_on_lane_thread":
+        # The first cancel is asked on the thread that let the case go -- the
+        # lane's -- and waits there for the platform, as it used to.
+        def asks_here(self, case):
+            outcome = case_module.cancel_on_reader(case, self.exits)
+            if outcome in case_module.CANCEL_RETRY:
+                self._cancels.add(case.exit_id)
+
+        monkeypatch.setattr(LaneController, "_cancel_on_reader", asks_here)
+
+    elif mode == "fee_not_held":
+        # The next car's fee goes to the reader while the last car's cancel
+        # is still unconfirmed.
+        monkeypatch.setattr(case_module.PendingCancels, "others", lambda self, exit_id: False)
 
     elif mode == "payment_guard_removed":
         # `_act` hands the fee to the reader whatever the payment's status.

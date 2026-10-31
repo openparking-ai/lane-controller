@@ -52,8 +52,9 @@ car's close the lane's own reader screen is not driven for it, since a cart
 or a clear it put up would take the intent off the reader. A case the lane
 lets go of without opening for it -- the car left, a new car arrived, a
 person opened at the lane -- has its payment taken off the reader through
-the platform (`cancel_on_reader`), so the next car is never shown this
-car's fee: after the next car's frames are taken, before its fee goes on.
+the platform, so the next car is never shown this car's fee: the lane's
+thread queues the cancel (`PendingCancels`), the drain's asks it, and no
+other case's fee goes to the reader until it is confirmed.
 """
 
 from __future__ import annotations
@@ -219,6 +220,9 @@ class ExitCase:
     told: str | None = None
     #: What the last step answered (`SETTLED`, `WAITING`, `UNANSWERED`).
     outcome: str | None = None
+    #: Set before each step: an earlier case's cancel is unconfirmed, so this
+    #: case's fee is not handed to the reader yet.
+    fee_held: bool = False
 
     @property
     def needs(self) -> str | None:
@@ -389,6 +393,13 @@ def _act(case: ExitCase, platform, display: ExitDisplay | None, *, now: float) -
         payment = case.answer.get("payment") or {}
         if payment.get("status") not in (None, "open"):
             return
+        if case.fee_held:
+            # AN EARLIER CASE'S PAYMENT MAY STILL BE ON THE READER: its cancel
+            # is queued and not yet confirmed (`PendingCancels`). This car's
+            # fee waits for it, so the next driver is never shown the last
+            # one's -- the order the lane used to keep by asking the cancel on
+            # its own thread. The case waits; nothing blocks.
+            return
         failure = payment.get("last_failure")
         due = (
             case.sent_at is None
@@ -495,10 +506,10 @@ def cancel_on_reader(case: ExitCase, platform) -> str | None:
     """Cancel the case's payment at Stripe and take it off the lane's reader,
     through the platform (`/exits/:id/pay/cancel`): the lane let the case go,
     or a person opened for it. Only a case whose fee was handed to the reader;
-    None for any other. Asked once here; an answer in `CANCEL_RETRY` is asked
-    again by `PendingCancels`, off the lane's thread, until the platform
-    confirms -- a failed cancel is never dropped (it once left another car's
-    fee on the reader).
+    None for any other. One ask, on the caller's thread: the lane itself no
+    longer calls this -- it queues the cancel on `PendingCancels`, and the
+    drain asks (`cancel_payment`) until the platform confirms; a failed
+    cancel is never dropped (it once left another car's fee on the reader).
 
     A card that had already paid (`exit_paid`) is not a failure: the platform
     has the case settled as paid, and nothing was canceled. It opens nothing
@@ -575,13 +586,20 @@ class PendingCancels:
             self._pending[exit_id] = _Pending(attempts=0, due=now)
 
     def add(self, exit_id: str) -> None:
-        """A cancel asked once and not confirmed: asked again after the first wait."""
+        """A cancel to ask, due at once. The lane's thread only queues it
+        here; the drain's asks (`LaneController.retry_cancels`)."""
         with self._lock:
             if exit_id in self._pending:
                 return
-            self._pending[exit_id] = _Pending(attempts=1, due=self._clock() + cancel_backoff(1))
+            self._pending[exit_id] = _Pending(attempts=0, due=self._clock())
         if self._events is not None:
             self._events.keep_cancel(exit_id, self._clock())
+
+    def others(self, exit_id: str | None) -> bool:
+        """Whether a cancel for any OTHER case is still unconfirmed: that
+        case's payment may still be on the reader."""
+        with self._lock:
+            return any(pending != exit_id for pending in self._pending)
 
     def due(self) -> list[str]:
         now = self._clock()
