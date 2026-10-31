@@ -474,6 +474,12 @@ def test_a_refused_item_is_dropped_and_counted_not_retried_forever():
     controller.run_once()  # closes a session that was never opened
 
     assert transport.rejected == 1
+    # The refused close named the car's exit case: it is not dropped silently,
+    # a person is told (`LaneController._close_refused`), and that is all that
+    # waits -- the poison itself is gone and blocks nothing.
+    left = [e.kind for e in controller.events._queue]
+    assert left == ["fallback_needs_human"], left
+    controller.events.flush()
     assert controller.events.pending == 0, "poison must not block everything behind it"
 
 

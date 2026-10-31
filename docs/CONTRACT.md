@@ -520,7 +520,28 @@ driver's word for when they came in, or let out by a person.
   ask-again failed, the new one if the platform superseded the old: their
   close names that case, so the platform writes the record of the car let
   out. A case a person took never has its fee handed to the reader; one
-  handed over in the same instant has its cancel queued. The barrier opens only if the new
+  handed over in the same instant has its cancel queued.
+
+  **When the person's wait runs out first** -- an ask-again slower than the
+  wait (a slow card read at Stripe answered past the client's timeout, the
+  camera and the outbox before the call) -- the person takes the OLD case
+  and the barrier opens once, for them. If the platform then supersedes the
+  old case with the new one, the lane follows the supersede in three ways,
+  so the close lands on the case left open and the platform writes the
+  record of the car let out:
+  - the close, written when the car crosses, names the new case and carries
+    the person's authority (`let_out_by`), when the ask-again answered by
+    then; the new case is not the lane's to step, so nothing opens again;
+  - a close already written on the old case carries the ask-again's event
+    id (`superseding_event`, kept on the lane, never sent); the platform
+    refuses it 409 `exit_closed`, and the lane reads the old case
+    (`GET /api/v1/lane/exits/:id`, `ended.superseded_by`), checks the case
+    that took its place is its own ask-again (its `event_id`), and sends the
+    same close (the same event id, `let_out_by`, `qr`) naming it;
+  - a close naming a case that the platform refuses and that cannot be
+    followed is never dropped silently: `fallback_needs_human` says
+    `needs: "close_refused"` with its `exit_id`, the person's `let_out_by`,
+    the time and the refusal's code. The barrier opens only if the new
   case is settled, by the opener below; the close then carries `exit_id` and
   `qr`. A QR the module does not cover, or a case still priced, leaves the car
   on payment or a person. A case that names no stay is not asked again --

@@ -60,6 +60,15 @@ that drives it; no tracked file is edited.
   exit_retry_new_request    a retry opens another case instead of asking again
   exit_wait_not_floored     a person's vend waits less than the client's timeout
   exit_stay_not_text        a stay id that is not text is taken for a stay
+  exit_second_opening       the ask-again's case is taken as the car's though a person took it
+  exit_idle_not_finally     an ask-again that raises leaves later person's vends waiting
+  exit_vend_not_counted     a person's waiting vend is not counted, and their case is stepped
+  exit_open_answer_trusted  an open's answer for another event is taken as the new case
+  close_not_followed        a close taken on the old case keeps naming it after the supersede
+  close_authority_lost      the close follows the supersede without the person's authority
+  close_409_not_followed    the transport drops a close the platform refused as superseded
+  close_followed_anywhere   a close is followed to a case that is not the lane's ask-again
+  close_refused_silent      a close that cannot land is dropped without telling a person
 """
 
 from __future__ import annotations
@@ -238,6 +247,36 @@ BREAKAGES = [
     ("exit_stay_not_text", "a stay id not text is a stay", EXIT_CASE,
      "    return found if isinstance(found, str) and found else None",
      "    return found or None"),
+    ("exit_second_opening", "the mine guard always true", CONTROLLER,
+     "            mine = self._exit_case is case\n", "            mine = True\n"),
+    ("exit_idle_not_finally", "idle set outside the finally", CONTROLLER,
+     "        try:\n            opened = self._open_superseding(case, fresh, qr_fields, key)\n"
+     "            with self._exit_lock:\n                person_waiting = self._vends_waiting > 0\n"
+     "        finally:\n            self._supersede_idle.set()\n",
+     "        opened = self._open_superseding(case, fresh, qr_fields, key)\n"
+     "        with self._exit_lock:\n            person_waiting = self._vends_waiting > 0\n"
+     "        self._supersede_idle.set()\n"),
+    ("exit_vend_not_counted", "a waiting vend not counted", CONTROLLER,
+     "            self._vends_waiting += 1\n", "            pass\n"),
+    ("exit_open_answer_trusted", "the open's event id not checked", CONTROLLER,
+     '            if answer.get("event_id") != fresh.event_id or not answer.get("id"):',
+     '            if not answer.get("id"):'),
+    ("close_not_followed", "the close does not follow the supersede", CONTROLLER,
+     "                self._close_follows[case.exit_id] = fresh.exit_id\n",
+     "                pass\n"),
+    ("close_authority_lost", "let_out_by not re-pointed", CONTROLLER,
+     "                    self._let_out_by = (fresh.exit_id, held[1])\n",
+     "                    pass\n"),
+    ("close_409_not_followed", "the transport does not follow", SYNC,
+     '            moved = self._superseded_by(err, exit_id, '
+     'event.detail.get("superseding_event"))',
+     "            moved = None"),
+    ("close_followed_anywhere", "followed without the own-ask-again check", SYNC,
+     "            if self._client.get_exit(moved).get(\"event_id\") != asked_again:\n"
+     "                return None\n", ""),
+    ("close_refused_silent", "a refused close dropped silently", SYNC,
+     "                        self.on_close_refused(event, self.last_refused)",
+     "                        pass"),
     ("plate_on_vended", "the QR's plate rides on vended", CONTROLLER,
      '**({"qr_passed_by": passed_by} if passed_by else {}),',
      '**({"qr_passed_by": passed_by, "qr_plate": enrolment.get("qr_plate")} '

@@ -389,6 +389,12 @@ class PlatformTransport(EventTransport):
         #: whatever it was and is never cleared.
         self.conflicts_unnamed = 0
         self.last_close: dict | None = None
+        #: Told of a close naming an exit case that the platform refused and
+        #: that could not be followed to the case that superseded it
+        #: (`LaneController._close_refused`), so it is never dropped silently.
+        self.on_close_refused: Callable[[LaneEvent, Exception], None] | None = None
+        #: The refusal `_guarded` last swallowed, for the caller to read.
+        self.last_refused: Exception | None = None
 
     def send(self, events: list[LaneEvent]) -> bool:
         plain: list[dict] = []
@@ -397,9 +403,12 @@ class PlatformTransport(EventTransport):
                 if event.kind == SESSION_OPEN:
                     self._guarded(lambda e=event: self._open_session(e))
                 elif event.kind == SESSION_CLOSE:
+                    self.last_refused = None
                     result = self._guarded(lambda e=event: self._close_session(e))
                     if result is not None:
                         self.last_close = result
+                    elif self.last_refused is not None and self.on_close_refused is not None:
+                        self.on_close_refused(event, self.last_refused)
                 else:
                     plain.append(
                         {
@@ -539,7 +548,36 @@ class PlatformTransport(EventTransport):
         session_id = event.detail.get("session_id") or (
             None if exit_id else self._open_session_id(event)
         )
-        result = self._client.close_session(
+        try:
+            result = self._send_close(event, exit_id, session_id, declared, descriptor)
+        except PlatformRejected as err:
+            # A CASE A QR'S ASK-AGAIN SUPERSEDED: the platform refuses a close
+            # naming it (409 `exit_closed`). Followed to the case that took its
+            # place -- when that is the lane's own ask-again -- and sent again
+            # there, the same close: the stay closes and the record of the car
+            # let out is written. Anything else stays the refusal it was.
+            moved = self._superseded_by(err, exit_id, event.detail.get("superseding_event"))
+            if moved is None:
+                raise
+            exit_id = moved
+            result = self._send_close(event, exit_id, session_id, declared, descriptor)
+        if exit_id and (result or {}).get("session") is None:
+            # A CASE WITH NO STAY -- the driver's word, or a person who let a
+            # car out that no stay was found for -- is closed on the case
+            # itself, and that is the whole echo there is.
+            case = (result or {}).get("exit") or {}
+            if case.get("id") != exit_id or case.get("closed") is not True:
+                raise PlatformRejected(
+                    None, "the close named an exit case and the platform did not close it"
+                )
+            return result
+        require_confirmation_echo(result, declared, end="exit", action="close")
+        require_descriptor_echo(result, descriptor, end="exit", action="close")
+        return result
+
+    def _send_close(self, event: LaneEvent, exit_id, session_id, declared, descriptor) -> dict:
+        """The close itself, naming `exit_id`."""
+        return self._client.close_session(
             event_id=event.event_id,
             plate=event.detail.get("plate"),
             ticket_ref=event.detail.get("ticket_ref"),
@@ -568,19 +606,30 @@ class PlatformTransport(EventTransport):
             # close the stay by the QR (its own round).
             **({"qr": event.detail["qr"]} if event.detail.get("qr") else {}),
         )
-        if exit_id and (result or {}).get("session") is None:
-            # A CASE WITH NO STAY -- the driver's word, or a person who let a
-            # car out that no stay was found for -- is closed on the case
-            # itself, and that is the whole echo there is.
-            case = (result or {}).get("exit") or {}
-            if case.get("id") != exit_id or case.get("closed") is not True:
-                raise PlatformRejected(
-                    None, "the close named an exit case and the platform did not close it"
-                )
-            return result
-        require_confirmation_echo(result, declared, end="exit", action="close")
-        require_descriptor_echo(result, descriptor, end="exit", action="close")
-        return result
+
+    def _superseded_by(self, err, exit_id, asked_again) -> str | None:
+        """The case that superseded `exit_id`, when the platform refused the
+        close for it (409 `exit_closed`), the case says so (`ended.
+        superseded_by`), and the superseding case is the lane's own ask-again
+        (its event id is the one the close carries). None otherwise. Asks the
+        platform; out of reach, the close stays queued as any close does."""
+        if (
+            not exit_id
+            or not asked_again
+            or getattr(err, "status", None) != 409
+            or getattr(err, "code", None) != "exit_closed"
+        ):
+            return None
+        try:
+            ended = (self._client.get_exit(exit_id).get("ended") or {})
+            moved = ended.get("superseded_by")
+            if not moved:
+                return None
+            if self._client.get_exit(moved).get("event_id") != asked_again:
+                return None
+        except PlatformRejected:
+            return None
+        return moved
 
     def _open_session_id(self, event: LaneEvent) -> str | None:
         """The id of the session the platform has open for this close's
@@ -619,6 +668,7 @@ class PlatformTransport(EventTransport):
         except PlatformRejected as err:
             self.rejected += 1
             self._classify(err)
+            self.last_refused = err
             log.error("platform refused an item, dropping it: %s", err)
             return None
         # THE WAY BACK. A write the platform ACCEPTED is a platform that took

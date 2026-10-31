@@ -87,6 +87,9 @@ class FakePlatform:
         #: The stay the platform's matcher finds for a case that names none
         #: (0037), or None: none found (`method: none`).
         self.exit_match_session: str | None = None
+        #: Stays a close named an exit case of: a later case naming one is
+        #: refused (409 `stay_not_open`), as the platform refuses it.
+        self.closed_stays: set[str] = set()
         #: What `redeem_enrolment` answers, and how many QRs were presented.
         self.qr_answer: dict = {"open": False, "outcome": "not_covered",
                                 "enrolment": {"refused": "REFUSAL_CREDENTIAL_UNKNOWN"},
@@ -319,6 +322,13 @@ class FakePlatform:
     ) -> dict:
         self._check()
         who = {"let_out_by": let_out_by} if let_out_by is not None else {}
+        if exit_id and (self.exits.get(exit_id) or {}).get("ended"):
+            # A case the platform closed (superseded): its close is refused,
+            # as `/sessions/close` refuses it (409 `exit_closed`).
+            raise PlatformRejected(409, "{}", "exit_closed")
+        if exit_id and exit_id in self.exits and self.exits[exit_id].get("session_id"):
+            self.closed_stays.add(self.exits[exit_id]["session_id"])
+            self.exits[exit_id]["closed"] = True
         if exit_id and not plate and not ticket_ref:
             # A case with no car named: closed on the case, as the platform
             # closes a case with no stay.
@@ -399,6 +409,8 @@ class FakePlatform:
                 return self._case(case["id"])
         exit_id = f"exit-{len(self.exits) + 1}"
         stay = session_id or self.exit_match_session
+        if session_id and session_id in self.closed_stays:
+            raise PlatformRejected(409, "{}", "stay_not_open")
         if stay:
             for prior in self.exits.values():
                 if prior.get("session_id") == stay and not prior.get("closed"):

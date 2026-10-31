@@ -710,6 +710,7 @@ def test_a_person_who_opens_while_the_qr_asks_again_takes_the_case_the_car_is_on
     assert closed["exit_id"] == "exit-2", "the close names the case the car was on"
     assert closed.get("let_out_by") == "human_open_now"
     assert ("pay", "exit-2") not in platform.exit_requests, "a fee for a car let out"
+    assert ("get", "exit-2") not in platform.exit_requests, "the person's case was stepped"
     assert requests(platform, "supersede") == [("supersede", "exit-1", "exit-2")]
     assert ("pay_cancel", "exit-1") in platform.exit_requests
     assert controller._exit_case is None and len(controller._cancels) == 0
@@ -765,6 +766,145 @@ def test_a_persons_vend_waits_at_least_the_platform_clients_timeout():
     assert controller._supersede_wait_seconds() == 11.0
     platform._timeout = 1.0
     assert controller._supersede_wait_seconds() == exit_case_module.EXIT_SUPERSEDE_WAIT_SECONDS
+
+
+def past_the_wait(monkeypatch, *, drain=False, hold_crossing=True):
+    """An exit whose QR ask-again outlasts a person's wait: the person takes
+    the OLD case, and the platform then supersedes it with the new one,
+    which the platform prices covered."""
+    from lane_controller import exit_case as exit_case_module
+
+    monkeypatch.setattr(exit_case_module, "EXIT_SUPERSEDE_WAIT_SECONDS", 0.05)
+    holder = {}
+    presenter = SlowPresenter(0.0, during=requote_covered(holder), answer=passed("same_plate"))
+    controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
+    holder["platform"] = platform
+    if drain:
+        controller.set_drain(lambda: None)
+    held = HeldOpen(platform)
+    crossing = HeldCrossing()
+    if hold_crossing:
+        controller.closing_loops = crossing
+    else:
+        crossing.release.set()
+    scanner.scan(QR)
+    lane = threading.Thread(target=controller.run_once, name="lane")
+    lane.start()
+    assert held.entered.wait(5)
+    person = {}
+    worker = threading.Thread(target=lambda: person.update(answer=a_person_opens(controller)))
+    worker.start()
+    return controller, vend, platform, held, crossing, lane, worker, person
+
+
+def test_past_the_wait_the_barrier_opens_once_and_the_close_follows_the_supersede(monkeypatch):
+    """The reviewer's order: the person's wait runs out, they take the old
+    case and the barrier opens for them; the platform then supersedes the old
+    case with the new one, which it prices covered. Nothing opens again (the
+    new case is not the lane's to step), and the close -- not written until
+    the car crosses -- names the new case with the person's authority."""
+    controller, vend, platform, held, crossing, lane, worker, person = past_the_wait(
+        monkeypatch)
+    for _ in range(100):
+        if vend.vend_count:
+            break
+        time.sleep(0.02)
+    assert vend.vend_count == 1, "the person's vend went ahead past the wait"
+    held.release.set()
+    lane.join(10)
+    crossing.release.set()
+    worker.join(10)
+    controller.events.flush()
+    assert vend.vend_count == 1, "the barrier opened twice"
+    [closed] = platform.closed
+    assert (closed["exit_id"], closed.get("let_out_by")) == ("exit-2", "human_open_now")
+    assert requests(platform, "supersede") == [("supersede", "exit-1", "exit-2")]
+    assert ("pay", "exit-2") not in platform.exit_requests
+    assert controller._exit_case is None
+
+
+def test_a_close_sent_before_the_supersede_is_followed_to_the_case_left_open(monkeypatch):
+    """The close was written naming the old case before the ask-again came
+    back, and is delivered after the platform superseded it: refused 409
+    `exit_closed`, followed through `ended.superseded_by` to the lane's own
+    ask-again (its event id), and sent again there -- the same close."""
+    controller, vend, platform, held, crossing, lane, worker, person = past_the_wait(
+        monkeypatch, drain=True, hold_crossing=False)
+    worker.join(10)
+    assert vend.vend_count == 1
+    pending = [e for e in controller.events._queue if e.kind == "session_close"]
+    assert [e.detail["exit_id"] for e in pending] == ["exit-1"], "written on the old case"
+    held.release.set()
+    lane.join(10)
+    controller.events.flush()
+    [closed] = platform.closed
+    assert (closed["exit_id"], closed.get("let_out_by")) == ("exit-2", "human_open_now")
+    assert closed["event_id"] == pending[0].event_id, "the same close"
+    assert not [e for e in platform.events.values()
+                if e["kind"] == "fallback_needs_human"
+                and e["detail"].get("needs") == "close_refused"]
+    assert vend.vend_count == 1
+
+
+def test_a_close_that_cannot_be_followed_tells_a_person_and_is_never_dropped(monkeypatch):
+    """The case that superseded the old one is not the lane's own ask-again:
+    the close is not sent there. It cannot land, so a person is told -- the
+    case, who opened and when -- rather than the close vanishing."""
+    controller, vend, platform, held, crossing, lane, worker, person = past_the_wait(
+        monkeypatch, drain=True, hold_crossing=False)
+    worker.join(10)
+    held.release.set()
+    lane.join(10)
+    platform.exits["exit-2"]["event_id"] = "someone-elses-case"
+    controller.events.flush()
+    controller.events.flush()
+    assert platform.closed == []
+    [told] = [e for e in platform.events.values()
+              if e["kind"] == "fallback_needs_human"
+              and e["detail"].get("needs") == "close_refused"]
+    assert (told["detail"]["exit_id"], told["detail"]["let_out_by"]) == (
+        "exit-1", "human_open_now")
+    assert told["detail"]["at"] and told["detail"]["refused"] == "exit_closed"
+    assert HOLDER not in json.dumps(told) and STRANGER not in json.dumps(told)
+
+
+def test_an_ask_again_that_raises_does_not_leave_a_persons_vend_waiting():
+    """The ask-again fails with an error of the lane's own: the next person's
+    open at the lane does not wait for it."""
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("same_plate")))
+    real = platform.open_exit
+
+    def broken(**kwargs):
+        if len(opened_cases(platform)) >= 1:
+            raise RuntimeError("a defect on the way to the platform")
+        return real(**kwargs)
+
+    platform.open_exit = broken
+    scanner.scan(QR)
+    with pytest.raises(RuntimeError):
+        controller.run_once()
+    began = time.monotonic()
+    status, said = a_person_opens(controller)
+    assert status == 202 and vend.vend_count == 1, said
+    assert time.monotonic() - began < 2.0, "the person's vend waited on a dead ask-again"
+
+
+def test_an_answer_to_the_ask_again_for_another_case_moves_nothing():
+    """The open's answer names another event: it is not the new case, the car
+    stays on its case, and a person is told the QR covers it."""
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("same_plate")))
+    real = platform.open_exit
+
+    def elsewhere(**kwargs):
+        answer = real(**kwargs)
+        return {**answer, "event_id": "another-event"} if kwargs["session_id"] else answer
+
+    platform.open_exit = elsewhere
+    scanner.scan(QR)
+    controller.run_once()
+    assert controller._exit_case.exit_id == "exit-1" and vend.vend_count == 0
+    assert [e for e in platform.events.values()
+            if e["kind"] == "fallback_needs_human" and e["detail"].get("needs") == "qr_covered"]
 
 
 def test_the_clear_before_a_qr_is_measured_before_the_qr_goes_out():
