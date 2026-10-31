@@ -90,6 +90,22 @@ EXIT_BACKED_IN = "exit_backed_in"
 EXIT_HELD = "exit_held"
 EXIT_UNCONFIRMABLE = "exit_unconfirmable"
 
+#: A registration QR this lane could NOT present: the platform out of reach,
+#: or refusing the presentation itself. Detail: `answered: false`, `reason`,
+#: `direction`, `read_identity` -- the platform refuses any other key, and
+#: never the token or a plate. A QR the platform answered is recorded by the
+#: platform. AHEAD OF THE PLATFORM, like `entry_unadmitted`: the platform's
+#: `LANE_EVENT_KINDS` carries it from the same release.
+QR_PRESENTED = "qr_presented"
+#: The platform's names for a presentation it could not take (`POST
+#: /lane/redeem-enrolment`): the pass module could not answer (503), the
+#: garage names no pass-module garage, the scan is older than the car.
+QR_UNANSWERED = "qr_unanswered"
+QR_NOT_LINKED = "qr_not_linked"
+QR_STALE = "qr_stale"
+#: The relay's reason, and the `vended` event's, for a gate a QR opened.
+REASON_QR_OPENED = "registration_qr_covered"
+
 #: Why an entry or an exit ended the way it did. One reason per outcome, and
 #: the reason travels to the platform with the session so the money record can
 #: say what confirmed it.
@@ -486,6 +502,9 @@ class PlatformTransport(EventTransport):
             **({"plate_unreadable": True} if event.detail.get("plate_unreadable") else {}),
             # A car no open command let in, read or not (0036): its own mark.
             **({"no_open_command": True} if event.detail.get("no_open_command") else {}),
+            # The QR that let this car in, and how (the owner's rule of
+            # 2026-10-30): for the platform to tie the stay to it.
+            **({"qr": event.detail["qr"]} if event.detail.get("qr") else {}),
             # What was read below the confidence, not an identity (0036).
             **(
                 {
@@ -516,7 +535,10 @@ class PlatformTransport(EventTransport):
         """
         declared = event.detail["exit_confirmation"]
         descriptor = event.detail.get("descriptor")
-        session_id = event.detail.get("session_id") or self._open_session_id(event)
+        exit_id = event.detail.get("exit_id")
+        session_id = event.detail.get("session_id") or (
+            None if exit_id else self._open_session_id(event)
+        )
         result = self._client.close_session(
             event_id=event.event_id,
             plate=event.detail.get("plate"),
@@ -536,7 +558,26 @@ class PlatformTransport(EventTransport):
             # What the reader showed, when a screen said (A2.2); absent, the
             # close is the one this lane sent before it existed.
             **_reader_shown(event),
+            # The settled exit case this car left on (platform 0037), named
+            # instead of the car.
+            exit_id=exit_id,
+            # The authority a person opened on, when one did (platform 0042).
+            **({"let_out_by": event.detail["let_out_by"]} if event.detail.get("let_out_by")
+               else {}),
+            # The QR that let this car out, and how: for the platform to
+            # close the stay by the QR (its own round).
+            **({"qr": event.detail["qr"]} if event.detail.get("qr") else {}),
         )
+        if exit_id and (result or {}).get("session") is None:
+            # A CASE WITH NO STAY -- the driver's word, or a person who let a
+            # car out that no stay was found for -- is closed on the case
+            # itself, and that is the whole echo there is.
+            case = (result or {}).get("exit") or {}
+            if case.get("id") != exit_id or case.get("closed") is not True:
+                raise PlatformRejected(
+                    None, "the close named an exit case and the platform did not close it"
+                )
+            return result
         require_confirmation_echo(result, declared, end="exit", action="close")
         require_descriptor_echo(result, descriptor, end="exit", action="close")
         return result

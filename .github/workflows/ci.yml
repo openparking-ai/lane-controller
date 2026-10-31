@@ -233,6 +233,16 @@ jobs:
           # car no register covers; no disk on the car's path. Each broken, and
           # requires tests/test_entry_always_a_stay.py to fail each time.
           - entry_stay
+          # QR fail-control (Phase 1b)
+          # A registration QR scanned for the car the lane just refused: the
+          # gate opening on anything but covered, a QR overruling the owner or
+          # letting in a banned car, presented for an empty lane or twice, the
+          # unsure read withheld, an unchecked QR unrecorded or recorded twice,
+          # the token or the plate on the event or in the log, the exit's case
+          # lost or a closed exit opened, the client's route and the 503's
+          # name, the wiring. Each broken in a copy of the tree, and requires
+          # tests/test_qr_scanner.py to fail each time.
+          - qr
           # Deactivate-loop fail-control
           # Breaks the third loop's guarantees on purpose -- the level (an edge
           # deadlocks two queued cars), each end of the held interval, its
@@ -303,6 +313,32 @@ jobs:
           # one of them in the reassuring direction, and requires the contract
           # suite to go red.
           - measured_codes
+          # Exit-settled fail-control
+          # Breaks the exit that opens only when settled -- a priced car let
+          # out unpaid, an unreachable platform or no platform taken as
+          # settled, the plate text or an unsure plate in the case, the case
+          # opened before its pictures, the fee sent every turn or never again
+          # after a decline, a car that left let out, a person asked for every
+          # turn, the barrier opened twice, the close not naming the case, the
+          # receipt never sent; the reader driven after the case's fee is on
+          # it, a dropped case's payment left on the reader, a person's close
+          # not naming the case, a repeated decline or a no-tap timeout never
+          # re-sent, attempts never counted, a busy reader taken as a refusal,
+          # a person's vend racing a settled case, an entry time with no
+          # offset, a refusal or a truthy `settled` or another case's answer
+          # taken as settled, the case opening after a person took it, the
+          # receipt before the barrier, one clear loop sample dropping the
+          # case; a car rolled on unarmed let out on the backed-off car's
+          # case, any clear ending the case, the loop sampled too seldom, a
+          # stuck busy reader alerting nobody, the reader driven for an
+          # unpriced case car, a /pay or first answer for another case or
+          # event taken, the vend route left busy, the last car's cancel
+          # before the next car's frames; a settled answer opening for a car
+          # that backed off during the call, the loop unwatched during it,
+          # the flicker doubled, the busy count not reset, the driver's-word
+          # answer for another event taken -- and requires the exit-case
+          # suite to fail each time.
+          - exit_settled
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }

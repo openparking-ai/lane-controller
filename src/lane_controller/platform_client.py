@@ -21,7 +21,16 @@ from typing import Any
 
 
 class PlatformUnreachable(Exception):
-    """Network failure, timeout, or a 5xx. Retryable -- keep the work queued."""
+    """Network failure, timeout, or a 5xx. Retryable -- keep the work queued.
+
+    `status` and `code` are set for a 5xx that carried them, and None for
+    everything else: the QR presentation tells the pass module's own
+    could-not-answer (`503 qr_unanswered`) from a platform that is down."""
+
+    def __init__(self, message: str, *, status: int | None = None, code: str | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
 
 
 #: The name the platform's clock-skew refusal carries in its error body.
@@ -124,7 +133,9 @@ class PlatformClient:
             if err.code >= 500:
                 # The platform is having a bad time. That is the same situation
                 # as it being unreachable, from the lane's point of view.
-                raise PlatformUnreachable(f"HTTP {err.code}: {body}") from err
+                raise PlatformUnreachable(
+                    f"HTTP {err.code}: {body}", status=err.code, code=_refusal_code(body)
+                ) from err
             raise PlatformRejected(err.code, body, _refusal_code(body)) from err
         except (urllib.error.URLError, TimeoutError, OSError) as err:
             raise PlatformUnreachable(str(err)) from err
@@ -196,6 +207,7 @@ class PlatformClient:
         no_open_command: bool = False,
         unsure_plate: str | None = None,
         unsure_plate_confidence: float | None = None,
+        qr: dict | None = None,
     ) -> dict:
         # event_id is the lane's own, and it is what makes a re-sent flush safe.
         # The platform keys the session on it, so this exact arrival can only
@@ -235,6 +247,10 @@ class PlatformClient:
                     if unsure_plate is not None
                     else {}
                 ),
+                # The QR that let the car in (`{enrolment, passed_by,
+                # qr_plate}`), ONLY when one did: the platform ties the stay to
+                # it (2026-10-30). Every other open is byte-identical to before.
+                **({"qr": qr} if qr is not None else {}),
             },
         )
 
@@ -278,10 +294,22 @@ class PlatformClient:
         descriptor: str | None = None,
         local_decision: dict | None = None,
         reader_shown: dict | None = None,
+        exit_id: str | None = None,
+        let_out_by: str | None = None,
+        qr: dict | None = None,
     ) -> dict:
+        # A SETTLED EXIT CASE is named on the close (platform 0037): the case
+        # holds the stay it was decided on, or none, the close writes the
+        # case's own figures, and the identity beside it is not consulted. A
+        # car the lane could not read has only the case.
+        if exit_id and not plate and not ticket_ref:
+            identity = {}
+        else:
+            identity = self._identity(plate, ticket_ref)
         body = {
             "event_id": event_id,
-            **self._identity(plate, ticket_ref),
+            **({"exit_id": exit_id} if exit_id else {}),
+            **identity,
             "exit_at": exit_at,
             "exit_confirmation": exit_confirmation,
         }
@@ -304,6 +332,15 @@ class PlatformClient:
         # is its discounted fee.
         if reader_shown is not None:
             body["reader_shown"] = reader_shown
+        # WHO OPENED for a car with a case (platform 0042): the authority a
+        # person at the lane opened on, ONLY with the case it names. The
+        # platform's change log names this lane computer beside it.
+        if let_out_by is not None and exit_id:
+            body["let_out_by"] = let_out_by
+        # The QR that let the car out (`{enrolment, passed_by, qr_plate}`),
+        # ONLY when one did.
+        if qr is not None:
+            body["qr"] = qr
         return self._request("POST", "/api/v1/lane/sessions/close", body)
 
 
@@ -323,6 +360,87 @@ class PlatformClient:
             {"phone": phone, "local_decision": local_decision},
         )
         return answer.get("validation") if isinstance(answer, dict) else None
+
+    # -- the exit case (platform 0037, 0038) -----------------------------------
+    #
+    # A car at this exit the lane could not let out on its own copy. Each call
+    # answers the case as `{exit: {...}}`; these return the case. ON THE
+    # BARRIER'S PATH, and the one place an exit waits on the network: the
+    # barrier stays down until the case is settled, so there is nothing faster
+    # to fall back to -- an unreachable platform is a person's decision.
+
+    def open_exit(
+        self,
+        *,
+        event_id: str,
+        exit_at: str,
+        session_id: str | None = None,
+        id_fields: dict | None = None,
+    ) -> dict:
+        """The case for this car, opened or, for the same `event_id`, found."""
+        body = {"event_id": event_id, "exit_at": exit_at, **(id_fields or {})}
+        if session_id:
+            body["session_id"] = session_id
+        return self._exit(self._request("POST", "/api/v1/lane/exits", body))
+
+    def get_exit(self, exit_id: str) -> dict:
+        """The case as it stands: settled, or what it needs."""
+        return self._exit(self._request("GET", self._exit_path(exit_id)))
+
+    def exit_word(self, exit_id: str, entry_at: str) -> dict:
+        """The driver's stated entry time, priced by the platform, once."""
+        return self._exit(
+            self._request("POST", f"{self._exit_path(exit_id)}/word", {"entry_at": entry_at})
+        )
+
+    def exit_pay(self, exit_id: str) -> tuple[dict, object]:
+        """The case's fee handed to the reader bound to this lane: the case and
+        `sent` (`True`, `False` or `"unknown"`)."""
+        answer = self._request("POST", f"{self._exit_path(exit_id)}/pay", {})
+        return self._exit(answer), answer.get("sent") if isinstance(answer, dict) else None
+
+    def exit_pay_cancel(self, exit_id: str) -> dict:
+        """The case's payment canceled at Stripe, and taken off the reader
+        bound to this lane while it shows it: the car left, or a person opened
+        for it. A card that had already paid is 409 `exit_paid` (the case is
+        settled as paid, nothing canceled); a card being authorised is 409
+        `payment_in_progress`; Stripe not answering is a 5xx."""
+        return self._exit(
+            self._request("POST", f"{self._exit_path(exit_id)}/pay/cancel", {})
+        )
+
+    def exit_receipt(self, exit_id: str, phone: str) -> None:
+        """A text receipt for a paid case. The number goes in this request
+        body and nowhere else; nothing here keeps or logs it."""
+        self._request("POST", f"{self._exit_path(exit_id)}/receipt", {"phone": phone})
+
+    @staticmethod
+    def _exit_path(exit_id: str) -> str:
+        return f"/api/v1/lane/exits/{urllib.parse.quote(exit_id, safe='')}"
+
+    @staticmethod
+    def _exit(answer) -> dict:
+        case = answer.get("exit") if isinstance(answer, dict) else None
+        if not isinstance(case, dict) or not case.get("id"):
+            raise PlatformRejected(None, "the platform answered no exit case")
+        return case
+
+    def redeem_enrolment(self, token: str, vehicle: str | None, presented_at: str) -> dict:
+        """A registration QR scanned at this lane, presented with the identity
+        the camera read (None when it read none) and when. The platform asks
+        the pass module and answers `{open, outcome, enrolment, answer}`:
+        `open` on covered and on nothing else.
+
+        THE TOKEN IS IN THIS REQUEST BODY AND NOWHERE ELSE: nothing here keeps
+        it or logs it, and the platform names no token in a refusal. Raises as
+        every call does: `PlatformUnreachable` (offline, or `503
+        qr_unanswered` when the module could not answer), `PlatformRejected`
+        (`409 qr_not_linked`, `409 qr_stale`, `429`)."""
+        return self._request(
+            "POST",
+            "/api/v1/lane/redeem-enrolment",
+            {"token": token, "vehicle": vehicle, "presented_at": presented_at},
+        )
 
 
 def _refusal_code(body: str) -> str | None:

@@ -254,6 +254,19 @@ class Unavailable(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class PlateCharacters:
+    """The plate as positioned characters, as the identity service states it
+    (`plate_characters`): `state` is `read`, `unreadable` or `not_seen`; a read
+    plate's `pattern` is its characters folded under `rule`, with `?` where a
+    position is not sure. A READING, passed on as it came and never derived
+    here from a plate the lane was unsure of."""
+
+    state: str
+    rule: str | None = None
+    pattern: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class VehicleIdentity:
     """What the vision stage believes it saw, and how strongly.
 
@@ -346,6 +359,14 @@ class VehicleIdentity:
     #: the SESSION ACTION only -- `POST /lane/sessions/open` -- to the
     #: platform's `sessions.entry_descriptor`, which its purge nulls.
     descriptor: str | None = None
+    #: THE CAR'S ID AS THE EXIT MATCHES IT (platform 0037), when the identity
+    #: service measured it: the plate as positioned characters, the colour
+    #: code (`opvid-colour/<v>:…`) and the size class. Readings, `None` when
+    #: not measured, and like the plate they never reach `events.detail`: they
+    #: ride the exit case (`POST /lane/exits`) only.
+    plate_characters: PlateCharacters | None = None
+    color_code: str | None = None
+    size: str | None = None
 
     def __post_init__(self) -> None:
         """The seam. Anything not in the set is refused, never carried.
@@ -387,6 +408,23 @@ class VehicleIdentifier(Protocol):
     def identify(self, frames: Sequence[Frame]) -> VehicleIdentity: ...
 
 
+class QrScanner(Protocol):
+    """The lane's QR scanner: what a driver holds up to it, as text.
+
+    A registration QR the pass module issued (garage-pass `issue-enrolment`).
+    This package does not read what the text means -- it is a credential the
+    platform presents to the module for this lane -- and KEEPS IT NOWHERE: not
+    in an event, not in a log line, not on disk. A driver, real or simulated,
+    hands it over once and forgets it.
+    """
+
+    def poll(self) -> str | None:
+        """The text of a QR scanned since the last poll, or None. Never blocks,
+        and consumes what it returns: a scan is handed over once. Called on the
+        lane's idle turns, the thread the barrier's own reads run on."""
+        ...
+
+
 class BannedMatcher(Protocol):
     """Whether an arriving car is one the garage banned (U7f).
 
@@ -400,4 +438,37 @@ class BannedMatcher(Protocol):
         """The id of the ban this car matches, or None. `banned` is the
         platform's list, each `{"id", "descriptor"}`. Raises when the comparison
         could not be made; the lane then refuses nobody on it."""
+        ...
+
+
+class ExitDisplay(Protocol):
+    """The exit's screen for the driver while their exit is not settled.
+
+    It is shown what the case needs (`show_exit`) and asked for the two things
+    only the driver can give: the date and time they came in, when no stay was
+    found (the driver's word), and a phone for a text receipt once paid. Both
+    are POLLED, never waited on: each returns what the driver entered since it
+    was last asked, once, or None. Until a talking gate agent exists, this is
+    the exit display's keypad. A lane with no display cannot take the driver's
+    word, and such a case waits for a person.
+    """
+
+    def show_exit(self, view: dict | None) -> None:
+        """What to show: `{"needs", "fee", "refused"?}` from the case, or None
+        to clear the screen once the car has gone. `fee` is the platform's
+        fee object as it answered it (`fee_minor`, `currency`, `breakdown`,
+        ...), or None."""
+        ...
+
+    def entry_time(self) -> str | None:
+        """The entry the driver gave, ISO 8601 WITH A TIMEZONE OFFSET, or None.
+        A time without an offset is refused at the lane and never sent
+        (`entry_time_without_offset`): the platform would read it on its own
+        clock. In the hour the clocks go back a local time happens twice, and
+        the offset the display sends is what decides which one it was."""
+        ...
+
+    def receipt_phone(self) -> str | None:
+        """A phone the driver gave for a text receipt, or None. Passed on in
+        one request and kept nowhere on the lane."""
         ...

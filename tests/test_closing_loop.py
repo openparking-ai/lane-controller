@@ -114,6 +114,7 @@ def build(*, direction="entry", crossings=(), identities=None, closing_loops=1):
         identifier=StubVehicleIdentifier([*(identities or [ALLOWED]), UNREAD]),
         closing_loops=loops,
         cache=cache,
+        exits=FakePlatform(),
     )
     return controller, vend, loops
 

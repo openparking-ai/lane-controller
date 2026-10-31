@@ -69,13 +69,14 @@ OPEN = {"state": "open", "reason": None, "message": None, "closed_at": None}
 
 
 def closed_lane(closing, identities, *, direction="entry", crossings=None, register=None,
-                stays=(), default_action="allow"):
+                stays=(), default_action="allow", exits=None):
     """A lane told `closing` on the fast read, with a register and stays as given,
-    on the lane's clock at `NOW` (June 2026, the day the register covers)."""
+    on the lane's clock at `NOW` (June 2026, the day the register covers). Its
+    exit cases go to `exits`, by default a platform that settles each at once."""
     controller = a_lane(
         identities=identities, direction=direction, default_action=default_action,
         crossings=crossings if crossings is not None else [(ClosingSequence.FORWARD, 0.0)],
-        clock=lambda: NOW,
+        clock=lambda: NOW, exits=exits if exits is not None else FakePlatform(),
     )
     cache = controller.cache
     cache.timezone = NEW_YORK

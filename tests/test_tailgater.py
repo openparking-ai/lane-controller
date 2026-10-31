@@ -109,6 +109,7 @@ def build(*, crossings=(), identities=(ALLOWED,), banned=(), matcher="exact", di
         cache=cache,
         events=EventQueue(PlatformTransport(platform)),
         banned_matcher=ExactBannedMatcher() if matcher == "exact" else matcher,
+        exits=platform,
     )
     return controller, vend, platform
 

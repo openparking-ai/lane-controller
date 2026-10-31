@@ -48,6 +48,7 @@ from .contract import (
     is_idempotency_key,
     is_ticket_ref,
 )
+from .controller import DecisionAlreadyCompleted
 from .decision import ADMITS_PASSES_ONLY, Outcome, closed_to, decide, garage_admits
 from .interfaces import VehicleIdentity
 
@@ -480,9 +481,22 @@ class AssistedVend:
                 presence=True,
                 ticket_ref=request.ticket_ref,
             )
-            at = controller.complete_vend(
-                identity, authorised_by=request.authorised_by.value, assisted=assisted
-            )
+            try:
+                at = controller.complete_vend(
+                    identity, authorised_by=request.authorised_by.value, assisted=assisted
+                )
+            except DecisionAlreadyCompleted:
+                # Completed between `_refuse` and here -- an exit case that
+                # settled opened the barrier -- and nothing moved.
+                with self._state:
+                    self._in_progress = False
+                return 409, VendRefused(
+                    code=VendRefusal.ALREADY_COMPLETED.value,
+                    error=(
+                        "the decision named was completed while this call was being "
+                        "judged; a decision is one case and one case is one vend"
+                    ),
+                ).to_dict()
             body = VendCommanded(
                 event_cursor=controller.events.cursor,
                 # What it IS at the moment of the answer: a pending entry, made
@@ -543,7 +557,8 @@ class AssistedVend:
                 # The arming read of the car being let in, which
                 # `complete_vend` set aside for this transit: kept with its stay.
                 controller.resolve_transit(
-                    identity, at, claim=claim, arming=controller.take_completion_arming(at)
+                    identity, at, claim=claim, arming=controller.take_completion_arming(at),
+                    exit_id=controller.take_completion_exit_id(at),
                 )
             except Exception:  # noqa: BLE001
                 # A settling thread that died silently would leave the transit
