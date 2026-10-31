@@ -2921,9 +2921,15 @@ class LaneController:
         # A CLOSE ON A CASE A QR'S ASK-AGAIN SUPERSEDED follows it to the case
         # left open (`_close_follows`), and carries the ask-again's event id so
         # the transport can follow a supersede it learns of only on delivery.
-        asked_again = self._ask_again_events.pop(exit_id, None) if exit_id else None
-        if exit_id is not None:
-            exit_id = self._close_follows.pop(exit_id, exit_id)
+        # UNDER `_exit_lock`, the three reads as one: the lane thread re-points
+        # `_close_follows` and `_let_out_by` together, under the same lock, when
+        # a person took the old case (`_open_superseding`). Read apart, a
+        # re-point landing between them named the old case and lost who opened.
+        with self._exit_lock:
+            asked_again = self._ask_again_events.pop(exit_id, None) if exit_id else None
+            if exit_id is not None:
+                exit_id = self._close_follows.pop(exit_id, exit_id)
+            let_out_by = self._take_let_out_by(exit_id)
         self.events.record(
             SESSION_CLOSE,
             lane,
@@ -2940,7 +2946,7 @@ class LaneController:
             **({"exit_id": exit_id} if exit_id else {}),
             **({"superseding_event": asked_again} if asked_again else {}),
             # A person opened for it: on what authority (platform 0042).
-            **self._take_let_out_by(exit_id),
+            **let_out_by,
             at=at,
             session_id=session_id,
             exit_confirmation=confirmation,

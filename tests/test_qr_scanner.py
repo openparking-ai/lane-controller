@@ -868,6 +868,132 @@ def test_a_close_that_cannot_be_followed_tells_a_person_and_is_never_dropped(mon
     assert HOLDER not in json.dumps(told) and STRANGER not in json.dumps(told)
 
 
+def close_refused(platform):
+    return [e for e in platform.events.values()
+            if e["kind"] == "fallback_needs_human" and e["detail"].get("needs") == "close_refused"]
+
+
+def a_close_on_the_old_case(monkeypatch):
+    """The person's close written on the old case, and then the platform
+    supersedes it with the lane's ask-again: the close is still to deliver."""
+    controller, vend, platform, held, crossing, lane, worker, person = past_the_wait(
+        monkeypatch, drain=True, hold_crossing=False)
+    worker.join(10)
+    held.release.set()
+    lane.join(10)
+    [pending] = [e for e in controller.events._queue if e.kind == "session_close"]
+    assert pending.detail["exit_id"] == "exit-1"
+    return controller, vend, platform, pending
+
+
+class InterleavingFollows(dict):
+    """`_close_follows` whose read hands the turn to the lane thread's
+    re-point (`_open_superseding`'s not-mine branch, under `_exit_lock`) and
+    waits a moment for it: the window between the close's two reads."""
+
+    def __init__(self, controller):
+        super().__init__()
+        self.controller = controller
+
+    def pop(self, key, default=None):
+        value = super().pop(key, default)
+
+        def repoint():
+            with self.controller._exit_lock:
+                self["exit-1"] = "exit-2"
+                held = self.controller._let_out_by
+                if held is not None and held[0] == "exit-1":
+                    self.controller._let_out_by = ("exit-2", held[1])
+
+        lane = threading.Thread(target=repoint)
+        lane.start()
+        lane.join(0.3)
+        return value
+
+
+def test_a_repoint_between_the_closes_reads_never_loses_who_opened():
+    """Hardening 1: the close reads where it follows and who opened as one,
+    under the lock the re-point takes. A re-point racing the close lands
+    before both reads or after both -- never between them, which named the
+    old case and dropped `let_out_by`."""
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("same_plate")))
+    controller._let_out_by = ("exit-1", "human_open_now")
+    controller._close_follows = InterleavingFollows(controller)
+    controller._record_session(SEEN, "2026-09-21T14:00:00+00:00", confirmation="confirmed",
+                               exit_id="exit-1")
+    [close] = [e for e in controller.events._queue if e.kind == "session_close"]
+    assert close.detail.get("let_out_by") == "human_open_now", "who opened was lost"
+    assert close.detail["exit_id"] in ("exit-1", "exit-2")
+
+
+@pytest.mark.parametrize("ended", ["superseded", ["exit-2"], {"superseded_by": 42}],
+                         ids=["text", "list", "id not text"])
+def test_a_supersede_answered_in_another_shape_is_refused_and_never_jams(monkeypatch, ended):
+    """Hardening 2: the old case's `ended`, or its `superseded_by`, comes back
+    in a shape the lane cannot follow. The close is not followed, a person is
+    told, and the outbox goes on -- no error out of the drain."""
+    controller, vend, platform, pending = a_close_on_the_old_case(monkeypatch)
+    platform.exits["exit-1"]["ended"] = ended
+    controller.events.flush()
+    controller.events.flush()
+    assert platform.closed == []
+    assert [e["detail"]["exit_id"] for e in close_refused(platform)] == ["exit-1"]
+    assert not [e for e in controller.events._queue if e.kind == "session_close"], "jammed"
+
+
+def test_a_close_refused_for_another_reason_is_not_followed(monkeypatch):
+    """Hardening 3: the old case was superseded, but the platform refused the
+    close for another reason: it is not sent on to the new case."""
+    controller, vend, platform, pending = a_close_on_the_old_case(monkeypatch)
+    real = platform.close_session
+
+    def otherwise(**kwargs):
+        if kwargs.get("exit_id") == "exit-1":
+            raise PlatformRejected(409, "{}", "exit_on_another_lane")
+        return real(**kwargs)
+
+    platform.close_session = otherwise
+    controller.events.flush()
+    controller.events.flush()  # the person's alert goes out on the next pass
+    assert platform.closed == []
+    assert [e["detail"]["refused"] for e in close_refused(platform)] == ["exit_on_another_lane"]
+
+
+def test_a_close_without_the_ask_agains_event_is_not_followed(monkeypatch):
+    """Hardening 3: a close that carries no ask-again event id is not followed,
+    even to a case that answers no event id of its own."""
+    controller, vend, platform, pending = a_close_on_the_old_case(monkeypatch)
+    pending.detail.pop("superseding_event")
+    platform.exits["exit-2"].pop("event_id")
+    controller.events.flush()
+    controller.events.flush()  # the person's alert goes out on the next pass
+    assert platform.closed == []
+    assert [e["detail"]["exit_id"] for e in close_refused(platform)] == ["exit-1"]
+
+
+def test_a_refused_ask_again_for_a_case_a_person_took_tells_nobody(monkeypatch):
+    """Hardening 3: the person's wait ran out and they took the old case; the
+    ask-again is then refused (here the stay was closed meanwhile). The person
+    has the car: nobody is told the QR covers it."""
+    controller, vend, platform, held, crossing, lane, worker, person = past_the_wait(
+        monkeypatch)
+    for _ in range(100):
+        if vend.vend_count:
+            break
+        time.sleep(0.02)
+    real = held.real
+    held.real = lambda **kwargs: (_ for _ in ()).throw(
+        PlatformRejected(409, "{}", "stay_not_open"))
+    held.release.set()
+    lane.join(10)
+    crossing.release.set()
+    worker.join(10)
+    held.real = real
+    assert vend.vend_count == 1
+    assert not [e for e in platform.events.values()
+                if e["kind"] == "fallback_needs_human" and e["detail"].get("needs") == "qr_covered"]
+
+
 def test_an_ask_again_that_raises_does_not_leave_a_persons_vend_waiting():
     """The ask-again fails with an error of the lane's own: the next person's
     open at the lane does not wait for it."""
