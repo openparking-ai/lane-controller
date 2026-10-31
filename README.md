@@ -439,10 +439,17 @@ when that case says settled, with the case's own loop watch and final read; a
 case still priced stays on payment or a person. A case that names no stay (an
 unmatched car, the driver's word) is not asked again -- that would be a second
 open case -- and a person is told the QR covers the car (`needs:
-"qr_covered"`); the platform cannot cover such a car by its QR yet. Never while
-the old case's card is being taken, once per QR, and a clear under the old case
-longer than a flicker drops it to a person instead. With no waiting case nothing
-opens. At an entry, an opening the module passed on one difference or on
+"qr_covered"`); the platform cannot cover such a car by its QR yet. The new
+case is opened on the platform BEFORE the lane takes it, and a person's vend
+waits for an ask-again on the network (at least the client's timeout and two
+seconds) and then takes the case the car is really on -- so their close names
+it and the platform writes the record of the car let out -- and no fee is handed
+to the reader for a case a person took. Never for a paid case; a card being
+authorised on the old case (the platform answers 503 `payment_unsettled`) is
+waited out quietly, tried again every two seconds at most five times; once per
+QR; and a clear under the old case longer than a flicker -- measured when the
+car is seen on the loop again, before the QR goes out -- drops it to a person
+instead. With no waiting case nothing opens. At an entry, an opening the module passed on one difference or on
 nothing read is recorded: `vended` names the rule (`qr_passed_by`) and the QR
 (`enrolment`), the car's pictures are kept against that event, the stay keeps
 what was read as every stay does, and the module keeps the QR's plate and what

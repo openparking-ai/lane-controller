@@ -262,6 +262,15 @@ class LaneController:
         #: Who takes the case to open the barrier: the lane's turn when the
         #: case settles, or a person's vend at the lane. Exactly one does.
         self._exit_lock = threading.Lock()
+        #: Clear while a covered QR's ask-again is on the network: a person's
+        #: vend waits for it (`EXIT_SUPERSEDE_WAIT_SECONDS`) and then takes the
+        #: case the car is really on, so the close names that case.
+        self._supersede_idle = threading.Event()
+        self._supersede_idle.set()
+        #: How many person's vends are waiting to take the case (under
+        #: `_exit_lock`): a new case a QR just opened is left for them to
+        #: take, and the lane does not step it -- no fee for a car being let out.
+        self._vends_waiting = 0
         #: The case whose fee the platform handed to this lane's reader: until
         #: its car's close the lane does not drive the reader for it.
         self._reader_case: str | None = None
@@ -869,6 +878,20 @@ class LaneController:
         whatever time anything else eventually hears about it.
         """
         lane = self.config.lane_id
+        # A COVERED QR ASKING THE CASE AGAIN, on the network now: wait for it,
+        # so the case taken below is the one the car is on -- the old one if
+        # the ask-again failed, the new one if the platform superseded the old.
+        # A close naming a superseded case is refused, and with it the record
+        # of the car let out.
+        with self._exit_lock:
+            self._vends_waiting += 1
+        try:
+            if not self._supersede_idle.wait(self._supersede_wait_seconds()):
+                log.warning("lane %s: a QR's ask-again is still on the network; the "
+                            "person's vend goes ahead", lane)
+        finally:
+            with self._exit_lock:
+                self._vends_waiting -= 1
         # A PERSON AT THE LANE DECIDED: a car whose exit case was waiting is
         # theirs now, and the lane's turn will not open for it as well. THE
         # DECISION IS CLAIMED HERE, under the lock the case's own opening
@@ -879,6 +902,8 @@ class LaneController:
                 raise DecisionAlreadyCompleted(self.last_decision_completed_at)
             self.last_decision_completed_at = to_iso(self._clock())
             case, self._exit_case = self._exit_case, None
+            if case is not None:
+                case.taken = True
         # FIRST, and before anything moves. Held on the controller as well as
         # recorded, because the record is what an operator reads and this is
         # what the session action is built from.
@@ -1040,7 +1065,18 @@ class LaneController:
             settled = self._step(case) == exit_case.SETTLED
         finally:
             watch.stop()
+        self._after_step(case)
         return settled, watch
+
+    def _after_step(self, case: exit_case.ExitCase) -> None:
+        """A case a person took WHILE its step was on the network: if the step
+        handed its fee to the reader anyway, that payment's cancel is queued
+        -- no fee stays on the reader for a car that has left. (A fee handed
+        over before the person took the case is cancelled by their vend.)"""
+        with self._exit_lock:
+            queue = case.taken and case.sent_at is not None
+        if queue:
+            self._cancel_on_reader(case)
 
     def _still_there(self, watch: exit_case.LoopWatch) -> bool:
         """Whether the car the case was asked about is still the car on the
@@ -1195,6 +1231,10 @@ class LaneController:
                     "the arming loop read clear under the waiting car for longer than a "
                     "flicker; the car on it now was not read"
                 )
+                return
+        if case.qr_waiting is not None:
+            self._retry_waiting_qr(case)
+            if self._exit_case is not case:
                 return
         self._advance_exit_case(case)
 
@@ -1381,6 +1421,10 @@ class LaneController:
             return None
         lane = self.config.lane_id
         decided_at = self.last_decision_at
+        # AT AN EXIT, how long the waiting car's loop read clear before the car
+        # was seen on it again -- measured NOW, before the QR goes out: the
+        # call's own time is the watch's, and is not clear time.
+        exit_clear = self._exit_clear_now()
         identity = decision.identity
         if self._banned(identity) is not None:
             # A refusal that was not a vend never asked the banned list
@@ -1478,7 +1522,7 @@ class LaneController:
             # AT AN EXIT A QR OPENS NOTHING ITSELF: the gate opens only when
             # the exit is settled, and only through the one opener
             # (`_let_out`). The QR settles the car's case instead.
-            return self._qr_settles_exit_case(qr_fields)
+            return self._qr_settles_exit_case(qr_fields, cleared_for=exit_clear)
         self.vend.vend(REASON_QR_OPENED)
         vended = self.events.record(
             "vended", lane, reason=REASON_QR_OPENED,
@@ -1505,43 +1549,58 @@ class LaneController:
         self.deliver()
         return opened
 
-    def _qr_settles_exit_case(self, qr_fields: dict | None) -> None:
+    def _exit_clear_now(self) -> float | None:
+        """At an exit, how long the waiting case's loop had read clear when
+        the car was seen on it again just now, or None: no case, no clear."""
+        if self.config.direction != "exit":
+            return None
+        with self._exit_lock:
+            case = self._exit_case
+            since = case.clear_since if case is not None else None
+        return None if since is None else self._clock() - since
+
+    def _qr_settles_exit_case(
+        self, qr_fields: dict | None, *, cleared_for: float | None = None
+    ) -> None:
         """A QR the pass module answered covered, at an EXIT. The QR opens
         nothing: the gate opens only when the car's case is settled, through
         `_advance_exit_case` and `_let_out` -- the one opener, with its loop
         watch, its final read and its lock.
 
-        THE CASE IS ASKED AGAIN, AS THE SAME STAY, OR NOT AT ALL. The lane
-        opens a new case for the stay the old one is for (`exit_case.stay_of`:
-        the stay the lane named, or the one the platform found and answered),
-        with the old case's ID fields and fee. Naming the stay is what makes
-        the platform supersede the old case -- its payment canceled and off the
-        reader first, the case closed (platform 0045) -- and price the stay
-        again with the pass module first. An old case that names NO stay (none
-        was found: the driver's word, an unmatched car) is not asked again: a
-        second case would be a second open case on the platform, matched from
-        scratch, with the first one's payment still on the reader. The case
-        stays as it is (payment or a person) and a person is told the QR
+        THE CASE IS ASKED AGAIN, AS THE SAME STAY, OR NOT AT ALL. The new case
+        names the stay the old one is for (`exit_case.stay_of`): naming it is
+        what makes the platform supersede the old case -- its payment canceled
+        and off the reader first, the case closed (platform 0045) -- and price
+        the stay again with the pass module first. An old case that names NO
+        stay is not asked again (a second case would be a second open case,
+        matched from scratch): it stays as it is and a person is told the QR
         covers the car (`needs: "qr_covered"`), once.
 
-        NEVER WHILE A CARD IS TAKEN, AND ONCE PER QR: not while the old case's
-        payment is being processed (`SUPERSEDE_PAYMENTS`), and a QR that has
-        already acted on this car's case does nothing more.
+        THE NEW CASE IS OPENED ON THE PLATFORM BEFORE THE LANE TAKES IT, and a
+        person's vend waits while that is on the network
+        (`_supersede_idle`): whichever comes first, the case a person takes is
+        the case the car is really on -- the old one if the ask-again failed,
+        the new one if the platform superseded the old -- so their close names
+        it, and the platform writes the record of the car let out. A fee is
+        never handed to the reader for a case a person took (`ExitCase.taken`,
+        `_after_step`).
 
-        THE OLD CASE'S PAYMENT IS NEVER LEFT ON THE READER: whatever the
-        platform does with the new case, the old case's cancel is queued
-        (`_cancel_on_reader`, asked off the lane's thread until confirmed --
-        a superseded case answers canceled, or `exit_closed`).
+        NEVER WHILE A CARD IS TAKEN, AND ONCE PER QR: not while the old case
+        is paid (`SUPERSEDE_PAYMENTS`); a card being authorised (the platform
+        answers 503 `payment_unsettled`), or a platform out of reach, is
+        waited out -- asked again every `EXIT_QR_RETRY_SECONDS`, at most
+        `EXIT_QR_RETRIES` times, telling nobody -- and a QR that has acted on
+        this car's case does nothing more.
 
-        THE ROLLED-ON CAR RULE HOLDS ACROSS THE SWAP: a clear under the old
-        case longer than a flicker drops it to a person, as
-        `observe_exit_case` does, and nothing is asked again for the car on
-        the loop now. The close names the case and carries the QR (`qr`)."""
+        THE OLD CASE'S PAYMENT IS NEVER LEFT ON THE READER: once the new case
+        is the car's, the old case's cancel is queued (`_cancel_on_reader`).
+
+        THE ROLLED-ON CAR RULE HOLDS: `cleared_for` is how long the old case's
+        loop had read clear when the car was seen on it again before the QR
+        went out; longer than a flicker drops the case to a person. The new
+        case starts with no clear of its own."""
         lane = self.config.lane_id
         key = (qr_fields or {}).get("enrolment") or ""
-        rolled_on = False
-        tell = None
-        fresh = None
         with self._exit_lock:
             case = self._exit_case
             if case is None:
@@ -1553,64 +1612,139 @@ class LaneController:
                          lane)
                 return None
             if exit_case.payment_status(case) not in exit_case.SUPERSEDE_PAYMENTS:
-                log.info("lane %s: the waiting case's payment is being taken; a QR does not "
-                         "ask it again now", lane)
+                log.info("lane %s: the waiting case is paid; a QR does not ask it again", lane)
                 return None
-            if case.clear_since is not None:
-                if self._clock() - case.clear_since >= exit_case.EXIT_FLICKER_SECONDS:
-                    rolled_on = True
-                else:
-                    case.clear_since = None  # a flicker, as `observe_exit_case` reads it
+            rolled_on = cleared_for is not None and cleared_for >= exit_case.EXIT_FLICKER_SECONDS
+            if not rolled_on and cleared_for is not None:
+                case.clear_since = None  # a flicker, as `observe_exit_case` reads it
             stay = exit_case.stay_of(case)
-            if rolled_on:
-                pass
-            elif stay is None:
+            if not rolled_on and stay is None:
                 case.qr_used = case.qr_used | {key}
-                tell = case
-            else:
-                fresh = exit_case.ExitCase(
-                    event_id=str(uuid.uuid4()),
-                    exit_at=case.exit_at,
-                    identity=case.identity,
-                    pricing=case.pricing,
-                    fields=case.fields,
-                    session_id=stay,
-                    clear_since=case.clear_since,
-                    qr_used=case.qr_used | {key},
-                )
-                self._exit_case = fresh
+            if not rolled_on and stay is not None:
+                self._supersede_idle.clear()
         if rolled_on:
             self._leave_exit_case(
                 "the arming loop read clear under the waiting car for longer than a flicker "
                 "before its QR was answered; the car on it now was not read"
             )
             return None
-        if tell is not None:
-            self.events.record(
-                "fallback_needs_human",
-                lane,
-                reason="a registration QR covers this car, but its exit case names no stay "
-                "to ask again; the case stays as it is and a person decides",
-                fallback=Fallback.EXIT_NOT_SETTLED.value,
-                exit_id=tell.exit_id,
-                needs=exit_case.NEEDS_QR_COVERED,
-                **({"enrolment": key} if key else {}),
-            )
-            self.deliver()
+        if stay is None:
+            self._tell_qr_covered(case, key, "its exit case names no stay to ask again")
+            return None
+        # ONE NEW CASE PER ASK-AGAIN, its event id kept on the old case: a retry
+        # after an answer that never came back is the same request, and the
+        # platform answers it with the same case rather than opening another.
+        with self._exit_lock:
+            if case.qr_fresh_event is None:
+                case.qr_fresh_event = str(uuid.uuid4())
+            fresh_event = case.qr_fresh_event
+        fresh = exit_case.ExitCase(
+            event_id=fresh_event,
+            exit_at=case.exit_at,
+            identity=case.identity,
+            pricing=case.pricing,
+            fields=case.fields,
+            session_id=stay,
+            qr_used=case.qr_used | {key},
+        )
+        try:
+            opened = self._open_superseding(case, fresh, qr_fields, key)
+            with self._exit_lock:
+                person_waiting = self._vends_waiting > 0
+        finally:
+            self._supersede_idle.set()
+        if not opened:
             return None
         # THE OLD CASE: its payment off the reader, queued here and asked off
         # this thread until the platform confirms it -- never left behind.
         self._cancel_on_reader(case)
         if self._reader_case == case.exit_id:
             self._reader_case = None
-        # The pictures the platform's picker is shown of this car, under the
-        # new case's own event, as `_exit_settlement` keeps them.
-        self.events.queue_pictures(fresh.event_id, self._take_pictures(REFUSED_PICTURES))
         if qr_fields is not None:
             self._qr_opening = (fresh.exit_at, qr_fields)
-        self.deliver()
+        if person_waiting:
+            # A PERSON IS OPENING FOR THIS CAR: the new case is theirs to take,
+            # and it is not stepped -- no fee goes to the reader for it.
+            return None
         self._advance_exit_case(fresh)
         return None
+
+    def _open_superseding(self, case, fresh, qr_fields: dict | None, key: str) -> bool:
+        """Open `fresh` on the platform -- the pictures under its own event
+        first -- and only then make it the car's case, if the old one still
+        is. True when it became the car's case."""
+        self.events.queue_pictures(fresh.event_id, self._take_pictures(REFUSED_PICTURES))
+        self.deliver()
+        try:
+            answer = self.exits.open_exit(
+                event_id=fresh.event_id, exit_at=fresh.exit_at, session_id=fresh.session_id,
+                id_fields=fresh.fields,
+            )
+            if answer.get("event_id") != fresh.event_id or not answer.get("id"):
+                raise PlatformRejected(None, "the platform answered another case",
+                                       exit_case.OTHER_CASE)
+        except PlatformUnreachable:
+            # A card being authorised on the old case (503 `payment_unsettled`),
+            # or the platform out of reach: waited out, telling nobody.
+            with self._exit_lock:
+                if self._exit_case is case and case.qr_retries < exit_case.EXIT_QR_RETRIES:
+                    case.qr_waiting = qr_fields or {}
+                    case.qr_retry_at = self._clock() + exit_case.EXIT_QR_RETRY_SECONDS
+                    case.qr_retries += 1
+                elif self._exit_case is case:
+                    case.qr_waiting = None
+            log.info("lane %s: the platform could not ask the case again yet; it is asked "
+                     "again shortly", self.config.lane_id)
+            return False
+        except PlatformRejected as err:
+            with self._exit_lock:
+                case.qr_waiting = None
+                case.qr_used = case.qr_used | {key}
+            self._tell_qr_covered(case, key, f"the platform refused to ask the case again "
+                                  f"({err.code or err.status})")
+            return False
+        fresh.answer = answer
+        fresh.exit_id = answer["id"]
+        with self._exit_lock:
+            mine = self._exit_case is case
+            if mine:
+                case.qr_waiting = None
+                self._exit_case = fresh
+        return mine
+
+    def _supersede_wait_seconds(self) -> float:
+        """How long a person's vend waits for a QR's ask-again on the network:
+        `EXIT_SUPERSEDE_WAIT_SECONDS`, and never less than the platform
+        client's own timeout and two seconds, so the ask-again has answered or
+        failed before the person's vend takes a case."""
+        client_timeout = getattr(self.exits, "_timeout", None)
+        floor = client_timeout + 2.0 if isinstance(client_timeout, int | float) else 0.0
+        return max(exit_case.EXIT_SUPERSEDE_WAIT_SECONDS, floor)
+
+    def _tell_qr_covered(self, case, key: str, why: str) -> None:
+        """A covered QR the lane could not turn into an ask-again: a person is
+        told, once per QR, naming the case and the QR (no plate)."""
+        self.events.record(
+            "fallback_needs_human",
+            self.config.lane_id,
+            reason=f"a registration QR covers this car, but {why}; the case stays as it is "
+            "and a person decides",
+            fallback=Fallback.EXIT_NOT_SETTLED.value,
+            exit_id=case.exit_id,
+            needs=exit_case.NEEDS_QR_COVERED,
+            **({"enrolment": key} if key else {}),
+        )
+        self.deliver()
+
+    def _retry_waiting_qr(self, case) -> None:
+        """A covered QR whose ask-again the platform could not take yet: asked
+        again when due (`EXIT_QR_RETRY_SECONDS`, at most `EXIT_QR_RETRIES`)."""
+        if case.qr_waiting is None or case.qr_retry_at is None:
+            return
+        if self._clock() < case.qr_retry_at:
+            return
+        qr_fields, case.qr_retry_at = case.qr_waiting, None
+        self._qr_settles_exit_case(qr_fields or None)
 
     def _qr_denied(self, reason: str) -> None:
         """The owner's deny keeping a QR's car out, recorded as a `decision`

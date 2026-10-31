@@ -79,6 +79,8 @@ not known to stay down for one.
   held_car_never_told        a car held behind an unconfirmed cancel never reaches a person.
   held_car_fee_sent          the held car's fee is sent once a person is told.
   closed_cancel_retried      a cancel answered exit_closed is not taken as confirmed.
+  taken_case_paid            a case a person took still has its fee handed to the reader.
+  taken_fee_not_cancelled    a fee handed over as a person takes the case stays on the reader.
 """
 
 from __future__ import annotations
@@ -180,6 +182,8 @@ BREAKAGES = [
     ("held_car_never_told", "a car held behind an unconfirmed cancel never reaches a person"),
     ("held_car_fee_sent", "the held car's fee is sent once a person has been told"),
     ("closed_cancel_retried", "a cancel answered exit_closed is not taken as confirmed"),
+    ("taken_case_paid", "a case a person took still has its fee handed to the reader"),
+    ("taken_fee_not_cancelled", "a fee handed over as a person takes the case stays on it"),
 ]
 
 

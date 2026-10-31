@@ -4180,6 +4180,20 @@ def _break_the_settled_exit(monkeypatch):
 
         monkeypatch.setattr(LaneController, "retry_cancels", waits)
 
+    elif mode == "taken_case_paid":
+        # A case a person took still has its fee handed to the reader.
+        original = case_module._act
+
+        def forgets(case, platform, display, *, now):
+            case.taken = False
+            return original(case, platform, display, now=now)
+
+        monkeypatch.setattr(case_module, "_act", forgets)
+
+    elif mode == "taken_fee_not_cancelled":
+        # A fee handed over as a person takes the case is left on the reader.
+        monkeypatch.setattr(LaneController, "_after_step", lambda self, case: None)
+
     elif mode == "closed_cancel_retried":
         # A cancel answered `exit_closed` (the case superseded) is not taken
         # as confirmed.

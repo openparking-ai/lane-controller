@@ -51,6 +51,15 @@ that drives it; no tracked file is edited.
   exit_card_taken_reasked   a case is asked again while its card is being taken
   exit_qr_reused            the same QR asks the same car's case again and again
   exit_rolled_on_ignored    a clear longer than a flicker before the QR is ignored
+  exit_vend_does_not_wait   a person's vend takes the case while the ask-again is out
+  exit_claim_before_open    the new case is the car's before the platform opened it
+  exit_stepped_for_person   a case just opened is stepped while a person waits for it
+  exit_clear_after_answer   the answer's own time is counted as clear time
+  exit_unsettled_alarm      a card being authorised tells a person
+  exit_retries_unbounded    the ask-again is tried again without end
+  exit_retry_new_request    a retry opens another case instead of asking again
+  exit_wait_not_floored     a person's vend waits less than the client's timeout
+  exit_stay_not_text        a stay id that is not text is taken for a stay
 """
 
 from __future__ import annotations
@@ -72,6 +81,7 @@ DECISION = "src/lane_controller/decision.py"
 CLIENT = "src/lane_controller/platform_client.py"
 CLI = "src/lane_controller/cli.py"
 WATCH = "src/lane_controller/loop_watch.py"
+EXIT_CASE = "src/lane_controller/exit_case.py"
 SYNC = "src/lane_controller/sync.py"
 
 BREAKAGES = [
@@ -180,19 +190,54 @@ BREAKAGES = [
      '        if self.config.direction == "exit":\n            # AT AN EXIT A QR OPENS NOTHING',
      "        if False:\n            # AT AN EXIT A QR OPENS NOTHING"),
     ("exit_case_not_reasked", "the exit case is not asked again", CONTROLLER,
-     "        self.deliver()\n        self._advance_exit_case(fresh)\n",
-     "        self.deliver()\n"),
+     "        self._advance_exit_case(fresh)\n        return None\n\n    def _open_superseding",
+     "        return None\n\n    def _open_superseding"),
     ("exit_old_cancel_dropped", "the old case's cancel is not queued", CONTROLLER,
      "never left behind.\n        self._cancel_on_reader(case)\n", "never left behind.\n"),
     ("exit_no_stay_reasked", "a case with no stay is asked again", CONTROLLER,
-     "            elif stay is None:\n", "            elif False:\n"),
+     "        if stay is None:\n            self._tell_qr_covered(",
+     "        if False:\n            self._tell_qr_covered("),
     ("exit_card_taken_reasked", "asked again mid-payment", CONTROLLER,
      "            if exit_case.payment_status(case) not in exit_case.SUPERSEDE_PAYMENTS:\n",
      "            if False:\n"),
     ("exit_qr_reused", "the same QR asks again", CONTROLLER,
      "            if key in case.qr_used:\n", "            if False:\n"),
     ("exit_rolled_on_ignored", "a rolled-on car's QR asks again", CONTROLLER,
-     "                    rolled_on = True\n", "                    rolled_on = False\n"),
+     "            rolled_on = cleared_for is not None and cleared_for >= "
+     "exit_case.EXIT_FLICKER_SECONDS\n", "            rolled_on = False\n"),
+    ("exit_vend_does_not_wait", "a person's vend does not wait", CONTROLLER,
+     "        if not self._supersede_idle.wait(self._supersede_wait_seconds()):\n",
+     "        if False:\n"),
+    ("exit_claim_before_open", "the new case claimed before it is opened", CONTROLLER,
+     "        try:\n            opened = self._open_superseding(case, fresh, qr_fields, key)\n",
+     "        with self._exit_lock:\n            self._exit_case = fresh\n"
+     "        try:\n            opened = self._open_superseding(fresh, fresh, qr_fields, key)\n"),
+    ("exit_stepped_for_person", "a just-opened case stepped while a person waits", CONTROLLER,
+     "        if person_waiting:\n", "        if False:\n"),
+    ("exit_clear_after_answer", "clear measured after the answer", CONTROLLER,
+     "            rolled_on = cleared_for is not None and cleared_for >= "
+     "exit_case.EXIT_FLICKER_SECONDS\n",
+     "            cleared_for = None if case.clear_since is None else "
+     "self._clock() - case.clear_since\n"
+     "            rolled_on = cleared_for is not None and cleared_for >= "
+     "exit_case.EXIT_FLICKER_SECONDS\n"),
+    ("exit_unsettled_alarm", "a card being authorised tells a person", CONTROLLER,
+     "            log.info(\"lane %s: the platform could not ask the case again yet; it is "
+     "asked \"\n",
+     "            self._tell_qr_covered(case, key, \"planted\")\n"
+     "            log.info(\"lane %s: the platform could not ask the case again yet; it is "
+     "asked \"\n"),
+    ("exit_retries_unbounded", "the ask-again retried without end", CONTROLLER,
+     "if self._exit_case is case and case.qr_retries < exit_case.EXIT_QR_RETRIES:",
+     "if self._exit_case is case:"),
+    ("exit_retry_new_request", "a retry is a new request", CONTROLLER,
+     "            if case.qr_fresh_event is None:\n", "            if True:\n"),
+    ("exit_wait_not_floored", "the wait is not floored", CONTROLLER,
+     "        return max(exit_case.EXIT_SUPERSEDE_WAIT_SECONDS, floor)",
+     "        return exit_case.EXIT_SUPERSEDE_WAIT_SECONDS"),
+    ("exit_stay_not_text", "a stay id not text is a stay", EXIT_CASE,
+     "    return found if isinstance(found, str) and found else None",
+     "    return found or None"),
     ("plate_on_vended", "the QR's plate rides on vended", CONTROLLER,
      '**({"qr_passed_by": passed_by} if passed_by else {}),',
      '**({"qr_passed_by": passed_by, "qr_plate": enrolment.get("qr_plate")} '

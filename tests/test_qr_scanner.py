@@ -42,6 +42,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import threading
 import time
 import urllib.error
 
@@ -512,36 +513,51 @@ def test_a_covered_qr_for_a_case_with_no_stay_asks_nothing_again_and_tells_a_per
     assert vend.vend_count == 1, "the driver paid the case on the reader; it opens"
 
 
-def test_the_old_payment_is_cancelled_even_when_the_platform_drops_before_the_new_case():
-    """Finding 1, the probe: the fee on the reader, the QR covered, the
-    platform gone before the new case opens, then a person opens. The old
-    case's cancel was queued and is asked when the platform is back."""
+def a_person_opens(controller, key="KEY-QR-EXIT"):
+    """`POST /v1/lane/vend` as the route takes it, a person's word."""
     from lane_controller.contract import VendAuthority
     from lane_controller.service import LaneService
     from lane_controller.vend import parse as parse_vend
 
+    service = getattr(controller, "_test_service", None) or LaneService(controller)
+    controller._test_service = service
+    body = {"authorised_by": VendAuthority.HUMAN_OPEN_NOW.value,
+            "identity": {"kind": "ticket", "ticket_ref": "TKT-4RS9WQ2M"},
+            "decision_at": controller.last_decision_at}
+    status, said = service.assisted.complete(parse_vend(body, key))
+    if service.assisted.settling is not None:
+        service.assisted.settling.join(timeout=10)
+    return status, said
+
+
+def test_the_old_payment_is_cancelled_even_when_the_platform_drops_before_the_new_case():
+    """Finding 1, the probe: the fee on the reader, the QR covered, the
+    platform gone before the new case opens, then a person opens. Nothing
+    moved on: the old case is still the car's, the ask-again waits to be
+    tried again, and the person's vend takes the old case -- its close names
+    it and its payment's cancel is asked when the platform is back."""
     holder = {}
     presenter = SlowPresenter(
         0.0, during=lambda: setattr(holder["platform"], "online", False),
         answer=passed("same_plate"))
     controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
     holder["platform"] = platform
-    service = LaneService(controller)
     scanner.scan(QR)
     controller.run_once()
-    assert "exit-1" in controller._cancels, "the old case's cancel is queued"
-    body = {"authorised_by": VendAuthority.HUMAN_OPEN_NOW.value,
-            "identity": {"kind": "ticket", "ticket_ref": "TKT-4RS9WQ2M"},
-            "decision_at": controller.last_decision_at}
-    status, said = service.assisted.complete(parse_vend(body, "KEY-QR-EXIT"))
-    if service.assisted.settling is not None:
-        service.assisted.settling.join(timeout=5)
+    assert controller._exit_case.exit_id == "exit-1", "nothing moved on"
+    assert controller._exit_case.qr_waiting is not None, "the ask-again waits"
+    assert "exit-1" not in controller._cancels, "the old fee is still the car's to pay"
+    status, said = a_person_opens(controller)
     assert status == 202 and vend.vend_count == 1, said
+    assert "exit-1" in controller._cancels, "the person's vend queues its payment's cancel"
     platform.online = True
     controller._cancels._pending["exit-1"].due = 0
     controller.retry_cancels()
+    controller.events.flush()
     assert ("pay_cancel", "exit-1") in platform.exit_requests
     assert "exit-1" not in controller._cancels
+    [closed] = platform.closed
+    assert closed["exit_id"] == "exit-1" and len(opened_cases(platform)) == 1
 
 
 @pytest.mark.parametrize("status", ["processing", "requires_capture", "succeeded"])
@@ -633,6 +649,208 @@ def test_a_refusal_a_person_completed_during_the_exit_qr_asks_nothing_again():
     scanner.scan(QR)
     controller.run_once()
     assert len(opened_cases(platform)) == 1 and vend.vend_count == 0
+
+
+class HeldOpen:
+    """The platform's `open_exit` for the case a QR asks again, held on the
+    network until released: the window a person's vend can land in."""
+
+    def __init__(self, platform):
+        self.platform = platform
+        self.real = platform.open_exit
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        platform.open_exit = self
+
+    def __call__(self, **kwargs):
+        if len([r for r in self.platform.exit_requests if r[0] == "open"]) >= 1:
+            self.entered.set()
+            self.release.wait(10)
+        return self.real(**kwargs)
+
+
+class HeldCrossing:
+    """A closing loop whose crossing waits until released."""
+
+    def __init__(self):
+        self.release = threading.Event()
+
+    def wait_for_sequence(self, window_seconds):
+        self.release.wait(10)
+        return ClosingSequence.OCCUPIED
+
+
+def test_a_person_who_opens_while_the_qr_asks_again_takes_the_case_the_car_is_on():
+    """Round 2, finding 1: a person opens while the new case is being opened
+    on the platform. Their vend waits for it, then takes the NEW case (the
+    platform superseded the old one): the close names it -- so the platform
+    writes the record of the car let out -- no fee goes to the reader for it,
+    and the old case's payment comes off the reader."""
+    holder = {}
+    presenter = SlowPresenter(0.0, during=lambda: None, answer=passed("same_plate"))
+    controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
+    holder["platform"] = platform
+    held = HeldOpen(platform)
+    scanner.scan(QR)
+    lane = threading.Thread(target=controller.run_once, name="lane")
+    lane.start()
+    assert held.entered.wait(5), "the ask-again reached the platform"
+    person = {}
+    worker = threading.Thread(target=lambda: person.update(answer=a_person_opens(controller)))
+    worker.start()
+    time.sleep(0.3)
+    assert worker.is_alive(), "the person's vend waits for the ask-again"
+    held.release.set()
+    lane.join(10)
+    worker.join(10)
+    status, said = person["answer"]
+    assert status == 202 and vend.vend_count == 1, said
+    controller.events.flush()
+    [closed] = platform.closed
+    assert closed["exit_id"] == "exit-2", "the close names the case the car was on"
+    assert closed.get("let_out_by") == "human_open_now"
+    assert ("pay", "exit-2") not in platform.exit_requests, "a fee for a car let out"
+    assert requests(platform, "supersede") == [("supersede", "exit-1", "exit-2")]
+    assert ("pay_cancel", "exit-1") in platform.exit_requests
+    assert controller._exit_case is None and len(controller._cancels) == 0
+
+
+def test_a_case_a_qr_just_opened_is_left_for_a_waiting_person_and_not_stepped():
+    """A person's vend is waiting on the ask-again: the new case is theirs to
+    take, so the lane does not ask how it stands or hand its fee over."""
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("one_difference")))
+    controller._vends_waiting = 1  # a person's vend, waiting on the ask-again
+    scanner.scan(QR)
+    controller.run_once()
+    assert controller._exit_case.exit_id == "exit-2"
+    assert ("get", "exit-2") not in platform.exit_requests
+    assert ("pay", "exit-2") not in platform.exit_requests
+
+
+def test_an_ask_again_whose_answer_was_lost_is_asked_again_as_the_same_request():
+    """The platform opened the new case but its answer never came back: the
+    retry is the same request (the same event id), so the platform answers
+    with that case -- no third case, the old one superseded once."""
+    holder = {"now": NOW, "lose": 1}
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("same_plate")))
+    controller._clock = lambda: holder["now"]
+    real = platform.open_exit
+
+    def lossy(**kwargs):
+        answer = real(**kwargs)
+        if holder["lose"]:
+            holder["lose"] -= 1
+            raise PlatformUnreachable("timed out")
+        return answer
+
+    platform.open_exit = lossy
+    scanner.scan(QR)
+    controller.run_once()
+    assert controller._exit_case.exit_id == "exit-1", "the lane did not hear the answer"
+    for _ in range(4):
+        holder["now"] += 1.0
+        controller.observe_exit_case()
+    events = [r[1] for r in opened_cases(platform)]
+    assert len(events) == 3 and events[1] == events[2], "the retry is the same request"
+    assert len(platform.exits) == 2, "no third case"
+    assert requests(platform, "supersede") == [("supersede", "exit-1", "exit-2")]
+    assert controller._exit_case.exit_id == "exit-2"
+
+
+def test_a_persons_vend_waits_at_least_the_platform_clients_timeout():
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("same_plate")))
+    from lane_controller import exit_case as exit_case_module
+
+    platform._timeout = 9.0
+    assert controller._supersede_wait_seconds() == 11.0
+    platform._timeout = 1.0
+    assert controller._supersede_wait_seconds() == exit_case_module.EXIT_SUPERSEDE_WAIT_SECONDS
+
+
+def test_the_clear_before_a_qr_is_measured_before_the_qr_goes_out():
+    """Round 2, finding 2: one clear sample, the car back on the loop before
+    the scan, and a slow answer. The time the answer took is not clear time:
+    the QR goes on (the watch covered the call)."""
+    holder = {"now": NOW}
+    presenter = SlowPresenter(0.0, during=lambda: holder.update(now=holder["now"] + 0.8),
+                              answer=passed("same_plate"))
+    controller, vend, platform, scanner, _ = an_exit_waiting(presenter)
+    controller._clock = lambda: holder["now"]
+    controller._exit_case.clear_since = holder["now"] - 0.3
+    scanner.scan(QR)
+    controller.observe_qr()
+    assert len(opened_cases(platform)) == 2, "a flicker plus a slow answer dropped the car"
+    assert left_events(platform) == []
+
+
+def test_a_card_being_authorised_on_the_old_case_is_waited_out_telling_nobody():
+    """Round 2, finding 3: the platform answers the ask-again 503
+    `payment_unsettled` (a card being authorised on the old case). The lane
+    waits it out -- asked again every couple of seconds, a bounded number of
+    times -- and tells nobody; the old case goes on as it was."""
+    from lane_controller import exit_case as exit_case_module
+
+    holder = {"now": NOW}
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("same_plate")))
+    controller._clock = lambda: holder["now"]
+    real = platform.open_exit
+
+    def unsettled(**kwargs):
+        platform.exit_requests.append(("open", kwargs["event_id"], kwargs.get("session_id"),
+                                       dict(kwargs.get("id_fields") or {})))
+        raise PlatformUnreachable("HTTP 503", status=503, code="payment_unsettled")
+
+    platform.open_exit = unsettled
+    scanner.scan(QR)
+    controller.run_once()
+    for _ in range(40):
+        holder["now"] += 1.0
+        controller.observe_exit_case()
+    tries = len(opened_cases(platform)) - 1
+    assert tries == 1 + exit_case_module.EXIT_QR_RETRIES, tries
+    assert controller._exit_case.exit_id == "exit-1" and vend.vend_count == 0
+    told = [e["detail"].get("needs") for e in platform.events.values()
+            if e["kind"] == "fallback_needs_human"]
+    assert "unanswered" not in told and "qr_covered" not in told, told
+    # and once the card is done, a scan of the QR asks again as before
+    platform.open_exit = real
+    scanner.scan(QR)
+    controller.run_once()
+    assert requests(platform, "supersede") == [("supersede", "exit-1", "exit-2")]
+
+
+def test_a_waiting_ask_again_goes_through_once_the_platform_takes_it():
+    holder = {"now": NOW, "fail": 2}
+    controller, vend, platform, scanner, _ = an_exit_waiting(Presenter(passed("same_plate")))
+    controller._clock = lambda: holder["now"]
+    real = platform.open_exit
+
+    def flaky(**kwargs):
+        if holder["fail"]:
+            holder["fail"] -= 1
+            raise PlatformUnreachable("HTTP 503", status=503, code="payment_unsettled")
+        return real(**kwargs)
+
+    platform.open_exit = flaky
+    scanner.scan(QR)
+    controller.run_once()
+    for _ in range(6):
+        holder["now"] += 1.0
+        controller.observe_exit_case()
+    assert requests(platform, "supersede") == [("supersede", "exit-1", "exit-2")]
+    assert controller._exit_case.exit_id == "exit-2"
+
+
+@pytest.mark.parametrize("found", [123, "", None, ["stay"]], ids=repr)
+def test_only_a_stay_id_the_platform_answered_as_text_is_a_stay(found):
+    from lane_controller import exit_case as exit_case_module
+
+    case = exit_case_module.ExitCase(event_id="e", exit_at="t", identity=LOW_EXIT,
+                                     pricing=None, fields={})
+    case.answer = {"session_id": found}
+    assert exit_case_module.stay_of(case) is None
+    case.answer = {"session_id": "stay-9"}
+    assert exit_case_module.stay_of(case) == "stay-9"
 
 
 def test_the_case_is_swapped_under_the_exit_lock(monkeypatch):

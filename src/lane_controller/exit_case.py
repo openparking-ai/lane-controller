@@ -228,6 +228,19 @@ class ExitCase:
     #: The registration QRs (by enrolment id) a covered answer already acted on
     #: for this car's case: a QR asks the case again, or tells a person, once.
     qr_used: frozenset = frozenset()
+    #: Set under the exit lock when a person at the lane takes this case (their
+    #: vend): from then nothing hands its fee to the reader, and a fee handed
+    #: over in the same instant has its cancel queued (`_after_step`).
+    taken: bool = False
+    #: A covered QR whose ask-again the platform could not take yet (503
+    #: `payment_unsettled`: a card is being authorised on this case; or out of
+    #: reach): asked again at `qr_retry_at`, at most `EXIT_QR_RETRIES` times.
+    qr_waiting: dict | None = None
+    qr_retry_at: float | None = None
+    qr_retries: int = 0
+    #: The event id of the case a QR asks this case again as, kept for its
+    #: retries: the same request, answered by the platform with the same case.
+    qr_fresh_event: str | None = None
     #: Whether a person was told this car waits on an earlier car's payment.
     held_told: bool = False
 
@@ -400,6 +413,10 @@ def _act(case: ExitCase, platform, display: ExitDisplay | None, *, now: float) -
         payment = case.answer.get("payment") or {}
         if payment.get("status") not in (None, "open"):
             return
+        if case.taken:
+            # A PERSON HAS TAKEN THIS CASE (their vend at the lane): its car is
+            # let out, and no fee goes to the reader for it.
+            return
         if case.fee_held:
             # AN EARLIER CASE'S PAYMENT MAY STILL BE ON THE READER: its cancel
             # is queued and not yet confirmed (`PendingCancels`). This car's
@@ -483,8 +500,10 @@ def send_receipt(case: ExitCase, platform, display: ExitDisplay | None) -> bool:
 CANCELED = "canceled"
 CANCEL_FOUND_PAID = "paid"
 CANCEL_NOTHING = "nothing"
-#: The platform closed the case (409 `exit_closed`) -- superseded by a later
-#: case for its stay, whose open canceled its payment first (platform 0045).
+#: DEFENSIVE, never answered today: the platform's `/pay/cancel` answers a
+#: superseded case 200 canceled (the supersede canceled its payment) or 409
+#: `exit_paid`; it has no `exit_closed`. Read as confirmed should it ever come
+#: -- a closed case has nothing left on the reader -- and harmless until then.
 CANCEL_CLOSED = "closed"
 CANCEL_IN_PROGRESS = "in_progress"
 CANCEL_FAILED = "failed"
@@ -524,8 +543,23 @@ NEEDS_QR_COVERED = "qr_covered"
 
 #: The payment states a case may be asked again in (superseded): none yet,
 #: one waiting on the reader (the platform's supersede cancels it first), or
-#: one already canceled. Never while a card is being processed or taken.
+#: one already canceled -- never a paid one. The platform's payment states are
+#: open, succeeded and canceled (its 0038); a card being authorised still
+#: reads `open`, and the platform answers that ask-again 503
+#: `payment_unsettled`, which the lane waits out (`EXIT_QR_RETRY_SECONDS`).
 SUPERSEDE_PAYMENTS = frozenset({None, "open", "canceled"})
+
+#: How long a covered QR's ask-again waits after the platform could not take
+#: it (a card being authorised on the old case, or out of reach), and how many
+#: times it is tried: then the QR is let go quietly -- the old case goes on as
+#: it was, and the driver can scan again.
+EXIT_QR_RETRY_SECONDS = 2.0
+EXIT_QR_RETRIES = 5
+
+#: How long a person's vend at the lane waits for a QR's ask-again already on
+#: the network, so that it takes the case the car is really on: longer than
+#: the platform client's timeout, so the ask-again has answered or failed.
+EXIT_SUPERSEDE_WAIT_SECONDS = 7.0
 
 
 def stay_of(case: ExitCase) -> str | None:

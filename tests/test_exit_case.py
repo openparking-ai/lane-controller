@@ -1887,3 +1887,53 @@ def test_a_pending_cancel_for_a_case_the_platform_closed_is_confirmed():
     clock.tick(60)
     assert controller.retry_cancels() == 0
     assert not told(controller, "cancel_refused")
+
+
+def test_no_fee_goes_to_the_reader_for_a_case_a_person_takes_mid_step():
+    """Round 2 (#55's race): a person opens while the case's step is asking the
+    platform how it stands; the step that follows would hand a new fee to the
+    reader -- it does not, the car is let out by the person."""
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    service = LaneService(controller)
+    controller.run_once()
+    assert len(pays(exits)) == 1
+    exits.exit_answer = {**PAYMENT, "payment": {"status": "open", "last_failure": DECLINED}}
+    real = exits.get_exit
+
+    def person_opens_meanwhile(exit_id):
+        worker = threading.Thread(target=lambda: person_opens(service, controller))
+        worker.start()
+        worker.join(10)
+        return real(exit_id)
+
+    exits.get_exit = person_opens_meanwhile
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 1
+    assert len(pays(exits)) == 1, "a fee went to the reader for a car let out"
+
+
+def test_a_fee_handed_over_as_a_person_takes_the_case_has_its_cancel_queued():
+    """Round 2 (#55's race): the person takes the case while the fee is on its
+    way to the reader; the fee lands after their vend looked. The lane queues
+    its cancel as the step ends -- nothing stays on the reader."""
+    from lane_controller.platform_client import PlatformUnreachable
+
+    controller, vend, exits, clock, _ = an_exit(answer=PAYMENT)
+    service = LaneService(controller)
+    real_pay = exits.exit_pay
+    exits.exit_pay = lambda exit_id: (_ for _ in ()).throw(PlatformUnreachable("down"))
+    controller.run_once()
+    assert controller._exit_case.sent_at is None, "no fee on the reader yet"
+
+    def person_opens_as_the_fee_goes(exit_id):
+        worker = threading.Thread(target=lambda: person_opens(service, controller))
+        worker.start()
+        worker.join(10)
+        return real_pay(exit_id)
+
+    exits.exit_pay = person_opens_as_the_fee_goes
+    clock.tick()
+    controller.observe_exit_case()
+    assert vend.vend_count == 1
+    assert ("pay_cancel", "exit-1") in exits.exit_requests or "exit-1" in controller._cancels
