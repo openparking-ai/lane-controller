@@ -399,12 +399,13 @@ STAY = "stay-77"
 LOW_EXIT = VehicleIdentity(plate=STRANGER, confidence=0.42, presence=True, color_code="c-07")
 
 
-def an_exit_waiting(answer, *, stay=STAY, payment=None):
+def an_exit_waiting(answer, *, stay=STAY, payment=None, crossings=()):
     """An exit lane with the platform's exit cases wired, the car's case on
     payment and its fee handed to the reader: the gate shut until the case is
     settled. `stay`: the stay the platform found for the case (None: none)."""
     controller, vend, platform, scanner, presenter, loop = a_lane(
-        LOW_EXIT, direction="exit", transient=True, exits=True, presenter=answer)
+        LOW_EXIT, direction="exit", transient=True, exits=True, presenter=answer,
+        crossings=crossings)
     platform.exit_match_session = stay
     platform.exit_answer = {**CASE_PAYMENT, **({"payment": payment} if payment else {})}
     refused = controller.run_once()
@@ -1625,3 +1626,21 @@ def test_op_5_11_a_person_who_completes_while_the_qr_is_judged_takes_it_and_the_
     assert {"read": False} in calls, "the premise: the window was reached"
     assert vend.vend_count == 0, "the person's completion has the decision; the QR moved nothing"
     assert len(presenter.calls) == 1
+
+
+def test_op_5_5_a_car_let_out_by_hand_while_its_case_waits_is_a_held_close_naming_the_case():
+    """The platform down, a person raises the barrier by hand: the loops see
+    the car go with nothing pending. Its waiting case is taken, the close is
+    recorded held and names the case, and nothing opens for it again."""
+    controller, vend, platform, scanner, _ = an_exit_waiting(
+        Presenter(passed("same_plate")), crossings=((OCC, 0.0),))
+    platform.online = False
+    controller.run_once()  # an idle turn: the loops see the car go
+    assert controller._exit_case is None, "the case was the car's, and it has gone"
+    close = next(e for e in controller.events._queue if e.kind == "session_close")
+    assert close.detail["exit_confirmation"] == "held"
+    assert close.detail["exit_id"] == "exit-1"
+    assert vend.vend_count == 0
+    status, said = a_person_opens(controller)
+    assert status == 409 and said["code"] == "already_completed", said
+    assert vend.vend_count == 0

@@ -284,6 +284,9 @@ class LaneController:
         #: Who takes the case to open the barrier: the lane's turn when the
         #: case settles, or a person's vend at the lane. Exactly one does.
         self._exit_lock = threading.Lock()
+        #: The last `session_close` this lane recorded, for the caller that
+        #: keeps pictures against it (`_unpended_exit`).
+        self._last_close: LaneEvent | None = None
         #: Clear while a covered QR's ask-again is on the network: a person's
         #: vend waits for it (`EXIT_SUPERSEDE_WAIT_SECONDS`) and then takes the
         #: case the car is really on, so the close names that case.
@@ -2396,8 +2399,9 @@ class LaneController:
         an entry the wrong way, which is not an entry of any kind and has no
         name on the platform yet; it is logged, and it is the one thing this
         method sees and does not record. An EXIT lane's unpended crossing is
-        a car that left without paying, a different fact about different
-        money with no kind on the platform yet; logged, not recorded.
+        a car that left with no open command -- by hand, through a raised
+        barrier, behind another -- and is recorded as a held close for a
+        person (`_unpended_exit`).
         """
         if self.closing_loops is None:
             return None
@@ -2466,12 +2470,7 @@ class LaneController:
             )
             return None
         if self.config.direction != "entry":
-            log.warning(
-                "lane %s: a vehicle crossed this EXIT lane's loops with nothing pending; "
-                "a stay left unbilled, and no event kind names it yet",
-                lane,
-            )
-            return None
+            return self._unpended_exit(lane)
 
         at = to_iso(self._clock())
         log.warning(
@@ -2539,6 +2538,61 @@ class LaneController:
             self.events.queue_pictures(unadmitted.event_id, frames)
         self._unadmitted_leaves_the_box()
         return ENTRY_UNADMITTED
+
+    def _unpended_exit(self, lane: str) -> str | None:
+        """A car crossed this EXIT's loops with nothing pending: it left with
+        no open command -- a barrier raised by hand (the platform down, a
+        person letting the car out), a barrier that is up, a tailgater.
+
+        It used to be a log line and nothing else, so a hand let-out left no
+        record and the stay stayed open for ever. Now it is the close the
+        loops saw, recorded `held` -- a flag for a person, never a settled
+        exit -- in the outbox file like every close, with no decision the
+        barrier moved on (none was made) and the closing-loop pictures kept
+        against it. Only a crossing the camera says no car made records
+        nothing, exactly as at an entry.
+        """
+        frames = self._take_pictures(CLOSING_PICTURES)
+        identity = self._crossing_identity(frames)
+        if identity is None:
+            log.warning(
+                "lane %s: the loops after this EXIT's gate reported a crossing with nothing "
+                "pending and the camera saw no car; not recorded", lane,
+            )
+            return None
+        if self._late_admitted(identity):
+            # The car this lane let out and held, crossing after the window:
+            # its close was recorded `held` when the window ran out.
+            log.info("lane %s: the held exit's car crossed late; its close is recorded", lane)
+            return None
+        log.warning(
+            "lane %s: a vehicle crossed this EXIT lane's loops with nothing pending; recorded "
+            "as a held close for a person", lane,
+        )
+        at = to_iso(self._clock())
+        # A CASE WAITING FOR A CAR AT THE BARRIER is that car's, and it has
+        # gone: taken here as a person's vend takes it, under the same lock,
+        # so nothing opens for it again and its close names the case.
+        with self._exit_lock:
+            case, self._exit_case = self._exit_case, None
+            if case is not None:
+                case.taken = True
+                if self.last_decision_completed_at is None:
+                    self.last_decision_completed_at = at
+        exit_id = case.exit_id if case is not None else None
+        self.events.record(
+            EXIT_HELD, lane, reason=REASON_NO_PENDING_ENTRY, at=at,
+            geometry_assumed=self.config.loops.as_published(), no_open_command=True,
+            **({"exit_id": exit_id} if exit_id else {}),
+        )
+        self._record_session(identity, at, confirmation=HELD, exit_id=exit_id)
+        self.events.queue_pictures(self._last_close.event_id, frames)
+        if case is not None:
+            self._cancel_on_reader(case)
+            if self.exit_display is not None:
+                self.exit_display.show_exit(None)
+        self._unadmitted_leaves_the_box()
+        return EXIT_HELD
 
     def _unadmitted_leaves_the_box(self) -> None:
         """Flush, exactly as every other path that writes a record ends.
@@ -3025,7 +3079,7 @@ class LaneController:
             if exit_id is not None:
                 exit_id = self._close_follows.pop(exit_id, exit_id)
             let_out_by = self._take_let_out_by(exit_id)
-        self.events.record(
+        self._last_close = self.events.record(
             SESSION_CLOSE,
             lane,
             **self._identity_detail(identity, with_region=False),

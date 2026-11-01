@@ -564,8 +564,15 @@ driver's word for when they came in, or let out by a person.
 - **When it is settled**, the barrier opens, `vended` names the case, and the
   stay's close names it too. Then a text receipt goes to the phone the driver
   gave, once, best effort: after the barrier, never before it.
-- **A person can always open it**: `POST /v1/lane/vend` at the lane, or the
-  case's let-out on the platform. The lane drops the case when a person opens
+- **A person can always open it**: the case's let-out on the platform, or
+  `POST /v1/lane/vend` where the lane serves it -- an ENTRY lane; an exit lane
+  answers `can_vend: false` and serves no vend route. **With the platform down
+  a person raises the barrier by hand**, and the lane records it: a car the
+  loops after the gate see go with nothing pending is an `exit_held` event
+  (`no_open_command: true`) and a `session_close` recorded `held` -- in the
+  outbox file, with the closing-loop pictures kept against it, naming the case
+  the car was waiting on (which is then taken, so nothing opens for it again).
+  It is a flag for a person, never a settled exit. The lane drops the case when a person opens
   for the car, the close of that car names the case, and the barrier moves
   once: the vend claims the decision under the lock the case's own opening
   takes, and one that finds it already completed is refused
@@ -576,7 +583,9 @@ driver's word for when they came in, or let out by a person.
   log names this lane computer. A close the platform
   answers 503 `payment_unsettled` (the case's payment could not be settled
   with Stripe yet) stays in the outbox and is sent again, as any 5xx is.
-- **Offline**, a covered car still leaves; every other car waits for a person.
+- **Offline**, a covered car still leaves; every other car waits for a person,
+  who lets it out by hand (above): recorded as a held close, never free and
+  never unrecorded.
 
 What the case carries about the car is its ID -- the plate's positioned
 characters, the colour code and the size -- and never the plate text; a plate
