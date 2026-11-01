@@ -1600,3 +1600,28 @@ def test_a_lane_with_a_platform_wires_the_scanner_and_a_standalone_one_does_not(
     wired = wire_lane(config, platform=client)
     assert wired.controller.qr_presenter == client.redeem_enrolment
     assert wired.seams["qr"].startswith("SIMULATED")
+
+
+def test_op_5_11_a_person_who_completes_while_the_qr_is_judged_takes_it_and_the_qr_opens_nothing():
+    """The QR checked `last_decision_completed_at` without the lock, then read
+    the loops and vended: a person's completion landing between the two
+    vended too. The QR now claims the decision under `_exit_lock` first."""
+    controller, vend, platform, scanner, presenter, _ = a_lane(SEEN)
+    controller.run_once()
+    original = controller._car_at_the_barrier
+    calls = []
+
+    def a_person_completes_meanwhile(**kwargs):
+        # The last look at the barrier before the relay: the window.
+        calls.append(kwargs)
+        if kwargs.get("read") is False:
+            with controller._exit_lock:
+                controller.last_decision_completed_at = "2026-09-21T14:00:00+00:00"
+        return original(**kwargs)
+
+    controller._car_at_the_barrier = a_person_completes_meanwhile
+    scanner.scan(QR)
+    assert controller.run_once() is None
+    assert {"read": False} in calls, "the premise: the window was reached"
+    assert vend.vend_count == 0, "the person's completion has the decision; the QR moved nothing"
+    assert len(presenter.calls) == 1

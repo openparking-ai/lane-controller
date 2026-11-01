@@ -1441,10 +1441,10 @@ class LaneController:
         a log line.
 
         A person's completion (`POST /v1/lane/vend`) of the same refusal at
-        the same moment is checked against once more, just before the relay,
-        by `last_decision_completed_at`; the vend route checks the same value
-        on its own thread, so two completions in the same instant are not
-        excluded by a lock. Stated, not guarded.
+        the same moment is excluded by a lock: just before the relay the QR
+        CLAIMS the decision (`last_decision_completed_at`) under `_exit_lock`,
+        where `complete_vend` claims it too, so only one of them moves the
+        barrier and the other answers `already_completed` or opens nothing.
         """
         if self.qr_scanner is None:
             return None
@@ -1568,6 +1568,20 @@ class LaneController:
             # the exit is settled, and only through the one opener
             # (`_let_out`). The QR settles the car's case instead.
             return self._qr_settles_exit_case(qr_fields, cleared_for=exit_clear)
+        # THE CLAIM, under the lock `complete_vend` claims under: a person's
+        # completion that landed while the platform was asked has the decision.
+        with self._exit_lock:
+            claimed = (
+                self.last_decision_at == decided_at and self.last_decision_completed_at is None
+            )
+            if claimed:
+                self.last_decision_completed_at = to_iso(self._clock())
+        if not claimed:
+            log.warning(
+                "lane %s: a QR was answered for a refusal a person completed meanwhile; not "
+                "vended", lane
+            )
+            return None
         self.vend.vend(REASON_QR_OPENED)
         vended = self.events.record(
             "vended", lane, reason=REASON_QR_OPENED,
