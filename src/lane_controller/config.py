@@ -562,8 +562,22 @@ class LaneConfig:
             "stays_refresh_seconds",
             "pass_registers_offline_days",
             "refused_arming_seconds",
+            "rules_max_age_seconds",
         ):
             positive_finite(getattr(self, name), name)
+        # The threshold is a confidence, so finite and in (0, 1]: nan makes no
+        # read confident by accident of `>=`, and 0 or below makes every read
+        # confident -- the silent guess CONTRIBUTING refuses.
+        threshold = self.confidence_threshold
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not math.isfinite(threshold)
+            or not 0 < threshold <= 1
+        ):
+            raise ValueError(
+                f"confidence_threshold must be a finite number in (0, 1], got {threshold!r}"
+            )
         # The two cadences are ordered, and both sit inside the staleness
         # bound. A delta read less often than the full set it is a delta OF is
         # no delta; a full refresh slower than the age at which the cache stops

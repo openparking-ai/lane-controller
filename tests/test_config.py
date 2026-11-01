@@ -314,3 +314,48 @@ def test_the_gate_config_has_no_close_setting():
 
     fields = GateConfig.__dataclass_fields__.keys()
     assert not any("close" in f or "lower" in f for f in fields)
+
+
+# ---------------------------------------------------------------------------
+# OP-5-12: the confidence threshold and the cache's age bound are numbers too.
+#
+# `rules_refresh_seconds >= nan` is False, so `rules_max_age_seconds = nan`
+# passed the ordering check and left a cache that never goes stale; a
+# threshold of nan made every `confidence >= threshold` False, and a threshold
+# of 0 or -inf made every read confident.
+# ---------------------------------------------------------------------------
+
+
+def _lane(**overrides) -> LaneConfig:
+    return LaneConfig(
+        lane_id="lane-1",
+        site_id="site-1",
+        camera=CameraConfig(camera_id="c", rtsp_url="", frames_per_read=1),
+        gate=GateConfig(),
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize(
+    "value", [float("nan"), float("inf"), float("-inf"), 0, 0.0, -0.5, 1.01, True, "0.9"]
+)
+def test_a_confidence_threshold_outside_zero_to_one_is_refused(value):
+    with pytest.raises(ValueError, match="confidence_threshold"):
+        _lane(confidence_threshold=value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.0, -1.0])
+def test_a_rules_max_age_that_is_not_a_positive_finite_number_is_refused(value):
+    with pytest.raises(ValueError, match="rules_max_age_seconds"):
+        _lane(rules_max_age_seconds=value)
+
+
+@pytest.mark.parametrize("value", [0.5, 0.85, 1.0, 1])
+def test_the_control_a_threshold_in_range_is_accepted(value):
+    assert _lane(confidence_threshold=value).confidence_threshold == value
+
+
+def test_nan_threshold_and_max_age_from_a_real_toml_file_are_refused(tmp_path):
+    path = edited(tmp_path, r"^confidence_threshold\b", "confidence_threshold = nan")
+    with pytest.raises(ValueError, match="confidence_threshold"):
+        LaneConfig.from_file(path)
