@@ -454,3 +454,65 @@ def test_a_cache_file_from_an_earlier_build_is_cleaned_at_start(cache_dir):
     assert SECRET.encode() in path.read_bytes(), "the premise: the residue is in the file"
     DurableStore(path)
     assert SECRET.encode() not in path.read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# OP-5-6: the files are bound to the lane, garage and platform that wrote them.
+# ---------------------------------------------------------------------------
+
+
+def test_another_lanes_cache_is_wiped_and_this_lanes_is_kept(cache_dir):
+    from lane_controller.durable import store_identity
+
+    path = cache_dir / "c.sqlite"
+    mine = store_identity("lane-a", "site-1", "https://p.example")
+    DurableStore(path, identity=mine).write({"rules": {"A-1": "allow"}})
+    # THE CONTROL: the same lane restarting keeps what it held.
+    assert DurableStore(path, identity=mine).read() == {"rules": {"A-1": "allow"}}
+    for other in (
+        store_identity("lane-b", "site-1", "https://p.example"),
+        store_identity("lane-a", "site-2", "https://p.example"),
+        store_identity("lane-a", "site-1", "https://other.example"),
+    ):
+        DurableStore(path, identity=mine).write({"rules": {"A-1": "allow"}})
+        assert DurableStore(path, identity=other).read() is None
+
+
+def test_another_lanes_outbox_with_stays_in_it_is_refused_never_sent_or_dropped(cache_dir):
+    from lane_controller.durable import OutboxStore, StoreIdentityMismatch, store_identity
+    from lane_controller.events import LaneEvent
+
+    path = cache_dir / "o.sqlite"
+    mine = store_identity("lane-a", "site-1", None)
+    other = store_identity("lane-b", "site-1", None)
+    OutboxStore(path, identity=mine).add(
+        LaneEvent(kind="session_open", lane_id="lane-a", at=1.0, detail={"plate": "A-1"})
+    )
+    with pytest.raises(StoreIdentityMismatch):
+        OutboxStore(path, identity=other)
+    held = OutboxStore(path, identity=mine).held()
+    assert [e.detail["plate"] for e in held] == ["A-1"], "the stay is still there"
+
+
+def test_an_empty_outbox_of_another_lane_is_taken_and_an_unstamped_one_is_adopted(cache_dir):
+    from lane_controller.durable import OutboxStore, StoreIdentityMismatch, store_identity
+
+    path = cache_dir / "o.sqlite"
+    OutboxStore(path)  # an earlier build: no stamp
+    OutboxStore(path, identity=store_identity("lane-a", "s", None))
+    OutboxStore(path, identity=store_identity("lane-b", "s", None))  # empty: re-stamped
+    with pytest.raises(StoreIdentityMismatch):
+        store = OutboxStore(path, identity=store_identity("lane-b", "s", None))
+        from lane_controller.events import LaneEvent
+
+        store.add(LaneEvent(kind="session_open", lane_id="lane-b", at=1.0, detail={}))
+        OutboxStore(path, identity=store_identity("lane-a", "s", None))
+
+
+def test_wire_lane_stamps_the_cache_with_the_configured_lane(cache_dir):
+    path = cache_dir / "c.sqlite"
+    first = cli.wire_lane(a_config(cache_path=str(path)), platform=None)
+    first.controller.cache.load([Rule(plate="A-1", allow=True)], default_action="allow")
+    assert DurableStore(path).read() is not None
+    cli.wire_lane(a_config(cache_path=str(path), lane_id="lane-other"), platform=None)
+    assert DurableStore(path).read() is None or not DurableStore(path).read().get("rules")

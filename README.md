@@ -260,7 +260,11 @@ outbox's stay opens and closes are kept beside it** (`decision-cache.outbox.sqli
 beside `decision-cache.sqlite`, same directory rule, 0600), with the pictures
 kept with the entries, written as each is recorded and removed once the platform
 has taken or refused it, so a restart during an outage loses none of them; the
-lane sends them first thing, in the order they happened. **The writes are made
+lane sends them first thing, in the order they happened. **Both files are
+stamped with the lane, garage and platform they were written for**: a cache
+written for another is wiped at start, and an outbox written for another that
+still holds stays refuses to start (`serve` exits 2 saying so) rather than
+sending them as this lane's or dropping them. **The writes are made
 by the outbox's own disk thread, never by the lane thread** (`events.DiskWriter`):
 a stay is recorded on the thread that decides the next car, and a disk that is
 slow or hung used to hold that car on SQLite's write; now it holds nothing on the

@@ -66,11 +66,19 @@ cache and not bounded by `rules_max_age_seconds`: each is held until the
 platform has taken it or refused it, and not after. The pictures kept with an
 entry are kept in the same file, on the same terms. Both are written by the
 outbox's own disk thread (`events.DiskWriter`), never by the lane's.
+
+BOTH FILES ARE STAMPED with the lane, garage and platform that wrote them
+(`store_identity`: a hash of `lane_id`, `site_id` and `server_url`). A cache
+written for another is wiped at start and refilled; an outbox written for
+another that still holds anything is refused (`StoreIdentityMismatch`) --
+never sent under this lane's token, never thrown away.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import sqlite3
 import stat
@@ -78,6 +86,8 @@ import threading
 from pathlib import Path
 
 from .events import LaneEvent, Picture
+
+log = logging.getLogger(__name__)
 
 #: The file's mode, applied on every write and not only at creation: SQLite
 #: may recreate the file, and a mode set once is a mode that can be undone.
@@ -96,6 +106,34 @@ PICTURES_MAX_BYTES = 1 << 30
 #: shape is not read as this one; it is discarded and refilled at the next
 #: refresh, which is what a cache is for.
 FORMAT = 1
+
+
+class StoreIdentityMismatch(Exception):
+    """The outbox file was written by a different lane, garage or platform than
+    the one this process is configured as, and it still holds stays. Sending
+    them under this lane's token would report another lane's cars; wiping them
+    would lose them. Raised at construction, before the port opens: a person
+    decides (point `[lane] cache_path` elsewhere, or restore the config)."""
+
+
+def store_identity(lane_id: str, site_id: str, server_url: str | None) -> str:
+    """The fingerprint both stores are stamped with: which lane, at which
+    garage, reporting to which platform. A hash, so the file says nothing more
+    about the installation than the configuration file beside it does."""
+    text = json.dumps([lane_id, site_id, server_url or ""])
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _stamped(connection) -> str | None:
+    connection.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    row = connection.execute("SELECT value FROM meta WHERE key = 'identity'").fetchone()
+    return row[0] if row else None
+
+
+def _stamp(connection, identity: str) -> None:
+    connection.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('identity', ?)", (identity,)
+    )
 
 
 class CacheDirectoryUnsafe(Exception):
@@ -176,7 +214,7 @@ class DurableStore:
     the refresh thread's writes and a wipe from interleaving.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, identity: str | None = None) -> None:
         path = Path(path)
         self.directory = ensure_cache_directory(path.parent)
         self.path = self.directory / path.name
@@ -186,6 +224,23 @@ class DurableStore:
                 "CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, format INTEGER NOT NULL, "
                 "state TEXT NOT NULL)"
             ))
+            if identity is not None:
+                # ANOTHER LANE'S CACHE IS NOT THIS LANE'S RULES: wiped, and
+                # refilled at the next refresh -- a cache is for that. A file
+                # with no stamp is this build's first start on it, and taken.
+                def bind(connection):
+                    held = _stamped(connection)
+                    if held is not None and held != identity:
+                        connection.execute("DELETE FROM cache")
+                    _stamp(connection, identity)
+                    return held
+
+                held = self._with_connection(bind)
+                if held is not None and held != identity:
+                    log.error(
+                        "the decision cache at %s was written for another lane, garage or "
+                        "platform; wiped", self.path,
+                    )
             # A file written by an earlier build may still carry deleted rows
             # in its free pages; the cache is one small row, so rebuilding it
             # once at start is cheap and leaves none.
@@ -291,7 +346,13 @@ class OutboxStore:
     EVERY WRITE COMES FROM `events.DiskWriter`'s thread, never the lane's.
     """
 
-    def __init__(self, path: str | Path, *, pictures_max_bytes: int = PICTURES_MAX_BYTES) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        pictures_max_bytes: int = PICTURES_MAX_BYTES,
+        identity: str | None = None,
+    ) -> None:
         path = Path(path)
         self.directory = ensure_cache_directory(path.parent)
         self.path = self.directory / path.name
@@ -312,6 +373,28 @@ class OutboxStore:
             _touch(self.path, lambda c: c.execute(
                 "CREATE TABLE IF NOT EXISTS cancels (exit_id TEXT PRIMARY KEY, at REAL NOT NULL)"
             ))
+            if identity is not None:
+                _touch(self.path, lambda c: self._bind(c, identity))
+
+    def _bind(self, connection, identity: str) -> None:
+        """Stamp the file with this lane's identity -- or refuse it. An outbox
+        of another lane that still holds anything is never sent as this one's
+        and never thrown away: `StoreIdentityMismatch`. An empty one is
+        re-stamped; one with no stamp (an earlier build) is taken."""
+        held = _stamped(connection)
+        if held is not None and held != identity:
+            waiting = sum(
+                connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                for table in ("outbox", "pictures", "cancels")
+            )
+            if waiting:
+                raise StoreIdentityMismatch(
+                    f"the outbox at {self.path} was written for another lane, garage or "
+                    f"platform and still holds {waiting} item(s). They are not sent as this "
+                    "lane's and not thrown away: restore the configuration that wrote them, "
+                    "or point [lane] cache_path at a new directory and keep this file."
+                )
+        _stamp(connection, identity)
 
     def add(self, event: LaneEvent) -> None:
         detail = json.dumps(event.detail, sort_keys=True)

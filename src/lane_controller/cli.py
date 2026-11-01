@@ -38,7 +38,14 @@ from pathlib import Path
 from .config import LaneConfig
 from .controller import LaneController
 from .decision import DecisionCache
-from .durable import CacheDirectoryUnsafe, DurableStore, OutboxStore, outbox_path
+from .durable import (
+    CacheDirectoryUnsafe,
+    DurableStore,
+    OutboxStore,
+    StoreIdentityMismatch,
+    outbox_path,
+    store_identity,
+)
 from .events import EventQueue
 from .platform_client import PlatformClient
 from .runner import LaneRunner
@@ -201,9 +208,13 @@ def wire_lane(
     # recorded and removed once the platform has taken it, so a restart during
     # an outage loses none of them (`durable.OutboxStore`). Same directory,
     # same rule; refused by the same exception if the directory is not ours.
+    # BOTH FILES ARE STAMPED with which lane, garage and platform wrote them:
+    # another lane's cache is wiped, another lane's unsent outbox is refused.
+    identity = store_identity(config.lane_id, config.site_id, config.server_url)
     outbox = (
         OutboxStore(
-            outbox_path(config.cache_path), pictures_max_bytes=config.outbox_pictures_max_bytes
+            outbox_path(config.cache_path), pictures_max_bytes=config.outbox_pictures_max_bytes,
+            identity=identity,
         )
         if platform is not None and config.cache_path
         else None
@@ -249,7 +260,7 @@ def wire_lane(
         # `cmd_serve`, which prints it and exits 2 before the port opens.
         cache = DecisionCache(
             max_age_seconds=config.rules_max_age_seconds,
-            store=DurableStore(config.cache_path),
+            store=DurableStore(config.cache_path, identity=identity),
             pass_registers_offline_s=config.pass_registers_offline_days * 86_400.0,
         )
         held = "restored" if cache.default_action is not None or cache.stays_cursor else "empty"
@@ -380,7 +391,7 @@ def cmd_serve(args) -> int:
             config, platform=platform,
             vehicle_id_token=_token(args.vehicle_id_token_file, "--vehicle-id-token-file"),
         )
-    except CacheDirectoryUnsafe as exc:
+    except (CacheDirectoryUnsafe, StoreIdentityMismatch) as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 2
     service = LaneService(wired.controller)
