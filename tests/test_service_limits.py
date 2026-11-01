@@ -11,11 +11,10 @@ import socket
 import time
 import urllib.request
 
-from serving import serving
-from test_lane_contract import full_lane
-
 from lane_controller import service as service_module
 from lane_controller.service import LaneService, _Handler, make_server
+from serving import serving
+from test_lane_contract import full_lane
 
 
 def _address(base: str) -> tuple[str, int]:
