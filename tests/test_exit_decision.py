@@ -822,3 +822,82 @@ def test_the_control_a_deny_garage_still_turns_strangers_away_at_the_entry():
     controller, vend = lane(cache, "NEW-1", direction="entry")
     decision = controller.run_once()
     assert decision.outcome.value == "deny" and not vend.vends
+
+
+# ---------------------------------------------------------------------------
+# OP-5-1: a register the platform stops carrying is not kept for ever.
+#
+# The rule "a module with no `register` keeps what the cache held" is for an
+# outage of that module's door. Without a bound, a module the owner unlinked
+# (`consulted: false`) or a door that never came back left a cancelled,
+# unpaid or revoked holder leaving COVERED indefinitely, and the register on
+# the box for good.
+# ---------------------------------------------------------------------------
+
+
+def test_a_module_the_owner_unlinked_covers_nobody_and_leaves_the_box(tmp_path):
+    from lane_controller.durable import CACHE_DIR_MODE, DurableStore
+
+    directory = tmp_path / "c"
+    directory.mkdir(mode=CACHE_DIR_MODE)
+    directory.chmod(CACHE_DIR_MODE)
+    platform = a_platform(gp=gp_register(gp_row("PASS-1")))
+    cache = DecisionCache(max_age_seconds=3600, store=DurableStore(directory / "c.sqlite"))
+    cache.load_payload(platform.get_rules(), now=NOW)
+    assert price_exit("PASS-1", cache, now=NOW).status == COVERED, "the premise"
+
+    platform.entitlements["garage_pass"] = {"consulted": False, "reason": "not linked"}
+    cache.load_payload(platform.get_rules(), now=NOW + 60)
+    assert "garage_pass" not in cache.entitlements
+    assert price_exit("PASS-1", cache, now=NOW + 60).status != COVERED
+    assert "PASS-1" not in json.dumps(DurableStore(directory / "c.sqlite").read())
+
+
+def test_a_register_kept_through_a_failed_door_past_the_bound_is_stale_facts():
+    platform = a_platform(gp=gp_register(gp_row("PASS-1")))
+    cache = DecisionCache(max_age_seconds=3600, pass_registers_offline_s=7 * 86_400)
+    cache.load_payload(platform.get_rules(), now=NOW)
+    platform.entitlements["garage_pass"] = {
+        "consulted": True, "unavailable": "the module did not answer",
+    }
+    # THE CONTROL: inside the bound the kept register still covers, as it always did.
+    cache.load_payload(platform.get_rules(), now=NOW + 1800)
+    assert price_exit("PASS-1", cache, now=NOW + 1800).status == COVERED
+    # Past it, never out free: the exit's case decides.
+    cache.load_payload(platform.get_rules(), now=NOW + 4000)
+    answer = price_exit("PASS-1", cache, now=NOW + 4000)
+    assert answer.status == STALE_FACTS and answer.covered_by == ()
+    # A car the stale register does not name is priced as before.
+    assert price_exit("OTHER-9", cache, now=NOW + 4000).status == NO_CACHED_ENTRY
+    # Past the ceiling it is not held at all.
+    cache.load_payload(platform.get_rules(), now=NOW + 8 * 86_400)
+    assert "garage_pass" not in cache.entitlements
+
+
+def test_a_register_the_platform_carries_again_covers_again():
+    platform = a_platform(gp=gp_register(gp_row("PASS-1")))
+    cache = DecisionCache(max_age_seconds=3600)
+    cache.load_payload(platform.get_rules(), now=NOW)
+    held = platform.entitlements["garage_pass"]
+    platform.entitlements["garage_pass"] = {"consulted": True, "unavailable": "down"}
+    cache.load_payload(platform.get_rules(), now=NOW + 4000)
+    assert price_exit("PASS-1", cache, now=NOW + 4000).status == STALE_FACTS
+    platform.entitlements["garage_pass"] = held
+    cache.load_payload(platform.get_rules(), now=NOW + 4100)
+    assert price_exit("PASS-1", cache, now=NOW + 4100).status == COVERED
+
+
+def test_the_received_time_survives_a_restart(tmp_path):
+    from lane_controller.durable import CACHE_DIR_MODE, DurableStore
+
+    directory = tmp_path / "c"
+    directory.mkdir(mode=CACHE_DIR_MODE)
+    directory.chmod(CACHE_DIR_MODE)
+    path = directory / "c.sqlite"
+    platform = a_platform(gp=gp_register(gp_row("PASS-1")))
+    cache = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    cache.load_payload(platform.get_rules(), now=time.time() - 3000)
+    platform.entitlements["garage_pass"] = {"consulted": True, "unavailable": "down"}
+    restarted = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
+    restarted.load_payload(platform.get_rules(), now=time.time() + 1000)
+    assert restarted.register_past_bound("garage_pass")

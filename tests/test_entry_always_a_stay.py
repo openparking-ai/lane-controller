@@ -1209,3 +1209,23 @@ def test_at_a_pass_only_garage_the_owners_rule_comes_before_the_registers():
     assert vend.vend_count == 0
     holder, vend, _ = a_lane([HOLDER_SEEN], transient=False, register=a_register())
     assert holder.run_once().outcome is Outcome.ALLOW, "the control: no rule, the pass opens"
+
+
+def test_op_5_1_a_pass_only_entry_on_a_register_past_its_age_goes_to_a_person():
+    """A register the platform has not carried for longer than the cache's
+    bound neither lets the car in nor refuses it: a person decides."""
+    platform = a_pass_only_platform()
+    cache = DecisionCache(max_age_seconds=3600)
+    cache.load_payload(platform.get_rules(), now=time.time() - 4000)
+    platform.entitlements["garage_pass"] = {"consulted": True, "unavailable": "down"}
+    cache.load_payload(platform.get_rules(), now=time.time())
+    controller, vend, _ = a_lane([HOLDER_SEEN], cache=cache)
+    decision = controller.run_once()
+    assert decision.outcome is Outcome.FALLBACK, decision
+    assert "past its age" in decision.reason
+    assert vend.vend_count == 0
+    # THE CONTROL: the same register carried again lets the monthly in.
+    platform.entitlements["garage_pass"] = {"consulted": True, "register": a_register()}
+    cache.load_payload(platform.get_rules(), now=time.time())
+    controller, vend, _ = a_lane([HOLDER_SEEN], cache=cache)
+    assert controller.run_once().outcome is Outcome.ALLOW
