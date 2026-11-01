@@ -186,6 +186,10 @@ class DurableStore:
                 "CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, format INTEGER NOT NULL, "
                 "state TEXT NOT NULL)"
             ))
+            # A file written by an earlier build may still carry deleted rows
+            # in its free pages; the cache is one small row, so rebuilding it
+            # once at start is cheap and leaves none.
+            _vacuum(self.path)
 
     def _with_connection(self, action):
         return _touch(self.path, action)
@@ -219,15 +223,31 @@ class DurableStore:
 def _touch(path: Path, action):
     """One connection, one transaction, `action` run inside it -- and the file
     narrowed AFTER every touch, not only at creation. The one way both stores
-    here open their file."""
+    here open their file.
+
+    `secure_delete` on every connection: without it a DELETE, or the row an
+    INSERT OR REPLACE replaces, only marks its pages free and the plate, the
+    identity or the stay stays readable in the file until SQLite happens to
+    reuse the page -- past the bound this module promises. With it SQLite
+    zeroes the freed content as it frees it."""
     connection = sqlite3.connect(path)
     try:
+        connection.execute("PRAGMA secure_delete = ON")
         with connection:
             result = action(connection)
     finally:
         connection.close()
     os.chmod(path, CACHE_FILE_MODE)
     return result
+
+
+def _vacuum(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("VACUUM")
+    finally:
+        connection.close()
+    os.chmod(path, CACHE_FILE_MODE)
 
 
 def outbox_path(cache_path: str | Path) -> Path:

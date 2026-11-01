@@ -393,3 +393,64 @@ def test_the_example_config_names_the_bound_and_the_forgery_path():
     assert "# cache_path =" in example
     assert "rules_max_age_seconds above" in example and "opens the barrier" in example
     assert os.path.isabs("/var/lib/lane-controller/decision-cache.sqlite")
+
+
+# ---------------------------------------------------------------------------
+# OP-5-13: a row deleted or replaced is gone from the FILE, not only the table.
+#
+# SQLite's DELETE marks pages free and leaves their bytes where they were, so
+# a plate that left the register, a wiped cache or a delivered stay could be
+# read straight out of the file with `strings`. The bytes of the file are the
+# test, not what a SELECT returns.
+# ---------------------------------------------------------------------------
+
+SECRET = "ZZ-SECRET-PLATE-0513"
+
+
+def _a_state_with(plate: str) -> dict:
+    return {"rules": {plate: "allow"}, "padding": "x" * 20_000}
+
+
+def test_a_replaced_or_wiped_cache_leaves_no_plate_in_the_file(cache_dir):
+    path = cache_dir / "c.sqlite"
+    store = DurableStore(path)
+    store.write(_a_state_with(SECRET))
+    assert SECRET.encode() in path.read_bytes(), "the premise: the plate is on disk"
+
+    store.write(_a_state_with("OTHER"))
+    assert SECRET.encode() not in path.read_bytes(), "a replaced row left the plate behind"
+
+    store.write(_a_state_with(SECRET))
+    store.wipe()
+    assert SECRET.encode() not in path.read_bytes(), "a wiped row left the plate behind"
+
+
+def test_a_removed_outbox_action_leaves_no_plate_in_the_file(cache_dir):
+    from lane_controller.durable import OutboxStore
+    from lane_controller.events import LaneEvent
+
+    path = cache_dir / "o.sqlite"
+    store = OutboxStore(path)
+    event = LaneEvent(kind="session_open", lane_id="l", at=1.0,
+                      detail={"plate": SECRET, "padding": "x" * 20_000})
+    store.add(event)
+    assert SECRET.encode() in path.read_bytes(), "the premise: the plate is on disk"
+    store.remove([event.event_id])
+    assert SECRET.encode() not in path.read_bytes()
+
+
+def test_a_cache_file_from_an_earlier_build_is_cleaned_at_start(cache_dir):
+    """A file whose deleted row sits in a free page from before secure_delete."""
+    path = cache_dir / "c.sqlite"
+    DurableStore(path)
+    connection = sqlite3.connect(path)
+    with connection:
+        connection.execute(
+            "INSERT INTO cache (key, format, state) VALUES ('old', 1, ?)", (SECRET * 2000,)
+        )
+    with connection:
+        connection.execute("DELETE FROM cache WHERE key = 'old'")
+    connection.close()
+    assert SECRET.encode() in path.read_bytes(), "the premise: the residue is in the file"
+    DurableStore(path)
+    assert SECRET.encode() not in path.read_bytes()
