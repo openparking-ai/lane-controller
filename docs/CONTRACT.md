@@ -709,6 +709,13 @@ refuses a skew exactly as it refuses everything else, so this code answers
 attempted no platform call at all: nothing was sent, so nothing could have been
 refused, and a clock nobody has had checked is not a clock found correct.
 
+`platform_unreachable` reads the outbox's last platform call: `active` when it
+did not reach the platform, and **also when the platform refused this lane
+itself** — a `401` or `403`, or a `404` the lane's own rules read confirms. Then
+nothing queued is dropped: the stays' opens and closes stay in the outbox, the
+flush stops, and this code is the only thing that says why it is not draining.
+`ok` once a call is answered; `unknown` before any call, or with no platform.
+
 **It recovers.** The next write the platform ACCEPTS clears both, so the code
 reads `ok` again once the clock is fixed and the lane is being taken. A code
 that could only ever go one way would be a latch that reads like a state:

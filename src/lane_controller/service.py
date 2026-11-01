@@ -450,6 +450,7 @@ class LaneService:
             MalfunctionCode.IDENTITY_SERVICE_DEGRADED: self._identity_service_degraded(),
             MalfunctionCode.OUTBOX_DEPTH_GROWING: self._outbox_depth_growing(),
             MalfunctionCode.SESSION_ACTIONS_DEAD_LETTERED: self._dead_lettered(),
+            MalfunctionCode.PLATFORM_UNREACHABLE: self._platform_unreachable(),
             MalfunctionCode.CLOCK_SKEW_REJECTED: self._clock_skew_rejected(),
             MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED: self._arming_loop_stuck(),
             MalfunctionCode.DEACTIVATE_LOOP_STUCK_OCCUPIED: self._deactivate_loop_stuck(),
@@ -769,6 +770,23 @@ class LaneService:
         if transport is None or not isinstance(rejected, int):
             return HealthState.UNKNOWN
         return HealthState.ACTIVE if rejected else HealthState.OK
+
+    def _platform_unreachable(self) -> HealthState:
+        """`active` while the outbox's last call did not reach the platform,
+        or the platform refused THIS LANE (401, 403, a confirmed 404) -- the
+        outbox is held then, and nothing but this says why it is not draining.
+
+        `unknown` with no transport, or before it has made a call.
+        """
+        transport = self.controller.events.transport
+        if transport is None:
+            return HealthState.UNKNOWN
+        if getattr(transport, "lane_refused", None) is not None:
+            return HealthState.ACTIVE
+        reachable = getattr(transport, "reachable", None)
+        if reachable is None:
+            return HealthState.UNKNOWN
+        return HealthState.OK if reachable else HealthState.ACTIVE
 
     # --- GET /v1/lane/events ----------------------------------------------
 

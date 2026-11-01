@@ -747,7 +747,7 @@ SOURCES: dict[MalfunctionCode, Source] = {
     MalfunctionCode.IDENTITY_SERVICE_DOWN: Source.MEASURED,
     MalfunctionCode.IDENTITY_SERVICE_DEGRADED: Source.MEASURED,
     MalfunctionCode.IDENTITY_SERVICE_UNMEASURED_WEIGHTS: Source.NO_SOURCE,
-    MalfunctionCode.PLATFORM_UNREACHABLE: Source.NO_SOURCE,
+    MalfunctionCode.PLATFORM_UNREACHABLE: Source.MEASURED,
     MalfunctionCode.LANE_GONE_QUIET: Source.NOT_MEASURED,
     MalfunctionCode.OUTBOX_DEPTH_GROWING: Source.MEASURED,
     MalfunctionCode.SESSION_ACTIONS_DEAD_LETTERED: Source.MEASURED,
