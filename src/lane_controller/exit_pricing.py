@@ -82,6 +82,7 @@ with what the modules would have said.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -89,6 +90,31 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from rate_engine.contract import run_quote, run_tax
 
 from .decision import DecisionCache
+
+
+def _engine_identity() -> dict:
+    """Which rate engine this lane prices with: the installed version and,
+    when it was installed from a pinned commit, that commit. The lane and the
+    platform each pin the engine, and a number the barrier showed is only the
+    platform's number if both ran the same engine -- so the decision says
+    which one it ran. Unknown parts are None, never guessed."""
+    from importlib import metadata
+
+    try:
+        dist = metadata.distribution("openparking-rate-engine")
+    except metadata.PackageNotFoundError:
+        return {"version": None, "commit": None}
+    commit = None
+    try:
+        direct = json.loads(dist.read_text("direct_url.json") or "{}")
+        commit = (direct.get("vcs_info") or {}).get("commit_id")
+    except (ValueError, AttributeError):
+        commit = None
+    return {"version": dist.version, "commit": commit}
+
+
+#: Read once: the engine in this process does not change while it runs.
+RATE_ENGINE = _engine_identity()
 
 COVERED = "covered"
 PRICED = "priced"
@@ -146,6 +172,8 @@ class ExitPricing:
         }
         if self.status in (PRICED, ENGINE_REFUSED, ENGINE_INVALID):
             detail.update(
+                # The engine that produced this answer (`RATE_ENGINE`).
+                rate_engine=dict(RATE_ENGINE),
                 entry_at=self.entry_at,
                 exit_at=self.exit_at,
                 session_id=self.session_id,

@@ -901,3 +901,23 @@ def test_the_received_time_survives_a_restart(tmp_path):
     restarted = DecisionCache(max_age_seconds=3600, store=DurableStore(path))
     restarted.load_payload(platform.get_rules(), now=time.time() + 1000)
     assert restarted.register_past_bound("garage_pass")
+
+
+# ---------------------------------------------------------------------------
+# OP-11-11: the decision says which rate engine priced it.
+# ---------------------------------------------------------------------------
+
+
+def test_a_priced_decision_names_the_engine_that_priced_it_and_a_covered_one_does_not():
+    from importlib import metadata
+
+    cache = a_cache(a_platform(stays=[("s-1", "CAR-1", ENTRY)]))
+    priced = price_exit("CAR-1", cache, now=NOW)
+    assert priced.status == PRICED
+    engine = priced.to_detail()["rate_engine"]
+    assert engine["version"] == metadata.version("openparking-rate-engine")
+    pinned = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    if engine["commit"] is not None:
+        assert engine["commit"] in pinned.read_text(), "the commit installed is the one pinned"
+    covered = a_cache(a_platform(gp=gp_register(gp_row("PASS-1"))))
+    assert "rate_engine" not in price_exit("PASS-1", covered, now=NOW).to_detail()

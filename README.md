@@ -243,7 +243,10 @@ never read back from "the last one"): a platform at migration 0017 or later
 card and the row are one computation, and its reconciler re-derives the number
 out of band from what the decision says it was computed from. A platform that
 does not consume it says why on the row; an older platform ignores the field
-and prices as before. `tests/test_close_decision.py` holds the seam, and
+and prices as before. A decision the engine answered names the engine that
+answered it (`rate_engine`: the installed version and the commit it was pinned
+to), so a fee priced by a lane whose pin differs from the platform's can be
+told apart on the row. `tests/test_close_decision.py` holds the seam, and
 `scripts/close_decision_fail_control.py` breaks it eight ways.
 
 **And it works after a restart with the internet down**, when `[lane]

@@ -401,3 +401,13 @@ def test_a_drop_on_the_lane_thread_and_a_delta_on_the_refresh_thread_lose_neithe
     assert failures == []
     assert not [sid for sid in cache.stays if sid.startswith("s-")], "a drop was lost"
     assert len([sid for sid in cache.stays if sid.startswith("n-")]) == held, "a delta was lost"
+
+
+def test_op_11_11_a_priced_close_tells_the_platform_which_engine_priced_it():
+    from lane_controller.exit_pricing import RATE_ENGINE
+
+    platform = with_open_stay(a_platform(stays=[("s-7", "TRNS-7", ENTRY)]), "TRNS-7")
+    controller = lane(platform, "TRNS-7")
+    assert controller.run_once().exit_pricing.status == PRICED
+    delivered = platform.closed[-1]["local_decision"]
+    assert delivered["rate_engine"] == RATE_ENGINE and RATE_ENGINE["version"]
