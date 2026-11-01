@@ -1113,10 +1113,15 @@ a browser history, none of which anybody decided. Serving such a request would
 hand the caller a working integration that publishes its own credential on every
 call.
 
-**Loopback takes neither**, exactly as the reads do. Off loopback the service
-**refuses to start** without both — the read token because this publishes where
-a vehicle was, and the act token for the larger reason that the exposed thing is
-no longer a description of a lane, it is a barrier.
+**The reads on loopback take no token; the vend always takes its own.** Off
+loopback the service **refuses to start** without both — the read token because
+this publishes where a vehicle was, and the act token for the larger reason that
+the exposed thing is no longer a description of a lane, it is a barrier. On
+loopback a lane with no act token answers this route `403`: loopback is every
+process on the box and any browser page that rebinds a DNS name to `127.0.0.1`.
+The route also answers `403` when `Host` is not loopback or the bound address (a
+lane bound to every interface accepts any IP literal, never a name), and `415`
+for a body not sent as `application/json`.
 
 ### What is on this route and what is not
 

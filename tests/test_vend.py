@@ -272,12 +272,26 @@ def test_a_lane_with_an_act_token_and_no_read_token_still_serves_the_reads():
         assert _post(base, "/v1/lane/vend", {}, token=None)[0] == 401
 
 
-def test_a_loopback_lane_with_no_credentials_serves_the_vend():
-    """The default, and the control on every 403 above."""
+def test_a_loopback_lane_with_no_credentials_serves_no_vend():
+    """OP-5-2: loopback is every process on the box, and any browser whose page
+    rebinds a DNS name to 127.0.0.1. The barrier takes its own token there too."""
     controller = a_lane_awaiting_a_completion()
     service = LaneService(controller)
     with serving(make_server(service, port=0)) as base:
-        status, accepted = _post(base, "/v1/lane/vend", body(controller))
+        status, refused = _post(base, "/v1/lane/vend", body(controller))
+        assert status == 403, refused
+        assert "no credential configured" in refused["error"]
+        # The reads are still the loopback default.
+        assert _get(base, "/v1/lane")[0] == 200
+    assert controller.vend.vend_count == 0
+
+
+def test_a_loopback_lane_with_the_act_token_serves_the_vend():
+    """The control on every 403 above."""
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    with serving(make_server(service, port=0, act_token=ACT_TOKEN)) as base:
+        status, accepted = _post(base, "/v1/lane/vend", body(controller), token=ACT_TOKEN)
         assert status == 202, accepted
         assert accepted["vend_commanded"] is True
         assert "opened" not in accepted, "nothing here measures the boom"
@@ -286,6 +300,44 @@ def test_a_loopback_lane_with_no_credentials_serves_the_vend():
         assert isinstance(accepted["event_cursor"], int)
     settled(service)
     assert controller.vend.vend_count == 1
+
+
+def test_a_vend_whose_host_is_a_name_that_is_not_this_lane_is_refused():
+    """OP-5-2: a DNS-rebinding page arrives with ITS name in Host."""
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    with serving(make_server(service, port=0, act_token=ACT_TOKEN)) as base:
+        port = base.rsplit(":", 1)[1]
+        for host in (f"attacker.example:{port}", "rebind.127.0.0.1.nip.io", ""):
+            status, refused = _post(
+                base, "/v1/lane/vend", body(controller), token=ACT_TOKEN,
+                headers={"Host": host},
+            )
+            assert status == 403, (host, refused)
+            assert "Host" in refused["error"]
+        assert controller.vend.vend_count == 0
+        # THE CONTROL: loopback by name is this lane.
+        status, accepted = _post(
+            base, "/v1/lane/vend", body(controller), token=ACT_TOKEN,
+            headers={"Host": f"localhost:{port}"},
+        )
+        assert status == 202, accepted
+    settled(service)
+    assert controller.vend.vend_count == 1
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "application/x-www-form-urlencoded", ""])
+def test_a_vend_that_is_not_sent_as_json_is_refused(content_type):
+    """OP-5-2: text/plain is what a cross-site form sends without asking first."""
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    with serving(make_server(service, port=0, act_token=ACT_TOKEN)) as base:
+        status, refused = _post(
+            base, "/v1/lane/vend", body(controller), token=ACT_TOKEN,
+            headers={"Content-Type": content_type},
+        )
+        assert status == 415, refused
+    assert controller.vend.vend_count == 0
 
 
 # ---------------------------------------------------------------------------

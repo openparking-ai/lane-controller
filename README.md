@@ -347,7 +347,9 @@ What makes that safe is enforced, not promised:
   order, asserted by a test that records every call.
 - **A read token never authorises an act.** The vend takes a second token from
   `--act-token-file`; each is `403` on the other's routes, and either in a query
-  string is `401`.
+  string is `401`. The vend takes its token on loopback too (`403` without one),
+  and refuses a `Host` that is not this lane's address and a body that is not
+  `application/json`.
 - **The answer is `vend_commanded`, never `opened`.** Nothing in this system
   measures the boom, and this lane's own health surface says so.
 
