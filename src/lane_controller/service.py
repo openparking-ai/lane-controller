@@ -826,6 +826,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     server_version = "openparking-lane-controller"
     sys_version = ""
+    #: Seconds a connection may sit silent before it is dropped. Without it a
+    #: client that opens a socket and sends nothing holds a thread for ever.
+    timeout = 10
 
     def log_message(self, fmt: str, *args) -> None:
         log.debug("%s - %s", self.address_string(), fmt % args)
@@ -1089,6 +1092,37 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+#: How many connections are served at once. Past it a new one is closed at
+#: once: a lane is asked by a monitor, an intercom and a person's screen, not
+#: by hundreds, and a thread per idle socket is how a box runs out of them.
+MAX_CONNECTIONS = 32
+
+
+class _BoundedServer(ThreadingHTTPServer):
+    """`ThreadingHTTPServer` with a ceiling on the threads it starts."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._slots.acquire(blocking=False):
+            log.warning("lane service at %d connections; closing a new one", MAX_CONNECTIONS)
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 def make_server(
     service: LaneService,
     host: str = "127.0.0.1",
@@ -1108,13 +1142,14 @@ def make_server(
         (_Handler,),
         {"service": service, "token": token or None, "act_token": act_token or None},
     )
-    return ThreadingHTTPServer((host, port), handler)
+    return _BoundedServer((host, port), handler)
 
 
 __all__ = [
     "ACT_ROUTES",
     "CREDENTIAL_QUERY_KEYS",
     "MAX_BODY_BYTES",
+    "MAX_CONNECTIONS",
     "READ_ROUTES",
     "InsecureBind",
     "LaneService",
