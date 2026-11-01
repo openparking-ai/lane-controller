@@ -94,6 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
              "credential with nothing to present it to is a credential lying around. A FILE, "
              "for the same reason as the other two",
     )
+    serve.add_argument(
+        "--vehicle-id-token-file",
+        type=Path,
+        help="a file holding a bearer token sent with every read to [lane] vehicle_id_url, "
+             "when that service requires one. A FILE, for the same reason as the others",
+    )
     return parser
 
 
@@ -108,6 +114,7 @@ SECRET_FORBIDDEN_MODE = 0o077
 SECRET_FILE_IS = {
     "--auth-token-file": "the token every read route of this lane requires.",
     "--act-token-file": "the act token: it opens the barrier, through POST /v1/lane/vend.",
+    "--vehicle-id-token-file": "the token sent with every read to [lane] vehicle_id_url.",
     "--platform-token-file": (
         "this lane's device token: the platform takes stay opens and closes from whoever "
         "presents it."
@@ -172,7 +179,9 @@ class WiredLane:
         self.seams = seams
 
 
-def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLane:
+def wire_lane(
+    config: LaneConfig, *, platform: PlatformClient | None, vehicle_id_token: str | None = None
+) -> WiredLane:
     """The lane `serve` runs: real software seams where configured, simulated
     hardware seams always, and a table saying which is which.
 
@@ -213,7 +222,7 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
         events = EventQueue()
         seams["platform"] = "NONE (standalone: nothing is reported, nothing is refreshed)"
     if config.vehicle_id_url:
-        identifier = VehicleIdClient(config.vehicle_id_url)
+        identifier = VehicleIdClient(config.vehicle_id_url, token=vehicle_id_token)
         seams["identifier"] = f"REAL Vehicle ID at {config.vehicle_id_url}"
     else:
         identifier = StubVehicleIdentifier()
@@ -225,6 +234,7 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
             config.vehicle_id_url,
             structure=config.banned_match_structure,
             colour=config.banned_match_colour,
+            token=vehicle_id_token,
         )
         seams["banned"] = f"REAL search at {config.vehicle_id_url}"
     else:
@@ -366,7 +376,10 @@ def cmd_serve(args) -> int:
 
     platform = platform_client_for(config, args.platform_token_file)
     try:
-        wired = wire_lane(config, platform=platform)
+        wired = wire_lane(
+            config, platform=platform,
+            vehicle_id_token=_token(args.vehicle_id_token_file, "--vehicle-id-token-file"),
+        )
     except CacheDirectoryUnsafe as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 2

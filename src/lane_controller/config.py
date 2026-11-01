@@ -410,6 +410,22 @@ def positive_finite(value, name: str) -> None:
         )
 
 
+def vehicle_id_url_fault(url) -> str | None:
+    """Why this `[lane] vehicle_id_url` would put the frames at risk, or None.
+
+    The same rule as `server_url`: every read carries pictures of a car and
+    its plate, and a token when one is configured, so it is https, or plain
+    http to a service on this box itself.
+    """
+    if server_url_fault(url) is None:
+        return None
+    return (
+        "must be an https:// address or plain http on this box (127.0.0.1, ::1, localhost): "
+        "every read carries pictures of a car, and plain http carries them readable across "
+        "the network"
+    )
+
+
 def server_url_fault(url) -> str | None:
     """Why this `[lane] server_url` would put the device token at risk, or None.
 
@@ -522,6 +538,10 @@ class LaneConfig:
             fault = server_url_fault(self.server_url)
             if fault:
                 raise ValueError(f"[lane] server_url {self.server_url!r} {fault}")
+        if self.vehicle_id_url:
+            fault = vehicle_id_url_fault(self.vehicle_id_url)
+            if fault:
+                raise ValueError(f"[lane] vehicle_id_url {self.vehicle_id_url!r} {fault}")
         if (self.banned_match_structure is None) != (self.banned_match_colour is None):
             raise ValueError(
                 "banned_match_structure and banned_match_colour are stated together or not at all"

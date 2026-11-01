@@ -33,6 +33,7 @@ The translation this class performs is small and deliberate:
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import urllib.error
@@ -96,6 +97,24 @@ CAUSE_SERVICE_ERROR = Unavailable.SERVICE_ERROR
 CAUSE_BAD_RESPONSE = Unavailable.BAD_RESPONSE
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is refused, not followed: the frames and the token go to the
+    address configured, and to nowhere a 30x names."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+#: THE ONE WAY THIS MODULE OPENS A URL: no proxy, whatever `http_proxy` says
+#: (a loopback service reached through a proxy is the frames on another
+#: machine), and no redirect.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+def _headers(token: str | None) -> dict:
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 class VehicleIdClient:
     """Implements the lane's `VehicleIdentifier` over the Vehicle ID contract."""
 
@@ -104,10 +123,12 @@ class VehicleIdClient:
         endpoint: str = DEFAULT_ENDPOINT,
         timeout: float = DEFAULT_TIMEOUT,
         opener=None,
+        *,
+        token: str | None = None,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
-        self._open = opener or _post_json
+        self._open = opener or functools.partial(_post_json, token=token)
 
     def identify(self, frames: Sequence[Frame]) -> VehicleIdentity:
         if not frames:
@@ -246,7 +267,7 @@ class VehicleIdClient:
             return None
 
     def _open_health(self, url: str) -> dict:
-        with urllib.request.urlopen(url, timeout=self.timeout) as response:
+        with _OPENER.open(url, timeout=self.timeout) as response:
             return json.loads(response.read(MAX_RESPONSE_BYTES + 1))
 
 
@@ -278,7 +299,7 @@ def _utc(captured_at: float) -> str:
     return datetime.fromtimestamp(captured_at, tz=UTC).isoformat()
 
 
-def _post_json(url: str, payload: dict, timeout: float) -> dict:
+def _post_json(url: str, payload: dict, timeout: float, *, token: str | None = None) -> dict:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -287,10 +308,11 @@ def _post_json(url: str, payload: dict, timeout: float) -> dict:
             # The same key on every re-send of one identification, so a request
             # this lane gave up on cannot come back as a second vehicle.
             "Idempotency-Key": payload["request_id"],
+            **_headers(token),
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _OPENER.open(request, timeout=timeout) as response:
         body = response.read(MAX_RESPONSE_BYTES + 1)
         if len(body) > MAX_RESPONSE_BYTES:
             raise ValueError(
@@ -321,6 +343,7 @@ class VehicleIdSearch:
         colour: float,
         timeout: float = DEFAULT_TIMEOUT,
         opener=None,
+        token: str | None = None,
     ) -> None:
         for name, value in (("structure", structure), ("colour", colour)):
             if not (isinstance(value, (int, float)) and 0 <= value <= 1):
@@ -330,7 +353,7 @@ class VehicleIdSearch:
         self.endpoint = endpoint.rstrip("/")
         self.thresholds = {"structure": float(structure), "colour": float(colour)}
         self.timeout = timeout
-        self._open = opener or _post_search
+        self._open = opener or functools.partial(_post_search, token=token)
 
     def match(self, descriptor: str, banned) -> str | None:
         if not descriptor or not banned:
@@ -356,14 +379,14 @@ class VehicleIdSearch:
         return matched[0]
 
 
-def _post_search(url: str, payload: dict, timeout: float) -> dict:
+def _post_search(url: str, payload: dict, timeout: float, *, token: str | None = None) -> dict:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **_headers(token)},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _OPENER.open(request, timeout=timeout) as response:
         body = response.read(MAX_RESPONSE_BYTES + 1)
         if len(body) > MAX_RESPONSE_BYTES:
             raise ValueError(

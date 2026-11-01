@@ -304,3 +304,118 @@ def test_a_falsy_check_on_presence_would_break_every_unconfigured_lane():
     cache = DecisionCache()
     cache.load([], default_action="allow")
     assert decide(unmeasured, cache, confidence_threshold=0.85).outcome is Outcome.ALLOW
+
+
+# ---------------------------------------------------------------------------
+# OP-5-9 / OP-9-8: where the frames go, and with what.
+#
+# Every read carries pictures of a car. `[lane] vehicle_id_url` took any
+# address at all, the client went through whatever `http_proxy` named and
+# followed any redirect, and it sent no token.
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+
+import pytest  # noqa: E402
+
+from lane_controller import CameraConfig, GateConfig, LaneConfig  # noqa: E402
+
+
+def _a_config(url):
+    return LaneConfig(lane_id="l", site_id="s", vehicle_id_url=url,
+                      camera=CameraConfig(camera_id="c", rtsp_url="", frames_per_read=1),
+                      gate=GateConfig())
+
+
+@pytest.mark.parametrize(
+    "url", ["http://192.168.1.20:8088", "http://vehicle-id.local:8088", "ftp://127.0.0.1", "x"]
+)
+def test_a_vehicle_id_url_that_is_not_https_or_loopback_is_refused(url):
+    with pytest.raises(ValueError, match="vehicle_id_url"):
+        _a_config(url)
+
+
+@pytest.mark.parametrize(
+    "url", ["http://127.0.0.1:8088", "http://localhost:8088", "http://[::1]:8088",
+            "https://vid.example:8443"]
+)
+def test_the_control_https_or_loopback_is_accepted(url):
+    assert _a_config(url).vehicle_id_url == url
+
+
+class _Recorder(BaseHTTPRequestHandler):
+    seen: list
+    redirect_to: str | None = None
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self.seen.append((self.path, self.headers.get("Authorization")))
+        if self.redirect_to:
+            self.send_response(307)
+            self.send_header("Location", self.redirect_to)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = json.dumps({"cursor": 1, "read": a_read()}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _serve(redirect_to=None):
+    handler = type("H", (_Recorder,), {"seen": [], "redirect_to": redirect_to})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, handler.seen
+
+
+def test_the_client_goes_direct_whatever_http_proxy_says(monkeypatch):
+    server, seen = _serve()
+    try:
+        for name in ("no_proxy", "NO_PROXY"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        identity = VehicleIdClient(f"http://127.0.0.1:{server.server_address[1]}").identify(
+            [a_frame()]
+        )
+        assert identity.unavailable is None and identity.plate == "ABC123"
+        assert len(seen) == 1
+    finally:
+        server.shutdown()
+
+
+def test_a_redirect_is_refused_not_followed():
+    elsewhere, hit = _serve()
+    try:
+        port = elsewhere.server_address[1]
+        server, seen = _serve(redirect_to=f"http://127.0.0.1:{port}/v1/reads")
+        try:
+            identity = VehicleIdClient(
+                f"http://127.0.0.1:{server.server_address[1]}", token="T0KEN"
+            ).identify([a_frame()])
+            assert identity.unavailable is not None, "a redirect is not an answer"
+            assert len(seen) == 1 and hit == [], "the frames went where a 30x said"
+        finally:
+            server.shutdown()
+    finally:
+        elsewhere.shutdown()
+
+
+def test_a_configured_token_is_sent_as_bearer_and_none_is_sent_without_one():
+    server, seen = _serve()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        VehicleIdClient(url, token="T0KEN").identify([a_frame()])
+        VehicleIdClient(url).identify([a_frame()])
+        assert [auth for _, auth in seen] == ["Bearer T0KEN", None]
+    finally:
+        server.shutdown()
