@@ -776,6 +776,12 @@ a run of crossings that were missed, which is the aggregation nobody has
 measured and which is still not built. The transit is published `unconfirmable`
 with reason `loop_driver_timeout` and no session is opened.
 
+A driver that **raises** after the vend — on any vend, ordinary or assisted —
+is read the same way and latches the same code, with `driver_raised: true` on
+the event, and with one difference: the barrier has opened, so the car keeps
+its record. At an entry the stay is opened `unconfirmable`; at an exit the
+close is recorded `held` beside an `exit_held` event, for a person.
+
 It is **latched** and it is never `ok`. A driver that stops answering is a fault
 somebody goes and fixes, so it does not clear the next time a transit happens to
 settle; it clears when the lane restarts, by which point a person has been

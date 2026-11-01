@@ -2111,7 +2111,14 @@ class LaneController:
         # loop confirms it, and with nothing otherwise.
         between = self._take_pictures(BETWEEN_PICTURES) if self.config.direction == "entry" else []
         started = self._clock()
-        crossing = self._as_declared(self._read_closing_loops(window, at))
+        try:
+            crossing = self._as_declared(self._read_closing_loops(window, at))
+        except Exception:  # noqa: BLE001 -- a driver that raises is a driver that did not answer
+            self._loop_driver_raised(
+                identity, at, names, geometry, claimed=mine(), exit_pricing=exit_pricing,
+                arming=[*arming, *between], exit_id=exit_id,
+            )
+            return
         elapsed = self._clock() - started
 
         # THE DRIVER RETURNED. Whether this call is still the one that may say
@@ -2187,6 +2194,46 @@ class LaneController:
             self._record_session(
                 identity, at, confirmation=HELD, exit_pricing=exit_pricing, exit_id=exit_id
             )
+
+    def _loop_driver_raised(
+        self, identity, at: str, names, geometry, *, claimed: bool, exit_pricing, arming, exit_id
+    ) -> None:
+        """The closing-loop driver RAISED after the vend: read as a timeout.
+
+        Left to propagate, the transit stayed `pending` for ever -- which
+        stands the idle poll down at this lane for good -- and the car the
+        barrier opened for had no record. The barrier has opened, so the car
+        is not left without one: at an entry the stay is OPENED, unconfirmable
+        (the loops could neither confirm nor refute it, and every car let in
+        is a stay); at an exit the close is recorded `held`, a flag for a
+        person, as an elapsed window is.
+        """
+        lane = self.config.lane_id
+        log.exception("lane %s: the closing-loop driver raised; read as a timeout", lane)
+        if not claimed:
+            return
+        # MEASURED FROM THIS TOO: a driver that raises is a loop not answering.
+        self._loop_driver_timed_out = True
+        if self.config.direction == "exit":
+            self.events.record(
+                names.held, lane, reason=REASON_LOOP_DRIVER_TIMEOUT, at=at,
+                geometry_assumed=geometry, driver_raised=True,
+            )
+            self._transit(TransitState.HELD, at)
+            self._record_session(
+                identity, at, confirmation=HELD, exit_pricing=exit_pricing, exit_id=exit_id
+            )
+            return
+        self.events.record(
+            names.unconfirmable, lane, reason=REASON_LOOP_DRIVER_TIMEOUT, at=at,
+            geometry_assumed=geometry, driver_raised=True,
+        )
+        self._transit(TransitState.UNCONFIRMABLE, at)
+        opened = self._record_session(
+            identity, at, confirmation=UNCONFIRMABLE, exit_pricing=exit_pricing, exit_id=exit_id
+        )
+        if opened is not None and arming:
+            self.events.queue_pictures(opened.event_id, list(arming))
 
     def transit_timed_out(self, identity, at: str, deadline: float) -> None:
         """The loop driver did not return inside this lane's own deadline.
