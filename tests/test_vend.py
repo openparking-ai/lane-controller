@@ -1589,3 +1589,43 @@ def test_a_credential_in_a_non_ascii_query_is_still_caught_by_value():
     with serving(make_server(service, port=0, token=READ_TOKEN, act_token=ACT_TOKEN)) as base:
         assert _raw(base, "GET", f"/v1/lane?zz={ACT_TOKEN}") == 401
         assert _raw(base, "GET", f"/v1/lane?zz={READ_TOKEN}") == 401
+
+
+# ---------------------------------------------------------------------------
+# OP-5-10: the decision a vend completes is the one it named, under the lock
+# ---------------------------------------------------------------------------
+
+
+def test_a_new_arrival_between_the_check_and_the_claim_completes_nothing(monkeypatch):
+    """The route compares `decision_at` without the lock; a car decided in
+    between made a DIFFERENT car's decision the last one. The claim re-checks
+    it, and the vend that named the old decision moves nothing."""
+    from lane_controller.vend import AssistedVend
+
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    named = controller.last_decision_at
+    original = AssistedVend._refuse
+
+    def then_another_car(self, request):
+        refusal = original(self, request)
+        # The next car's decision, landing in the window.
+        controller.last_decision_at = "2099-01-01T00:00:00+00:00"
+        controller.last_decision_completed_at = None
+        return refusal
+
+    monkeypatch.setattr(AssistedVend, "_refuse", then_another_car)
+    status, refused = complete(service, controller, decision_at=named)
+    assert status == 409, refused
+    assert refused["code"] == VendRefusal.DECISION_MISMATCH.value
+    assert controller.vend.vend_count == 0
+    assert controller.last_decision_completed_at is None, "the new car's decision is untouched"
+
+
+def test_the_control_the_decision_named_is_still_the_last_one_and_vends():
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    status, _ = complete(service, controller)
+    assert status == 202
+    settled(service)
+    assert controller.vend.vend_count == 1

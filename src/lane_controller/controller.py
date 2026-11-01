@@ -58,6 +58,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import datetime
 
 from . import exit_case
 from .config import LaneConfig
@@ -226,6 +227,27 @@ class DecisionAlreadyCompleted(Exception):
     """`complete_vend` found the decision already completed -- by an exit case
     that settled, or by another completion -- and moved nothing. The assisted
     vend answers it `already_completed`."""
+
+
+class DecisionSuperseded(Exception):
+    """`complete_vend` was asked to complete a decision that is no longer this
+    lane's last one -- another car arrived while the route judged the call --
+    and moved nothing. The assisted vend answers it `decision_mismatch`."""
+
+
+def _same_instant(a: str | None, b: str | None) -> bool:
+    """Whether two ISO 8601 strings name one moment (`Z` and `+00:00` alike)."""
+    if a is None or b is None:
+        return False
+    try:
+        left = datetime.fromisoformat(a.replace("Z", "+00:00"))
+        right = datetime.fromisoformat(b.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    try:
+        return left == right
+    except TypeError:  # one naive, one aware: not the same moment to this lane
+        return False
 
 
 class LaneController:
@@ -719,13 +741,18 @@ class LaneController:
         # reconstructed from the event queue, which `flush()` empties: a
         # consumer asking what the lane last decided must not get a different
         # answer depending on whether the platform happened to be reachable.
-        self.last_decision = decision
-        self.last_decision_at = to_iso(self._clock())
-        # A NEW CASE, so nothing has completed it. This is the only way back to
-        # a completable decision, and it is the whole of "one decision, one
-        # vend": the second vend a caller can legitimately get is the one that
-        # belongs to the second car.
-        self.last_decision_completed_at = None
+        #
+        # UNDER `_exit_lock`, the three as one: a completion claims the
+        # decision under it (`complete_vend`, `observe_qr`), so it sees the
+        # previous car's decision whole or this one's, never a mix.
+        with self._exit_lock:
+            self.last_decision = decision
+            self.last_decision_at = to_iso(self._clock())
+            # A NEW CASE, so nothing has completed it. This is the only way
+            # back to a completable decision, and it is the whole of "one
+            # decision, one vend": the second vend a caller can legitimately
+            # get is the one that belongs to the second car.
+            self.last_decision_completed_at = None
         self.last_read_ref = identity.read_ref
         self.last_cause = identity.unavailable.value if identity.unavailable else None
         # A refused car's arming read is held until the next arrival, for the
@@ -858,7 +885,9 @@ class LaneController:
     # The ASSISTED vend: an identity a human or a display code completed.
     # ------------------------------------------------------------------
 
-    def complete_vend(self, identity, *, authorised_by: str, assisted: dict) -> str:
+    def complete_vend(
+        self, identity, *, authorised_by: str, assisted: dict, decision_at: str | None = None
+    ) -> str:
         """Write the identity, pulse the relay, record it, open a pending entry.
 
         **THE ORDER IS THE SAFETY PROPERTY AND IT IS THE WHOLE OF THIS METHOD.**
@@ -909,6 +938,11 @@ class LaneController:
         # takes: the route checked `completed` without it, and a case that
         # settled in between has already moved the barrier for this car.
         with self._exit_lock:
+            # THE DECISION THE CALLER NAMED, re-checked where it is claimed: the
+            # route compared it without this lock, and an arrival in between
+            # made a different car's decision the last one.
+            if decision_at is not None and not _same_instant(decision_at, self.last_decision_at):
+                raise DecisionSuperseded(self.last_decision_at)
             if self.last_decision_completed_at is not None:
                 raise DecisionAlreadyCompleted(self.last_decision_completed_at)
             self.last_decision_completed_at = to_iso(self._clock())
