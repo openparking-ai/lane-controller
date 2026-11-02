@@ -1172,7 +1172,9 @@ def test_serve_warns_at_start_when_an_entry_lane_has_no_act_token(tmp_path, monk
     token.write_text("an-act-token")
     token.chmod(0o600)
     real_main = cli.main
-    monkeypatch.setattr(cli, "main", lambda argv: real_main([*argv, "--act-token-file", str(token)]))
+    monkeypatch.setattr(
+        cli, "main", lambda argv: real_main([*argv, "--act-token-file", str(token)])
+    )
     code, _ = _serve_with(tmp_path, monkeypatch, lambda controller: None)
     assert code == 0
     assert "no --act-token-file" not in capsys.readouterr().err
