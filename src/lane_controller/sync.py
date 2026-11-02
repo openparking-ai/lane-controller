@@ -157,6 +157,19 @@ UNCONFIRMABLE = "unconfirmable"
 HELD = "held"
 
 
+class LaneRefused(PlatformUnreachable):
+    """The platform refused THIS LANE, not the item: its token unknown or
+    revoked (401), a token for something else (403), the lane or garage gone
+    (404, confirmed on the lane's own rules read). Nothing queued is the
+    item's fault, so nothing is dropped: it is an unreachable platform to the
+    queue -- the part and everything after it stay, the flush stops -- and a
+    state of its own on the health surface (`PlatformTransport.lane_refused`)."""
+
+    def __init__(self, err: PlatformRejected) -> None:
+        super().__init__(f"the platform refused this lane: {err}", status=err.status)
+        self.refusal = err
+
+
 class _TooLarge(Exception):
     """A log post the platform answered 413: posted again in halves, not dropped."""
 
@@ -395,6 +408,13 @@ class PlatformTransport(EventTransport):
         self.on_close_refused: Callable[[LaneEvent, Exception], None] | None = None
         #: The refusal `_guarded` last swallowed, for the caller to read.
         self.last_refused: Exception | None = None
+        #: The platform's refusal of THIS LANE (`LaneRefused`), while it lasts:
+        #: set by a 401/403 (or a 404 the rules read confirms), cleared by the
+        #: next call it accepts. The outbox is held, never dropped, meanwhile.
+        self.lane_refused: PlatformRejected | None = None
+        #: Whether the last call reached the platform: None before any, False
+        #: after an unreachable one or a lane refusal, True after an answer.
+        self.reachable: bool | None = None
 
     def send(self, events: list[LaneEvent]) -> bool:
         plain: list[dict] = []
@@ -672,7 +692,19 @@ class PlatformTransport(EventTransport):
         self.attempted += 1
         try:
             result = call()
+        except PlatformUnreachable:
+            self.reachable = False
+            raise
         except PlatformRejected as err:
+            if self._refuses_the_lane(err):
+                self.lane_refused = err
+                self.reachable = False
+                log.error(
+                    "the platform refused this lane (HTTP %s); the outbox is held, nothing "
+                    "is dropped: %s", err.status, err,
+                )
+                raise LaneRefused(err) from err
+            self.reachable = True
             self.rejected += 1
             self._classify(err)
             self.last_refused = err
@@ -686,7 +718,28 @@ class PlatformTransport(EventTransport):
         # operator's repair invisible and no `recovered` ever sent.
         self.skew_rejected = 0
         self.conflicts_unnamed = 0
+        self.lane_refused = None
+        self.reachable = True
         return result
+
+    def _refuses_the_lane(self, err: PlatformRejected) -> bool:
+        """Whether this refusal is of the lane rather than of the item.
+
+        401 and 403 are the credential, whatever was sent. A 404 is two things
+        -- a close with no open session to end is one, a lane the platform no
+        longer has is the other -- so it is asked of the lane's own rules
+        read: refused there too, it is the lane; answered, it was the item.
+        A rules read that cannot be made keeps the item queued (unreachable).
+        """
+        if err.status in (401, 403):
+            return True
+        if err.status != 404:
+            return False
+        try:
+            self._client.get_rules()
+        except PlatformRejected as probe:
+            return probe.status in LANE_REFUSED
+        return False
 
     def _classify(self, err: PlatformRejected) -> None:
         """Separate the one refusal that is a MALFUNCTION from the ordinary ones.

@@ -231,8 +231,13 @@ EXPECTED = {
         "vends": 1,
         "unread_crossings": 0,
     },
+    # OP-5-5: a car through an exit with nothing pending is a held close, with
+    # the pictures, for a person -- no longer a log line and nothing else.
     "exit: deny, then A>B on an idle poll": {
-        "events": ["armed", "frames_captured", "vehicle_identified", "decision"],
+        "events": [
+            "armed", "frames_captured", "vehicle_identified", "decision", "exit_held",
+            "session_close",
+        ],
         "transit": "none",
         "vends": 0,
         "unread_crossings": 0,

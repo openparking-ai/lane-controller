@@ -66,11 +66,19 @@ cache and not bounded by `rules_max_age_seconds`: each is held until the
 platform has taken it or refused it, and not after. The pictures kept with an
 entry are kept in the same file, on the same terms. Both are written by the
 outbox's own disk thread (`events.DiskWriter`), never by the lane's.
+
+BOTH FILES ARE STAMPED with the lane, garage and platform that wrote them
+(`store_identity`: a hash of `lane_id`, `site_id` and `server_url`). A cache
+written for another is wiped at start and refilled; an outbox written for
+another that still holds anything is refused (`StoreIdentityMismatch`) --
+never sent under this lane's token, never thrown away.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import sqlite3
 import stat
@@ -78,6 +86,8 @@ import threading
 from pathlib import Path
 
 from .events import LaneEvent, Picture
+
+log = logging.getLogger(__name__)
 
 #: The file's mode, applied on every write and not only at creation: SQLite
 #: may recreate the file, and a mode set once is a mode that can be undone.
@@ -96,6 +106,59 @@ PICTURES_MAX_BYTES = 1 << 30
 #: shape is not read as this one; it is discarded and refilled at the next
 #: refresh, which is what a cache is for.
 FORMAT = 1
+
+
+class StoreIdentityMismatch(Exception):
+    """The outbox file was written by a different lane, garage or platform than
+    the one this process is configured as, and it still holds stays. Sending
+    them under this lane's token would report another lane's cars; wiping them
+    would lose them. Raised at construction, before the port opens: a person
+    decides (point `[lane] cache_path` elsewhere, or restore the config)."""
+
+
+def store_identity(lane_id: str, site_id: str, server_url: str | None) -> str:
+    """The fingerprint both stores are stamped with: which lane, at which
+    garage, reporting to which platform. A hash, so the file says nothing more
+    about the installation than the configuration file beside it does."""
+    text = json.dumps([lane_id, site_id, _platform_key(server_url)])
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _platform_key(server_url: str | None) -> str:
+    """The platform an address names, spelled one way: the scheme and host in
+    lower case, a default port dropped, and no trailing slash -- so
+    `https://P.example/` and `https://p.example` are one platform, and a
+    lane holding stays does not refuse to start over how its URL was typed."""
+    if not server_url:
+        return ""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(server_url.strip())
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    if port is not None and (scheme, port) not in (("https", 443), ("http", 80)):
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}{parts.path.rstrip('/')}"
+
+
+def _stamped(connection) -> str | None:
+    """The stamp, READ ONLY: a start must not need a write to learn it, or a
+    full disk stops a lane that `main` would have started."""
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+    ).fetchone()
+    if table is None:
+        return None
+    row = connection.execute("SELECT value FROM meta WHERE key = 'identity'").fetchone()
+    return row[0] if row else None
+
+
+def _stamp(connection, identity: str) -> None:
+    connection.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    connection.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('identity', ?)", (identity,)
+    )
 
 
 class CacheDirectoryUnsafe(Exception):
@@ -176,7 +239,7 @@ class DurableStore:
     the refresh thread's writes and a wipe from interleaving.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, identity: str | None = None) -> None:
         path = Path(path)
         self.directory = ensure_cache_directory(path.parent)
         self.path = self.directory / path.name
@@ -186,6 +249,54 @@ class DurableStore:
                 "CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, format INTEGER NOT NULL, "
                 "state TEXT NOT NULL)"
             ))
+            if identity is not None:
+                self._bind(identity)
+            # A file written by an earlier build may still carry deleted rows
+            # in its free pages; the cache is one small row, so rebuilding it
+            # once at start is cheap and leaves none. A VACUUM that cannot run
+            # (a full disk) costs the clean-up, never the start.
+            try:
+                _vacuum(self.path)
+            except sqlite3.Error as exc:
+                log.warning("the decision cache at %s could not be VACUUMed: %s", self.path, exc)
+
+    def _bind(self, identity: str) -> None:
+        """ANOTHER LANE'S CACHE IS NOT THIS LANE'S RULES: wiped, and refilled
+        at the next refresh -- a cache is for that. A file with no stamp is
+        this build's first start on it, and taken. Written only when the stamp
+        is missing or different, so an already-stamped lane starts on a full
+        disk as it always did. A stamp that cannot be written on an unstamped
+        file is logged and the start goes on; another lane's cache that cannot
+        be wiped is refused (`StoreIdentityMismatch`), never decided from."""
+        held = self._with_connection(_stamped)
+        if held == identity:
+            return
+        if held is None:
+            try:
+                self._with_connection(lambda c: _stamp(c, identity))
+            except sqlite3.Error:
+                log.exception(
+                    "the decision cache at %s could not be stamped; it is taken as this "
+                    "lane's and stamped at a later start", self.path,
+                )
+            return
+
+        def wipe(connection):
+            connection.execute("DELETE FROM cache")
+            _stamp(connection, identity)
+
+        try:
+            self._with_connection(wipe)
+        except sqlite3.Error as exc:
+            raise StoreIdentityMismatch(
+                f"the decision cache at {self.path} was written for another lane, garage or "
+                f"platform, and it could not be wiped ({exc}). It is not decided from: free "
+                "the disk, or point [lane] cache_path at a new directory."
+            ) from exc
+        log.error(
+            "the decision cache at %s was written for another lane, garage or platform; wiped",
+            self.path,
+        )
 
     def _with_connection(self, action):
         return _touch(self.path, action)
@@ -219,15 +330,31 @@ class DurableStore:
 def _touch(path: Path, action):
     """One connection, one transaction, `action` run inside it -- and the file
     narrowed AFTER every touch, not only at creation. The one way both stores
-    here open their file."""
+    here open their file.
+
+    `secure_delete` on every connection: without it a DELETE, or the row an
+    INSERT OR REPLACE replaces, only marks its pages free and the plate, the
+    identity or the stay stays readable in the file until SQLite happens to
+    reuse the page -- past the bound this module promises. With it SQLite
+    zeroes the freed content as it frees it."""
     connection = sqlite3.connect(path)
     try:
+        connection.execute("PRAGMA secure_delete = ON")
         with connection:
             result = action(connection)
     finally:
         connection.close()
     os.chmod(path, CACHE_FILE_MODE)
     return result
+
+
+def _vacuum(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("VACUUM")
+    finally:
+        connection.close()
+    os.chmod(path, CACHE_FILE_MODE)
 
 
 def outbox_path(cache_path: str | Path) -> Path:
@@ -271,7 +398,13 @@ class OutboxStore:
     EVERY WRITE COMES FROM `events.DiskWriter`'s thread, never the lane's.
     """
 
-    def __init__(self, path: str | Path, *, pictures_max_bytes: int = PICTURES_MAX_BYTES) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        pictures_max_bytes: int = PICTURES_MAX_BYTES,
+        identity: str | None = None,
+    ) -> None:
         path = Path(path)
         self.directory = ensure_cache_directory(path.parent)
         self.path = self.directory / path.name
@@ -292,6 +425,75 @@ class OutboxStore:
             _touch(self.path, lambda c: c.execute(
                 "CREATE TABLE IF NOT EXISTS cancels (exit_id TEXT PRIMARY KEY, at REAL NOT NULL)"
             ))
+            if identity is not None:
+                # THE FIRST START OF A BUILD THAT STAMPS: whatever an earlier
+                # build deleted (before `secure_delete`) is still in the free
+                # pages, and this is the one moment to clear it -- once, before
+                # anything else opens the file. Unstamped there is nothing to
+                # compare, so a VACUUM that failed leaves it unstamped and the
+                # next start tries again.
+                held = _touch(self.path, _stamped)
+                if held == identity:
+                    return  # stamped already: nothing to write, full disk or not
+                if held is None and not self._clear_residue():
+                    return
+                try:
+                    _touch(self.path, lambda c: self._bind(c, identity))
+                except sqlite3.Error as exc:
+                    if held is not None:
+                        # ANOTHER LANE'S STAMP, empty or not, that this lane
+                        # could not replace: never queued into, whatever the
+                        # disk. Its next start would refuse this lane's stays
+                        # or hand them to the other lane.
+                        raise StoreIdentityMismatch(
+                            f"the outbox at {self.path} was written for another lane, garage "
+                            f"or platform, and it could not be re-stamped ({exc}). Nothing is "
+                            "queued into it: free the disk, or point [lane] cache_path at a "
+                            "new directory."
+                        ) from exc
+                    # An unstamped file (an earlier build's): a stamp a full
+                    # disk would not take costs the stamp, never the start.
+                    log.exception(
+                        "the outbox at %s could not be stamped; it is stamped at a later "
+                        "start", self.path,
+                    )
+
+    def _clear_residue(self) -> bool:
+        """VACUUM the file once. It rewrites only the live rows (at most the
+        pictures' ceiling plus the stays), needs about that much free disk for
+        the copy, and holds the file exclusively while it runs -- here, at
+        construction, before the drain or the disk thread exist. A VACUUM
+        that fails (a full disk) is logged and changes nothing: the rows are
+        all still there, and the next start tries again."""
+        try:
+            _vacuum(self.path)
+        except sqlite3.Error:
+            log.exception(
+                "the outbox at %s could not be VACUUMed; what an earlier build deleted may "
+                "still be in its free pages", self.path,
+            )
+            return False
+        return True
+
+    def _bind(self, connection, identity: str) -> None:
+        """Stamp the file with this lane's identity -- or refuse it. An outbox
+        of another lane that still holds anything is never sent as this one's
+        and never thrown away: `StoreIdentityMismatch`. An empty one is
+        re-stamped; one with no stamp (an earlier build) is taken."""
+        held = _stamped(connection)
+        if held is not None and held != identity:
+            waiting = sum(
+                connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                for table in ("outbox", "pictures", "cancels")
+            )
+            if waiting:
+                raise StoreIdentityMismatch(
+                    f"the outbox at {self.path} was written for another lane, garage or "
+                    f"platform and still holds {waiting} item(s). They are not sent as this "
+                    "lane's and not thrown away: restore the configuration that wrote them, "
+                    "or point [lane] cache_path at a new directory and keep this file."
+                )
+        _stamp(connection, identity)
 
     def add(self, event: LaneEvent) -> None:
         detail = json.dumps(event.detail, sort_keys=True)

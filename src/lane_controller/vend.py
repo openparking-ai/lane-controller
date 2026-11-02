@@ -48,7 +48,7 @@ from .contract import (
     is_idempotency_key,
     is_ticket_ref,
 )
-from .controller import DecisionAlreadyCompleted
+from .controller import DecisionAlreadyCompleted, DecisionSuperseded
 from .decision import ADMITS_PASSES_ONLY, Outcome, closed_to, decide, garage_admits
 from .interfaces import VehicleIdentity
 
@@ -483,8 +483,21 @@ class AssistedVend:
             )
             try:
                 at = controller.complete_vend(
-                    identity, authorised_by=request.authorised_by.value, assisted=assisted
+                    identity, authorised_by=request.authorised_by.value, assisted=assisted,
+                    decision_at=request.decision_at,
                 )
+            except DecisionSuperseded:
+                # Another car's arrival made a new decision between `_refuse`
+                # and here; the one named is not this lane's to complete now.
+                with self._state:
+                    self._in_progress = False
+                return 409, VendRefused(
+                    code=VendRefusal.DECISION_MISMATCH.value,
+                    error=(
+                        "decision_at is not the moment of this lane's last decision; a new "
+                        "arrival was decided while this call was being judged"
+                    ),
+                ).to_dict()
             except DecisionAlreadyCompleted:
                 # Completed between `_refuse` and here -- an exit case that
                 # settled opened the barrier -- and nothing moved.

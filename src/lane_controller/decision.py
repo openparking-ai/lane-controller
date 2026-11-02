@@ -466,9 +466,18 @@ class DecisionCache:
         # module the platform could not read (`unavailable`, no `register`)
         # keeps what this cache already held, because an outage is not an
         # empty register and a cache that emptied itself on one would send
-        # every pass holder to pay at the next exit.
+        # every pass holder to pay at the next exit. KEPT FOR A BOUNDED TIME:
+        # past `max_age_seconds` it covers nobody (`register_past_bound`), and
+        # past the longer of that and `pass_registers_offline_s` it is not
+        # held. A module the owner unlinked (`consulted: false`, no
+        # `unavailable`) has no register, and what was held goes at once.
         self.entitlements: dict[str, dict] = {}
         self.entitlements_complete: bool | None = None
+        #: When each module's register was last RECEIVED, by module: what a
+        #: register kept through a module that cannot be read is bounded by
+        #: (`register_past_bound`). A module whose register is not stamped --
+        #: one placed by hand -- counts from the rules refresh.
+        self._register_received_at: dict[str, float] = {}
         # The garage's open stays, by session id, and the cursor the next
         # delta continues from. The full set arrives with the rules (the slow
         # cadence); the deltas arrive on their own (the fast cadence), closed
@@ -547,6 +556,7 @@ class DecisionCache:
             "tax_sets": self.tax_sets,
             "entitlements": self.entitlements,
             "entitlements_complete": self.entitlements_complete,
+            "registers_received_at": self._register_received_at,
             "stays": self.stays,
             "stays_cursor": self.stays_cursor,
             "stays_refreshed_at": self.stays_refreshed_at,
@@ -568,6 +578,7 @@ class DecisionCache:
         when the platform last confirmed them."""
         self.entitlements = dict(state.get("entitlements") or {})
         self.entitlements_complete = state.get("entitlements_complete")
+        self._register_received_at = _received_from_state(state)
         self.timezone = state.get("timezone")
         self._registers_past_bound = True
         self._registers_confirmed_at = float(confirmed_at) if confirmed_at is not None else None
@@ -580,6 +591,7 @@ class DecisionCache:
         held = bool(self.entitlements)
         self.entitlements = {}
         self.entitlements_complete = None
+        self._register_received_at = {}
         self._registers_past_bound = False
         self._registers_confirmed_at = None
         self._coverage_index = {}
@@ -647,6 +659,7 @@ class DecisionCache:
         self.tax_sets = list(state.get("tax_sets") or [])
         self.entitlements = dict(state.get("entitlements") or {})
         self.entitlements_complete = state.get("entitlements_complete")
+        self._register_received_at = _received_from_state(state)
         self.stays = dict(state.get("stays") or {})
         self.stays_cursor = state.get("stays_cursor")
         self.stays_refreshed_at = state.get("stays_refreshed_at")
@@ -708,6 +721,7 @@ class DecisionCache:
         else:
             self.entitlements = {}
             self.entitlements_complete = None
+            self._register_received_at = {}
             self._registers_past_bound = False
             self._registers_confirmed_at = None
         with self._stays_lock:
@@ -770,6 +784,7 @@ class DecisionCache:
             # is held -- a module it could not read is not kept from before.
             self.entitlements = {}
             self.entitlements_complete = None
+            self._register_received_at = {}
             self._registers_past_bound = False
             self._registers_confirmed_at = None
         rules = [
@@ -785,10 +800,29 @@ class DecisionCache:
         self.timezone = payload.get("timezone")
         self.currency = payload.get("currency")
         facts = payload.get("entitlements") or {}
+        received = self._refreshed_at
         for module, fact in facts.items():
-            if isinstance(fact, dict) and "register" in fact:
+            if not isinstance(fact, dict):
+                continue
+            if fact.get("consulted") is False and "unavailable" not in fact:
+                # THE OWNER UNLINKED THE MODULE: it has no register now, and
+                # the one this cache held is nobody's -- a cancelled or unpaid
+                # holder would otherwise go on leaving COVERED for ever. (A
+                # module that says why it could not be read, `unavailable`, is
+                # a door that failed, and is kept inside the bound below.)
+                self.entitlements.pop(module, None)
+                self._register_received_at.pop(module, None)
+            elif "register" in fact:
                 self.entitlements[module] = fact
+                self._register_received_at[module] = received
         self.entitlements_complete = facts.get("complete")
+        # A register kept through a module that cannot be read is kept for a
+        # bounded time, not for ever: past the ceiling it is personal data held
+        # for nobody, and it goes from memory and disk.
+        for module in list(self.entitlements):
+            if self._register_age(module) > max(self._max_age, self._registers_offline_max):
+                self.entitlements.pop(module, None)
+                self._register_received_at.pop(module, None)
         # Replaced whole, as the plans are: a platform older than the list
         # sends none, and none is an empty list.
         self.banned = banned_from_payload(payload.get("banned"))
@@ -893,6 +927,22 @@ class DecisionCache:
                 if identity:
                     index.setdefault(normalise_identity(identity), []).append(stay)
         self._stay_index = index
+
+    def _register_age(self, module: str) -> float:
+        """How much older this module's register is than the last rules read
+        that answered. Zero for one that read carried, or when nothing has."""
+        if self._refreshed_at is None:
+            return 0.0
+        received = self._register_received_at.get(module, self._refreshed_at)
+        return max(0.0, self._refreshed_at - received)
+
+    def register_past_bound(self, module: str) -> bool:
+        """Whether this module's register is one KEPT past `max_age_seconds`:
+        the platform answers, and has not carried this module's register for
+        longer than the cache trusts anything. A car only it covers is not let
+        out free on it (`exit_pricing.price_exit` answers `stale_facts`), and
+        is not let in on it at a pass-only garage (a person decides)."""
+        return self._register_age(module) > self._max_age
 
     def register_rows_for(self, identity: str) -> list[tuple[str, dict, dict]]:
         """Every register row naming this identity: (module, the row, the pass
@@ -1146,6 +1196,21 @@ def decide(
     )
 
 
+def _received_from_state(state: dict) -> dict[str, float]:
+    """When each stored register was received. A store written before the
+    stamp existed counts each from its own refresh, the oldest it can be."""
+    stamped = state.get("registers_received_at")
+    refreshed = state.get("refreshed_at")
+    held = {}
+    for module in state.get("entitlements") or {}:
+        value = stamped.get(module) if isinstance(stamped, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            held[module] = float(value)
+        elif isinstance(refreshed, (int, float)) and not isinstance(refreshed, bool):
+            held[module] = float(refreshed)
+    return held
+
+
 def registers_held(cache: DecisionCache) -> bool:
     """Whether this lane holds any pass or monthly register to confirm a car
     against. None held -- never received, or a module the platform could not
@@ -1224,11 +1289,14 @@ def _decide_entry(
     """
     read = plate_read(identity, confidence_threshold)
     covered = False
+    stale_cover = False
     if read:
-        from .exit_pricing import local_day, register_cover
+        from .exit_pricing import local_day, register_cover, stale_register_cover
 
-        covered_by, _ = register_cover(read, cache, local_day(day_at, cache.timezone)[0])
+        day = local_day(day_at, cache.timezone)[0]
+        covered_by, _ = register_cover(read, cache, day)
         covered = bool(covered_by)
+        stale_cover = not covered and bool(stale_register_cover(read, cache, day))
     rule = cache.lookup(read) if read and not stale else None
 
     if admits == ADMITS_PASSES_ONLY:
@@ -1250,7 +1318,7 @@ def _decide_entry(
                     "car",
                     identity=identity,
                 )
-            if not registers_held(cache):
+            if not registers_held(cache) or stale_cover:
                 return no_register
             return Decision(
                 outcome=Outcome.DENY,
@@ -1268,6 +1336,15 @@ def _decide_entry(
                 outcome=Outcome.ALLOW,
                 reason="pass or monthly only; a pass or monthly register covers this car",
                 identity=identity,
+            )
+        if stale_cover:
+            # Only a register kept past its age names this car: its pass can
+            # be neither confirmed nor refused here. A person decides.
+            return replace(
+                no_register,
+                reason="pass or monthly only; the pass could not be confirmed: the register "
+                "that names this car is past its age",
+                qr_may_open=True,
             )
         # THE QR SEAM: see `REASON_NOT_REGISTERED`.
         return Decision(

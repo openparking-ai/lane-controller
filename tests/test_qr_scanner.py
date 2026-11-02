@@ -399,12 +399,13 @@ STAY = "stay-77"
 LOW_EXIT = VehicleIdentity(plate=STRANGER, confidence=0.42, presence=True, color_code="c-07")
 
 
-def an_exit_waiting(answer, *, stay=STAY, payment=None):
+def an_exit_waiting(answer, *, stay=STAY, payment=None, crossings=()):
     """An exit lane with the platform's exit cases wired, the car's case on
     payment and its fee handed to the reader: the gate shut until the case is
     settled. `stay`: the stay the platform found for the case (None: none)."""
     controller, vend, platform, scanner, presenter, loop = a_lane(
-        LOW_EXIT, direction="exit", transient=True, exits=True, presenter=answer)
+        LOW_EXIT, direction="exit", transient=True, exits=True, presenter=answer,
+        crossings=crossings)
     platform.exit_match_session = stay
     platform.exit_answer = {**CASE_PAYMENT, **({"payment": payment} if payment else {})}
     refused = controller.run_once()
@@ -1600,3 +1601,46 @@ def test_a_lane_with_a_platform_wires_the_scanner_and_a_standalone_one_does_not(
     wired = wire_lane(config, platform=client)
     assert wired.controller.qr_presenter == client.redeem_enrolment
     assert wired.seams["qr"].startswith("SIMULATED")
+
+
+def test_op_5_11_a_person_who_completes_while_the_qr_is_judged_takes_it_and_the_qr_opens_nothing():
+    """The QR checked `last_decision_completed_at` without the lock, then read
+    the loops and vended: a person's completion landing between the two
+    vended too. The QR now claims the decision under `_exit_lock` first."""
+    controller, vend, platform, scanner, presenter, _ = a_lane(SEEN)
+    controller.run_once()
+    original = controller._car_at_the_barrier
+    calls = []
+
+    def a_person_completes_meanwhile(**kwargs):
+        # The last look at the barrier before the relay: the window.
+        calls.append(kwargs)
+        if kwargs.get("read") is False:
+            with controller._exit_lock:
+                controller.last_decision_completed_at = "2026-09-21T14:00:00+00:00"
+        return original(**kwargs)
+
+    controller._car_at_the_barrier = a_person_completes_meanwhile
+    scanner.scan(QR)
+    assert controller.run_once() is None
+    assert {"read": False} in calls, "the premise: the window was reached"
+    assert vend.vend_count == 0, "the person's completion has the decision; the QR moved nothing"
+    assert len(presenter.calls) == 1
+
+
+def test_op_5_5_a_car_let_out_by_hand_while_its_case_waits_is_a_held_close_naming_the_case():
+    """The platform down, a person raises the barrier by hand: the loops see
+    the car go with nothing pending. Its waiting case is taken, the close is
+    recorded held and names the case, and nothing opens for it again."""
+    controller, vend, platform, scanner, _ = an_exit_waiting(
+        Presenter(passed("same_plate")), crossings=((OCC, 0.0),))
+    platform.online = False
+    controller.run_once()  # an idle turn: the loops see the car go
+    assert controller._exit_case is None, "the case was the car's, and it has gone"
+    close = next(e for e in controller.events._queue if e.kind == "session_close")
+    assert close.detail["exit_confirmation"] == "held"
+    assert close.detail["exit_id"] == "exit-1"
+    assert vend.vend_count == 0
+    status, said = a_person_opens(controller)
+    assert status == 409 and said["code"] == "already_completed", said
+    assert vend.vend_count == 0

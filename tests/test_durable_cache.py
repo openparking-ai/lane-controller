@@ -393,3 +393,339 @@ def test_the_example_config_names_the_bound_and_the_forgery_path():
     assert "# cache_path =" in example
     assert "rules_max_age_seconds above" in example and "opens the barrier" in example
     assert os.path.isabs("/var/lib/lane-controller/decision-cache.sqlite")
+
+
+# ---------------------------------------------------------------------------
+# OP-5-13: a row deleted or replaced is gone from the FILE, not only the table.
+#
+# SQLite's DELETE marks pages free and leaves their bytes where they were, so
+# a plate that left the register, a wiped cache or a delivered stay could be
+# read straight out of the file with `strings`. The bytes of the file are the
+# test, not what a SELECT returns.
+# ---------------------------------------------------------------------------
+
+SECRET = "ZZ-SECRET-PLATE-0513"
+
+
+def _a_state_with(plate: str) -> dict:
+    return {"rules": {plate: "allow"}, "padding": "x" * 20_000}
+
+
+def test_a_replaced_or_wiped_cache_leaves_no_plate_in_the_file(cache_dir):
+    path = cache_dir / "c.sqlite"
+    store = DurableStore(path)
+    store.write(_a_state_with(SECRET))
+    assert SECRET.encode() in path.read_bytes(), "the premise: the plate is on disk"
+
+    store.write(_a_state_with("OTHER"))
+    assert SECRET.encode() not in path.read_bytes(), "a replaced row left the plate behind"
+
+    store.write(_a_state_with(SECRET))
+    store.wipe()
+    assert SECRET.encode() not in path.read_bytes(), "a wiped row left the plate behind"
+
+
+def test_a_removed_outbox_action_leaves_no_plate_in_the_file(cache_dir):
+    from lane_controller.durable import OutboxStore
+    from lane_controller.events import LaneEvent
+
+    path = cache_dir / "o.sqlite"
+    store = OutboxStore(path)
+    event = LaneEvent(kind="session_open", lane_id="l", at=1.0,
+                      detail={"plate": SECRET, "padding": "x" * 20_000})
+    store.add(event)
+    assert SECRET.encode() in path.read_bytes(), "the premise: the plate is on disk"
+    store.remove([event.event_id])
+    assert SECRET.encode() not in path.read_bytes()
+
+
+def test_a_cache_file_from_an_earlier_build_is_cleaned_at_start(cache_dir):
+    """A file whose deleted row sits in a free page from before secure_delete."""
+    path = cache_dir / "c.sqlite"
+    DurableStore(path)
+    connection = sqlite3.connect(path)
+    with connection:
+        connection.execute(
+            "INSERT INTO cache (key, format, state) VALUES ('old', 1, ?)", (SECRET * 2000,)
+        )
+    with connection:
+        connection.execute("DELETE FROM cache WHERE key = 'old'")
+    connection.close()
+    assert SECRET.encode() in path.read_bytes(), "the premise: the residue is in the file"
+    DurableStore(path)
+    assert SECRET.encode() not in path.read_bytes()
+
+
+# ---------------------------------------------------------------------------
+# OP-5-6: the files are bound to the lane, garage and platform that wrote them.
+# ---------------------------------------------------------------------------
+
+
+def test_another_lanes_cache_is_wiped_and_this_lanes_is_kept(cache_dir):
+    from lane_controller.durable import store_identity
+
+    path = cache_dir / "c.sqlite"
+    mine = store_identity("lane-a", "site-1", "https://p.example")
+    DurableStore(path, identity=mine).write({"rules": {"A-1": "allow"}})
+    # THE CONTROL: the same lane restarting keeps what it held.
+    assert DurableStore(path, identity=mine).read() == {"rules": {"A-1": "allow"}}
+    for other in (
+        store_identity("lane-b", "site-1", "https://p.example"),
+        store_identity("lane-a", "site-2", "https://p.example"),
+        store_identity("lane-a", "site-1", "https://other.example"),
+    ):
+        DurableStore(path, identity=mine).write({"rules": {"A-1": "allow"}})
+        assert DurableStore(path, identity=other).read() is None
+
+
+def test_another_lanes_outbox_with_stays_in_it_is_refused_never_sent_or_dropped(cache_dir):
+    from lane_controller.durable import OutboxStore, StoreIdentityMismatch, store_identity
+    from lane_controller.events import LaneEvent
+
+    path = cache_dir / "o.sqlite"
+    mine = store_identity("lane-a", "site-1", None)
+    other = store_identity("lane-b", "site-1", None)
+    OutboxStore(path, identity=mine).add(
+        LaneEvent(kind="session_open", lane_id="lane-a", at=1.0, detail={"plate": "A-1"})
+    )
+    with pytest.raises(StoreIdentityMismatch):
+        OutboxStore(path, identity=other)
+    held = OutboxStore(path, identity=mine).held()
+    assert [e.detail["plate"] for e in held] == ["A-1"], "the stay is still there"
+
+
+def test_an_empty_outbox_of_another_lane_is_taken_and_an_unstamped_one_is_adopted(cache_dir):
+    from lane_controller.durable import OutboxStore, StoreIdentityMismatch, store_identity
+
+    path = cache_dir / "o.sqlite"
+    OutboxStore(path)  # an earlier build: no stamp
+    OutboxStore(path, identity=store_identity("lane-a", "s", None))
+    OutboxStore(path, identity=store_identity("lane-b", "s", None))  # empty: re-stamped
+    with pytest.raises(StoreIdentityMismatch):
+        store = OutboxStore(path, identity=store_identity("lane-b", "s", None))
+        from lane_controller.events import LaneEvent
+
+        store.add(LaneEvent(kind="session_open", lane_id="lane-b", at=1.0, detail={}))
+        OutboxStore(path, identity=store_identity("lane-a", "s", None))
+
+
+def test_wire_lane_stamps_the_cache_with_the_configured_lane(cache_dir):
+    path = cache_dir / "c.sqlite"
+    first = cli.wire_lane(a_config(cache_path=str(path)), platform=None)
+    first.controller.cache.load([Rule(plate="A-1", allow=True)], default_action="allow")
+    assert DurableStore(path).read() is not None
+    cli.wire_lane(a_config(cache_path=str(path), lane_id="lane-other"), platform=None)
+    assert DurableStore(path).read() is None or not DurableStore(path).read().get("rules")
+
+
+def test_an_outbox_from_an_earlier_build_is_cleaned_once_on_its_first_stamp(cache_dir):
+    """OP-5-13, the outbox: a stay an earlier build removed (DELETE without
+    secure_delete) left its plate in a free page. The first start that stamps
+    the file VACUUMs it; later starts do not rewrite it again."""
+    from lane_controller.durable import OutboxStore, store_identity
+
+    path = cache_dir / "o.sqlite"
+    OutboxStore(path)  # the tables, as an earlier build made them
+    connection = sqlite3.connect(path)  # an earlier build: no secure_delete
+    with connection:
+        connection.execute(
+            "INSERT INTO outbox (event_id, at, kind, lane_id, detail) VALUES (?, 1, ?, ?, ?)",
+            ("e-1", "session_open", "lane-a", SECRET * 2000),
+        )
+    with connection:
+        connection.execute("DELETE FROM outbox WHERE event_id = 'e-1'")
+    connection.close()
+    assert SECRET.encode() in path.read_bytes(), "the premise: the residue is in the file"
+
+    mine = store_identity("lane-a", "s", None)
+    OutboxStore(path, identity=mine)
+    assert SECRET.encode() not in path.read_bytes()
+
+    vacuums = []
+    import lane_controller.durable as durable_module
+
+    real = durable_module._vacuum
+    durable_module._vacuum = lambda p: (vacuums.append(p), real(p))[1]
+    try:
+        OutboxStore(path, identity=mine)
+    finally:
+        durable_module._vacuum = real
+    assert vacuums == [], "a stamped outbox is not rewritten on every start"
+
+
+def test_an_outbox_whose_vacuum_fails_keeps_every_row_and_tries_again(cache_dir, monkeypatch):
+    from lane_controller import durable as durable_module
+    from lane_controller.durable import OutboxStore, store_identity
+    from lane_controller.events import LaneEvent
+
+    path = cache_dir / "o.sqlite"
+    OutboxStore(path).add(
+        LaneEvent(kind="session_open", lane_id="lane-a", at=1.0, detail={"plate": "A-1"})
+    )
+
+    def full_disk(p):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(durable_module, "_vacuum", full_disk)
+    store = OutboxStore(path, identity=store_identity("lane-a", "s", None))
+    assert [e.detail["plate"] for e in store.held()] == ["A-1"]
+    with sqlite3.connect(path) as c:
+        c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        assert c.execute("SELECT value FROM meta WHERE key='identity'").fetchone() is None, (
+            "left unstamped, so the next start tries again"
+        )
+
+
+def test_one_platform_typed_two_ways_is_one_identity():
+    from lane_controller.durable import store_identity
+
+    one = store_identity("l", "s", "https://p.example")
+    for same in ("https://p.example/", "HTTPS://P.Example", "https://p.example:443/"):
+        assert store_identity("l", "s", same) == one, same
+    # THE CONTROL: another host, port or path is another platform.
+    for other in ("https://q.example", "https://p.example:8443", "https://p.example/v2"):
+        assert store_identity("l", "s", other) != one, other
+
+
+# ---------------------------------------------------------------------------
+# A FULL DISK: a lane that `main` would start still starts.
+#
+# Re-review of #60: every start re-wrote the identity stamp and VACUUMed the
+# cache with no try, so on a full disk `serve` stopped starting where `main`
+# did. The disk here is SQLite answering SQLITE_FULL to every statement that
+# would write -- what a real full filesystem does (checked by hand on a 1 MB
+# tmpfs) -- while a read, and a CREATE ... IF NOT EXISTS of a table that is
+# already there, go through, as they do on a full disk.
+# ---------------------------------------------------------------------------
+
+_WRITES = ("INSERT", "REPLACE", "UPDATE", "DELETE", "VACUUM", "CREATE")
+
+
+class _FullDiskConnection:
+    def __init__(self, real):
+        self._real = real
+
+    def _would_write(self, sql: str) -> bool:
+        text = " ".join(sql.split()).upper()
+        if not text.startswith(_WRITES):
+            return False
+        if text.startswith("CREATE TABLE IF NOT EXISTS "):
+            name = text.split()[5].split("(")[0].lower()
+            return self._real.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone() is None
+        return True
+
+    def execute(self, sql, *args):
+        if self._would_write(sql):
+            raise sqlite3.OperationalError("database or disk is full")
+        return self._real.execute(sql, *args)
+
+    def executemany(self, sql, *args):
+        if self._would_write(sql):
+            raise sqlite3.OperationalError("database or disk is full")
+        return self._real.executemany(sql, *args)
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._real.__exit__(*exc)
+
+    def close(self):
+        self._real.close()
+
+
+@pytest.fixture
+def full_disk(monkeypatch):
+    from lane_controller import durable as durable_module
+
+    real_connect = sqlite3.connect
+
+    def turn_on():
+        monkeypatch.setattr(
+            durable_module.sqlite3, "connect",
+            lambda *a, **k: _FullDiskConnection(real_connect(*a, **k)),
+        )
+
+    return turn_on
+
+
+def _a_stay():
+    from lane_controller.events import LaneEvent
+
+    return LaneEvent(kind="session_open", lane_id="lane-a", at=1.0, detail={"plate": "A-1"})
+
+
+def test_stamped_stores_start_on_a_full_disk_and_keep_everything(cache_dir, full_disk):
+    from lane_controller.durable import OutboxStore, store_identity
+
+    mine = store_identity("lane-a", "s", None)
+    DurableStore(cache_dir / "c.sqlite", identity=mine).write({"rules": {"A-1": "allow"}})
+    OutboxStore(cache_dir / "o.sqlite", identity=mine).add(_a_stay())
+    full_disk()
+    cache = DurableStore(cache_dir / "c.sqlite", identity=mine)
+    outbox = OutboxStore(cache_dir / "o.sqlite", identity=mine)
+    assert cache.read() == {"rules": {"A-1": "allow"}}
+    assert [e.detail["plate"] for e in outbox.held()] == ["A-1"]
+
+
+def test_unstamped_stores_from_an_earlier_build_start_on_a_full_disk(cache_dir, full_disk):
+    from lane_controller.durable import OutboxStore, store_identity
+
+    DurableStore(cache_dir / "c.sqlite").write({"rules": {"A-1": "allow"}})
+    OutboxStore(cache_dir / "o.sqlite").add(_a_stay())
+    full_disk()
+    mine = store_identity("lane-a", "s", None)
+    assert DurableStore(cache_dir / "c.sqlite", identity=mine).read() == {
+        "rules": {"A-1": "allow"}
+    }
+    held = OutboxStore(cache_dir / "o.sqlite", identity=mine).held()
+    assert [e.detail["plate"] for e in held] == ["A-1"]
+
+
+def test_another_lanes_files_on_a_full_disk_are_still_refused(cache_dir, full_disk):
+    """The start goes on past a write the disk will not take -- never past an
+    identity that does not match: another lane's cache that cannot be wiped,
+    and another lane's outbox with stays in it, still stop `serve`."""
+    from lane_controller.durable import OutboxStore, StoreIdentityMismatch, store_identity
+
+    theirs = store_identity("lane-b", "s", None)
+    DurableStore(cache_dir / "c.sqlite", identity=theirs).write({"rules": {"B-1": "allow"}})
+    OutboxStore(cache_dir / "o.sqlite", identity=theirs).add(_a_stay())
+    full_disk()
+    mine = store_identity("lane-a", "s", None)
+    with pytest.raises(StoreIdentityMismatch):
+        DurableStore(cache_dir / "c.sqlite", identity=mine)
+    with pytest.raises(StoreIdentityMismatch):
+        OutboxStore(cache_dir / "o.sqlite", identity=mine)
+
+
+def test_another_lanes_empty_outbox_on_a_full_disk_is_refused_and_not_written(
+    cache_dir, full_disk, tmp_path, monkeypatch, capsys
+):
+    """Re-review of #60: an EMPTY outbox stamped for another lane that a full
+    disk will not let this lane re-stamp was logged and used, unstamped for
+    this lane -- so this lane's stays went into the other lane's file. It is
+    refused, as the cache is, and the file is left exactly as it was."""
+    from lane_controller import cli
+    from lane_controller.durable import OutboxStore, StoreIdentityMismatch, store_identity
+
+    path = cache_dir / "o.sqlite"
+    OutboxStore(path, identity=store_identity("lane-b", "s", None))
+    before = path.read_bytes()
+    full_disk()
+    with pytest.raises(StoreIdentityMismatch):
+        OutboxStore(path, identity=store_identity("lane-a", "s", None))
+    assert path.read_bytes() == before, "the other lane's file was written"
+
+    # And `serve` exits 2 on it, before the port opens.
+    def refuse(*args, **kwargs):
+        raise StoreIdentityMismatch("another lane's outbox")
+
+    monkeypatch.setattr(cli, "wire_lane", refuse)
+    monkeypatch.setattr(cli, "platform_client_for", lambda config, token_file: None)
+    example = Path(__file__).resolve().parent.parent / "config" / "lane.example.toml"
+    assert cli.main(["serve", "--config", str(example)]) == 2
+    assert "another lane's outbox" in capsys.readouterr().err

@@ -312,3 +312,53 @@ def test_a_lane_built_to_the_drawing_counts_inside():
 
     assert len(platform.open_sessions) == 1
     assert inside_count(platform) == 1, "the car the drawing's lane admitted is not counted inside"
+
+
+# ---------------------------------------------------------------------------
+# OP-5-4: a closing-loop driver that RAISES after the vend is read as a
+# timeout -- the car the barrier opened for still has its record, and the
+# transit is not left pending (which stood the idle poll down for good).
+# ---------------------------------------------------------------------------
+
+
+def _raising(window_seconds):
+    raise OSError("the loop board went away")
+
+
+def test_a_driver_that_raises_after_an_entry_vend_still_opens_the_stay():
+    controller, vend, loops = build(crossings=[])
+    loops.wait_for_sequence = _raising
+    controller.run_once()
+    assert vend.vend_count == 1
+    order = kinds(controller)
+    assert ENTRY_UNCONFIRMABLE in order and SESSION_OPEN in order
+    assert detail(controller, SESSION_OPEN)["entry_confirmation"] == "unconfirmable"
+    assert detail(controller, ENTRY_UNCONFIRMABLE)["driver_raised"] is True
+    assert controller.transit_state == TransitState.UNCONFIRMABLE.value
+    assert controller._nothing_pending(), "the idle poll is not stood down"
+    assert controller.loop_driver_timed_out
+
+
+def test_a_driver_that_raises_after_an_exit_vend_closes_held():
+    controller, vend, loops = build(direction="exit", crossings=[])
+    loops.wait_for_sequence = _raising
+    controller.run_once()
+    assert vend.vend_count == 1
+    assert EXIT_HELD in kinds(controller)
+    assert detail(controller, SESSION_CLOSE)["exit_confirmation"] == HELD
+    assert controller._nothing_pending()
+
+
+def test_a_driver_that_raises_under_the_assisted_vend_opens_the_stay():
+    from lane_controller.service import LaneService
+    from test_vend import a_lane_awaiting_a_completion, complete, settled
+
+    controller = a_lane_awaiting_a_completion()
+    controller.closing_loops.wait_for_sequence = _raising
+    service = LaneService(controller)
+    status, _ = complete(service, controller)
+    assert status == 202
+    settled(service)
+    assert controller.vend.vend_count == 1
+    assert SESSION_OPEN in kinds(controller), "the car the person let in has its stay"
+    assert controller.transit_state == TransitState.UNCONFIRMABLE.value

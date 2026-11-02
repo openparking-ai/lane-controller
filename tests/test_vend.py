@@ -272,12 +272,26 @@ def test_a_lane_with_an_act_token_and_no_read_token_still_serves_the_reads():
         assert _post(base, "/v1/lane/vend", {}, token=None)[0] == 401
 
 
-def test_a_loopback_lane_with_no_credentials_serves_the_vend():
-    """The default, and the control on every 403 above."""
+def test_a_loopback_lane_with_no_credentials_serves_no_vend():
+    """OP-5-2: loopback is every process on the box, and any browser whose page
+    rebinds a DNS name to 127.0.0.1. The barrier takes its own token there too."""
     controller = a_lane_awaiting_a_completion()
     service = LaneService(controller)
     with serving(make_server(service, port=0)) as base:
-        status, accepted = _post(base, "/v1/lane/vend", body(controller))
+        status, refused = _post(base, "/v1/lane/vend", body(controller))
+        assert status == 403, refused
+        assert "no credential configured" in refused["error"]
+        # The reads are still the loopback default.
+        assert _get(base, "/v1/lane")[0] == 200
+    assert controller.vend.vend_count == 0
+
+
+def test_a_loopback_lane_with_the_act_token_serves_the_vend():
+    """The control on every 403 above."""
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    with serving(make_server(service, port=0, act_token=ACT_TOKEN)) as base:
+        status, accepted = _post(base, "/v1/lane/vend", body(controller), token=ACT_TOKEN)
         assert status == 202, accepted
         assert accepted["vend_commanded"] is True
         assert "opened" not in accepted, "nothing here measures the boom"
@@ -286,6 +300,44 @@ def test_a_loopback_lane_with_no_credentials_serves_the_vend():
         assert isinstance(accepted["event_cursor"], int)
     settled(service)
     assert controller.vend.vend_count == 1
+
+
+def test_a_vend_whose_host_is_a_name_that_is_not_this_lane_is_refused():
+    """OP-5-2: a DNS-rebinding page arrives with ITS name in Host."""
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    with serving(make_server(service, port=0, act_token=ACT_TOKEN)) as base:
+        port = base.rsplit(":", 1)[1]
+        for host in (f"attacker.example:{port}", "rebind.127.0.0.1.nip.io", ""):
+            status, refused = _post(
+                base, "/v1/lane/vend", body(controller), token=ACT_TOKEN,
+                headers={"Host": host},
+            )
+            assert status == 403, (host, refused)
+            assert "Host" in refused["error"]
+        assert controller.vend.vend_count == 0
+        # THE CONTROL: loopback by name is this lane.
+        status, accepted = _post(
+            base, "/v1/lane/vend", body(controller), token=ACT_TOKEN,
+            headers={"Host": f"localhost:{port}"},
+        )
+        assert status == 202, accepted
+    settled(service)
+    assert controller.vend.vend_count == 1
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "application/x-www-form-urlencoded", ""])
+def test_a_vend_that_is_not_sent_as_json_is_refused(content_type):
+    """OP-5-2: text/plain is what a cross-site form sends without asking first."""
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    with serving(make_server(service, port=0, act_token=ACT_TOKEN)) as base:
+        status, refused = _post(
+            base, "/v1/lane/vend", body(controller), token=ACT_TOKEN,
+            headers={"Content-Type": content_type},
+        )
+        assert status == 415, refused
+    assert controller.vend.vend_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1537,3 +1589,43 @@ def test_a_credential_in_a_non_ascii_query_is_still_caught_by_value():
     with serving(make_server(service, port=0, token=READ_TOKEN, act_token=ACT_TOKEN)) as base:
         assert _raw(base, "GET", f"/v1/lane?zz={ACT_TOKEN}") == 401
         assert _raw(base, "GET", f"/v1/lane?zz={READ_TOKEN}") == 401
+
+
+# ---------------------------------------------------------------------------
+# OP-5-10: the decision a vend completes is the one it named, under the lock
+# ---------------------------------------------------------------------------
+
+
+def test_a_new_arrival_between_the_check_and_the_claim_completes_nothing(monkeypatch):
+    """The route compares `decision_at` without the lock; a car decided in
+    between made a DIFFERENT car's decision the last one. The claim re-checks
+    it, and the vend that named the old decision moves nothing."""
+    from lane_controller.vend import AssistedVend
+
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    named = controller.last_decision_at
+    original = AssistedVend._refuse
+
+    def then_another_car(self, request):
+        refusal = original(self, request)
+        # The next car's decision, landing in the window.
+        controller.last_decision_at = "2099-01-01T00:00:00+00:00"
+        controller.last_decision_completed_at = None
+        return refusal
+
+    monkeypatch.setattr(AssistedVend, "_refuse", then_another_car)
+    status, refused = complete(service, controller, decision_at=named)
+    assert status == 409, refused
+    assert refused["code"] == VendRefusal.DECISION_MISMATCH.value
+    assert controller.vend.vend_count == 0
+    assert controller.last_decision_completed_at is None, "the new car's decision is untouched"
+
+
+def test_the_control_the_decision_named_is_still_the_last_one_and_vends():
+    controller = a_lane_awaiting_a_completion()
+    service = LaneService(controller)
+    status, _ = complete(service, controller)
+    assert status == 202
+    settled(service)
+    assert controller.vend.vend_count == 1

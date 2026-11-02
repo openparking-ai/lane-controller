@@ -58,6 +58,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import datetime
 
 from . import exit_case
 from .config import LaneConfig
@@ -228,6 +229,27 @@ class DecisionAlreadyCompleted(Exception):
     vend answers it `already_completed`."""
 
 
+class DecisionSuperseded(Exception):
+    """`complete_vend` was asked to complete a decision that is no longer this
+    lane's last one -- another car arrived while the route judged the call --
+    and moved nothing. The assisted vend answers it `decision_mismatch`."""
+
+
+def _same_instant(a: str | None, b: str | None) -> bool:
+    """Whether two ISO 8601 strings name one moment (`Z` and `+00:00` alike)."""
+    if a is None or b is None:
+        return False
+    try:
+        left = datetime.fromisoformat(a.replace("Z", "+00:00"))
+        right = datetime.fromisoformat(b.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    try:
+        return left == right
+    except TypeError:  # one naive, one aware: not the same moment to this lane
+        return False
+
+
 class LaneController:
     def __init__(
         self,
@@ -262,6 +284,9 @@ class LaneController:
         #: Who takes the case to open the barrier: the lane's turn when the
         #: case settles, or a person's vend at the lane. Exactly one does.
         self._exit_lock = threading.Lock()
+        #: The last `session_close` this lane recorded, for the caller that
+        #: keeps pictures against it (`_unpended_exit`).
+        self._last_close: LaneEvent | None = None
         #: Clear while a covered QR's ask-again is on the network: a person's
         #: vend waits for it (`EXIT_SUPERSEDE_WAIT_SECONDS`) and then takes the
         #: case the car is really on, so the close names that case.
@@ -719,13 +744,18 @@ class LaneController:
         # reconstructed from the event queue, which `flush()` empties: a
         # consumer asking what the lane last decided must not get a different
         # answer depending on whether the platform happened to be reachable.
-        self.last_decision = decision
-        self.last_decision_at = to_iso(self._clock())
-        # A NEW CASE, so nothing has completed it. This is the only way back to
-        # a completable decision, and it is the whole of "one decision, one
-        # vend": the second vend a caller can legitimately get is the one that
-        # belongs to the second car.
-        self.last_decision_completed_at = None
+        #
+        # UNDER `_exit_lock`, the three as one: a completion claims the
+        # decision under it (`complete_vend`, `observe_qr`), so it sees the
+        # previous car's decision whole or this one's, never a mix.
+        with self._exit_lock:
+            self.last_decision = decision
+            self.last_decision_at = to_iso(self._clock())
+            # A NEW CASE, so nothing has completed it. This is the only way
+            # back to a completable decision, and it is the whole of "one
+            # decision, one vend": the second vend a caller can legitimately
+            # get is the one that belongs to the second car.
+            self.last_decision_completed_at = None
         self.last_read_ref = identity.read_ref
         self.last_cause = identity.unavailable.value if identity.unavailable else None
         # A refused car's arming read is held until the next arrival, for the
@@ -858,7 +888,9 @@ class LaneController:
     # The ASSISTED vend: an identity a human or a display code completed.
     # ------------------------------------------------------------------
 
-    def complete_vend(self, identity, *, authorised_by: str, assisted: dict) -> str:
+    def complete_vend(
+        self, identity, *, authorised_by: str, assisted: dict, decision_at: str | None = None
+    ) -> str:
         """Write the identity, pulse the relay, record it, open a pending entry.
 
         **THE ORDER IS THE SAFETY PROPERTY AND IT IS THE WHOLE OF THIS METHOD.**
@@ -909,6 +941,11 @@ class LaneController:
         # takes: the route checked `completed` without it, and a case that
         # settled in between has already moved the barrier for this car.
         with self._exit_lock:
+            # THE DECISION THE CALLER NAMED, re-checked where it is claimed: the
+            # route compared it without this lock, and an arrival in between
+            # made a different car's decision the last one.
+            if decision_at is not None and not _same_instant(decision_at, self.last_decision_at):
+                raise DecisionSuperseded(self.last_decision_at)
             if self.last_decision_completed_at is not None:
                 raise DecisionAlreadyCompleted(self.last_decision_completed_at)
             self.last_decision_completed_at = to_iso(self._clock())
@@ -1407,10 +1444,10 @@ class LaneController:
         a log line.
 
         A person's completion (`POST /v1/lane/vend`) of the same refusal at
-        the same moment is checked against once more, just before the relay,
-        by `last_decision_completed_at`; the vend route checks the same value
-        on its own thread, so two completions in the same instant are not
-        excluded by a lock. Stated, not guarded.
+        the same moment is excluded by a lock: just before the relay the QR
+        CLAIMS the decision (`last_decision_completed_at`) under `_exit_lock`,
+        where `complete_vend` claims it too, so only one of them moves the
+        barrier and the other answers `already_completed` or opens nothing.
         """
         if self.qr_scanner is None:
             return None
@@ -1534,6 +1571,20 @@ class LaneController:
             # the exit is settled, and only through the one opener
             # (`_let_out`). The QR settles the car's case instead.
             return self._qr_settles_exit_case(qr_fields, cleared_for=exit_clear)
+        # THE CLAIM, under the lock `complete_vend` claims under: a person's
+        # completion that landed while the platform was asked has the decision.
+        with self._exit_lock:
+            claimed = (
+                self.last_decision_at == decided_at and self.last_decision_completed_at is None
+            )
+            if claimed:
+                self.last_decision_completed_at = to_iso(self._clock())
+        if not claimed:
+            log.warning(
+                "lane %s: a QR was answered for a refusal a person completed meanwhile; not "
+                "vended", lane
+            )
+            return None
         self.vend.vend(REASON_QR_OPENED)
         vended = self.events.record(
             "vended", lane, reason=REASON_QR_OPENED,
@@ -2063,7 +2114,14 @@ class LaneController:
         # loop confirms it, and with nothing otherwise.
         between = self._take_pictures(BETWEEN_PICTURES) if self.config.direction == "entry" else []
         started = self._clock()
-        crossing = self._as_declared(self._read_closing_loops(window, at))
+        try:
+            crossing = self._as_declared(self._read_closing_loops(window, at))
+        except Exception:  # noqa: BLE001 -- a driver that raises is a driver that did not answer
+            self._loop_driver_raised(
+                identity, at, names, geometry, claimed=mine(), exit_pricing=exit_pricing,
+                arming=[*arming, *between], exit_id=exit_id,
+            )
+            return
         elapsed = self._clock() - started
 
         # THE DRIVER RETURNED. Whether this call is still the one that may say
@@ -2139,6 +2197,46 @@ class LaneController:
             self._record_session(
                 identity, at, confirmation=HELD, exit_pricing=exit_pricing, exit_id=exit_id
             )
+
+    def _loop_driver_raised(
+        self, identity, at: str, names, geometry, *, claimed: bool, exit_pricing, arming, exit_id
+    ) -> None:
+        """The closing-loop driver RAISED after the vend: read as a timeout.
+
+        Left to propagate, the transit stayed `pending` for ever -- which
+        stands the idle poll down at this lane for good -- and the car the
+        barrier opened for had no record. The barrier has opened, so the car
+        is not left without one: at an entry the stay is OPENED, unconfirmable
+        (the loops could neither confirm nor refute it, and every car let in
+        is a stay); at an exit the close is recorded `held`, a flag for a
+        person, as an elapsed window is.
+        """
+        lane = self.config.lane_id
+        log.exception("lane %s: the closing-loop driver raised; read as a timeout", lane)
+        if not claimed:
+            return
+        # MEASURED FROM THIS TOO: a driver that raises is a loop not answering.
+        self._loop_driver_timed_out = True
+        if self.config.direction == "exit":
+            self.events.record(
+                names.held, lane, reason=REASON_LOOP_DRIVER_TIMEOUT, at=at,
+                geometry_assumed=geometry, driver_raised=True,
+            )
+            self._transit(TransitState.HELD, at)
+            self._record_session(
+                identity, at, confirmation=HELD, exit_pricing=exit_pricing, exit_id=exit_id
+            )
+            return
+        self.events.record(
+            names.unconfirmable, lane, reason=REASON_LOOP_DRIVER_TIMEOUT, at=at,
+            geometry_assumed=geometry, driver_raised=True,
+        )
+        self._transit(TransitState.UNCONFIRMABLE, at)
+        opened = self._record_session(
+            identity, at, confirmation=UNCONFIRMABLE, exit_pricing=exit_pricing, exit_id=exit_id
+        )
+        if opened is not None and arming:
+            self.events.queue_pictures(opened.event_id, list(arming))
 
     def transit_timed_out(self, identity, at: str, deadline: float) -> None:
         """The loop driver did not return inside this lane's own deadline.
@@ -2301,8 +2399,9 @@ class LaneController:
         an entry the wrong way, which is not an entry of any kind and has no
         name on the platform yet; it is logged, and it is the one thing this
         method sees and does not record. An EXIT lane's unpended crossing is
-        a car that left without paying, a different fact about different
-        money with no kind on the platform yet; logged, not recorded.
+        a car that left with no open command -- by hand, through a raised
+        barrier, behind another -- and is recorded as a held close for a
+        person (`_unpended_exit`).
         """
         if self.closing_loops is None:
             return None
@@ -2371,12 +2470,7 @@ class LaneController:
             )
             return None
         if self.config.direction != "entry":
-            log.warning(
-                "lane %s: a vehicle crossed this EXIT lane's loops with nothing pending; "
-                "a stay left unbilled, and no event kind names it yet",
-                lane,
-            )
-            return None
+            return self._unpended_exit(lane)
 
         at = to_iso(self._clock())
         log.warning(
@@ -2444,6 +2538,61 @@ class LaneController:
             self.events.queue_pictures(unadmitted.event_id, frames)
         self._unadmitted_leaves_the_box()
         return ENTRY_UNADMITTED
+
+    def _unpended_exit(self, lane: str) -> str | None:
+        """A car crossed this EXIT's loops with nothing pending: it left with
+        no open command -- a barrier raised by hand (the platform down, a
+        person letting the car out), a barrier that is up, a tailgater.
+
+        It used to be a log line and nothing else, so a hand let-out left no
+        record and the stay stayed open for ever. Now it is the close the
+        loops saw, recorded `held` -- a flag for a person, never a settled
+        exit -- in the outbox file like every close, with no decision the
+        barrier moved on (none was made) and the closing-loop pictures kept
+        against it. Only a crossing the camera says no car made records
+        nothing, exactly as at an entry.
+        """
+        frames = self._take_pictures(CLOSING_PICTURES)
+        identity = self._crossing_identity(frames)
+        if identity is None:
+            log.warning(
+                "lane %s: the loops after this EXIT's gate reported a crossing with nothing "
+                "pending and the camera saw no car; not recorded", lane,
+            )
+            return None
+        if self._late_admitted(identity):
+            # The car this lane let out and held, crossing after the window:
+            # its close was recorded `held` when the window ran out.
+            log.info("lane %s: the held exit's car crossed late; its close is recorded", lane)
+            return None
+        log.warning(
+            "lane %s: a vehicle crossed this EXIT lane's loops with nothing pending; recorded "
+            "as a held close for a person", lane,
+        )
+        at = to_iso(self._clock())
+        # A CASE WAITING FOR A CAR AT THE BARRIER is that car's, and it has
+        # gone: taken here as a person's vend takes it, under the same lock,
+        # so nothing opens for it again and its close names the case.
+        with self._exit_lock:
+            case, self._exit_case = self._exit_case, None
+            if case is not None:
+                case.taken = True
+                if self.last_decision_completed_at is None:
+                    self.last_decision_completed_at = at
+        exit_id = case.exit_id if case is not None else None
+        self.events.record(
+            EXIT_HELD, lane, reason=REASON_NO_PENDING_ENTRY, at=at,
+            geometry_assumed=self.config.loops.as_published(), no_open_command=True,
+            **({"exit_id": exit_id} if exit_id else {}),
+        )
+        self._record_session(identity, at, confirmation=HELD, exit_id=exit_id)
+        self.events.queue_pictures(self._last_close.event_id, frames)
+        if case is not None:
+            self._cancel_on_reader(case)
+            if self.exit_display is not None:
+                self.exit_display.show_exit(None)
+        self._unadmitted_leaves_the_box()
+        return EXIT_HELD
 
     def _unadmitted_leaves_the_box(self) -> None:
         """Flush, exactly as every other path that writes a record ends.
@@ -2930,7 +3079,7 @@ class LaneController:
             if exit_id is not None:
                 exit_id = self._close_follows.pop(exit_id, exit_id)
             let_out_by = self._take_let_out_by(exit_id)
-        self.events.record(
+        self._last_close = self.events.record(
             SESSION_CLOSE,
             lane,
             **self._identity_detail(identity, with_region=False),

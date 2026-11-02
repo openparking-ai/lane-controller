@@ -82,6 +82,7 @@ with what the modules would have said.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -89,6 +90,31 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from rate_engine.contract import run_quote, run_tax
 
 from .decision import DecisionCache
+
+
+def _engine_identity() -> dict:
+    """Which rate engine this lane prices with: the installed version and,
+    when it was installed from a pinned commit, that commit. The lane and the
+    platform each pin the engine, and a number the barrier showed is only the
+    platform's number if both ran the same engine -- so the decision says
+    which one it ran. Unknown parts are None, never guessed."""
+    from importlib import metadata
+
+    try:
+        dist = metadata.distribution("openparking-rate-engine")
+    except metadata.PackageNotFoundError:
+        return {"version": None, "commit": None}
+    commit = None
+    try:
+        direct = json.loads(dist.read_text("direct_url.json") or "{}")
+        commit = (direct.get("vcs_info") or {}).get("commit_id")
+    except (ValueError, AttributeError):
+        commit = None
+    return {"version": dist.version, "commit": commit}
+
+
+#: Read once: the engine in this process does not change while it runs.
+RATE_ENGINE = _engine_identity()
 
 COVERED = "covered"
 PRICED = "priced"
@@ -146,6 +172,8 @@ class ExitPricing:
         }
         if self.status in (PRICED, ENGINE_REFUSED, ENGINE_INVALID):
             detail.update(
+                # The engine that produced this answer (`RATE_ENGINE`).
+                rate_engine=dict(RATE_ENGINE),
                 entry_at=self.entry_at,
                 exit_at=self.exit_at,
                 session_id=self.session_id,
@@ -273,6 +301,10 @@ def register_cover(
     covered_by: list[str] = []
     matched: list[dict] = []
     for module, row, head in cache.register_rows_for(identity_text):
+        # A register kept past the bound covers nobody: what it says may be
+        # a pass since cancelled, unpaid or revoked (`stale_register_cover`).
+        if cache.register_past_bound(module):
+            continue
         if row_covers(module, row, head, day):
             if module not in covered_by:
                 covered_by.append(module)
@@ -280,6 +312,20 @@ def register_cover(
                 {"module": module, "pass": row.get("pass"), "agreement": row.get("agreement")}
             )
     return covered_by, matched
+
+
+def stale_register_cover(identity_text: str, cache: DecisionCache, day: date) -> list[str]:
+    """The modules whose register, KEPT past the bound, would cover this
+    identity on `day`. Not a cover: a reason the lane cannot decide alone."""
+    stale: list[str] = []
+    for module, row, head in cache.register_rows_for(identity_text):
+        if (
+            cache.register_past_bound(module)
+            and module not in stale
+            and row_covers(module, row, head, day)
+        ):
+            stale.append(module)
+    return stale
 
 
 def price_exit(identity_text: str, cache: DecisionCache, *, now: float) -> ExitPricing:
@@ -307,6 +353,11 @@ def price_exit(identity_text: str, cache: DecisionCache, *, now: float) -> ExitP
             status=COVERED, covered_by=tuple(covered_by), matched=tuple(matched),
             computed_from=computed_from,
         )
+    if stale_register_cover(identity_text, cache, day):
+        # Named only by a register the platform has not carried for longer
+        # than this cache trusts anything: never out free on it, and never
+        # priced as if it said nothing either. The exit's case decides.
+        return ExitPricing(status=STALE_FACTS, computed_from=computed_from)
 
     stays = cache.open_stays_for(identity_text)
     if not stays:

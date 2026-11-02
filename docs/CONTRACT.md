@@ -564,8 +564,15 @@ driver's word for when they came in, or let out by a person.
 - **When it is settled**, the barrier opens, `vended` names the case, and the
   stay's close names it too. Then a text receipt goes to the phone the driver
   gave, once, best effort: after the barrier, never before it.
-- **A person can always open it**: `POST /v1/lane/vend` at the lane, or the
-  case's let-out on the platform. The lane drops the case when a person opens
+- **A person can always open it**: the case's let-out on the platform, or
+  `POST /v1/lane/vend` where the lane serves it -- an ENTRY lane; an exit lane
+  answers `can_vend: false` and serves no vend route. **With the platform down
+  a person raises the barrier by hand**, and the lane records it: a car the
+  loops after the gate see go with nothing pending is an `exit_held` event
+  (`no_open_command: true`) and a `session_close` recorded `held` -- in the
+  outbox file, with the closing-loop pictures kept against it, naming the case
+  the car was waiting on (which is then taken, so nothing opens for it again).
+  It is a flag for a person, never a settled exit. The lane drops the case when a person opens
   for the car, the close of that car names the case, and the barrier moves
   once: the vend claims the decision under the lock the case's own opening
   takes, and one that finds it already completed is refused
@@ -576,7 +583,9 @@ driver's word for when they came in, or let out by a person.
   log names this lane computer. A close the platform
   answers 503 `payment_unsettled` (the case's payment could not be settled
   with Stripe yet) stays in the outbox and is sent again, as any 5xx is.
-- **Offline**, a covered car still leaves; every other car waits for a person.
+- **Offline**, a covered car still leaves; every other car waits for a person,
+  who lets it out by hand (above): recorded as a held close, never free and
+  never unrecorded.
 
 What the case carries about the car is its ID -- the plate's positioned
 characters, the colour code and the size -- and never the plate text; a plate
@@ -709,6 +718,13 @@ refuses a skew exactly as it refuses everything else, so this code answers
 attempted no platform call at all: nothing was sent, so nothing could have been
 refused, and a clock nobody has had checked is not a clock found correct.
 
+`platform_unreachable` reads the outbox's last platform call: `active` when it
+did not reach the platform, and **also when the platform refused this lane
+itself** — a `401` or `403`, or a `404` the lane's own rules read confirms. Then
+nothing queued is dropped: the stays' opens and closes stay in the outbox, the
+flush stops, and this code is the only thing that says why it is not draining.
+`ok` once a call is answered; `unknown` before any call, or with no platform.
+
 **It recovers.** The next write the platform ACCEPTS clears both, so the code
 reads `ok` again once the clock is fixed and the lane is being taken. A code
 that could only ever go one way would be a latch that reads like a state:
@@ -768,6 +784,12 @@ name suggests something else, so this says which: an assisted vend whose
 a run of crossings that were missed, which is the aggregation nobody has
 measured and which is still not built. The transit is published `unconfirmable`
 with reason `loop_driver_timeout` and no session is opened.
+
+A driver that **raises** after the vend — on any vend, ordinary or assisted —
+is read the same way and latches the same code, with `driver_raised: true` on
+the event, and with one difference: the barrier has opened, so the car keeps
+its record. At an entry the stay is opened `unconfirmable`; at an exit the
+close is recorded `held` beside an `exit_held` event, for a person.
 
 It is **latched** and it is never `ok`. A driver that stops answering is a fault
 somebody goes and fixes, so it does not clear the next time a transit happens to
@@ -1113,10 +1135,15 @@ a browser history, none of which anybody decided. Serving such a request would
 hand the caller a working integration that publishes its own credential on every
 call.
 
-**Loopback takes neither**, exactly as the reads do. Off loopback the service
-**refuses to start** without both — the read token because this publishes where
-a vehicle was, and the act token for the larger reason that the exposed thing is
-no longer a description of a lane, it is a barrier.
+**The reads on loopback take no token; the vend always takes its own.** Off
+loopback the service **refuses to start** without both — the read token because
+this publishes where a vehicle was, and the act token for the larger reason that
+the exposed thing is no longer a description of a lane, it is a barrier. On
+loopback a lane with no act token answers this route `403`: loopback is every
+process on the box and any browser page that rebinds a DNS name to `127.0.0.1`.
+The route also answers `403` when `Host` is not loopback or the bound address (a
+lane bound to every interface accepts any IP literal, never a name), and `415`
+for a body not sent as `application/json`.
 
 ### What is on this route and what is not
 

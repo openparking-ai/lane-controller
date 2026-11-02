@@ -4261,3 +4261,46 @@ def _break_the_settled_exit(monkeypatch):
 
     else:
         raise RuntimeError(f"unknown BREAK_EXIT_SETTLED mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Deliberate breakage, for the vehicle-id transport fail-control.
+#
+# scripts/vehicle_id_transport_fail_control.py sets BREAK_VEHICLE_ID and
+# requires tests/test_vehicle_id_client.py to FAIL. A guard on where the frames
+# and the token go that nobody has seen fail is not known to guard anything.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.fixture(autouse=True)
+def _break_the_vehicle_id_transport(monkeypatch):
+    mode = os.environ.get("BREAK_VEHICLE_ID")
+    if not mode:
+        return
+
+    import urllib.request
+
+    from lane_controller import vehicle_id_client as client_module
+
+    if mode == "redirect_followed":
+        # The proxy guard kept, the redirect guard gone: a 30x is followed.
+        monkeypatch.setattr(
+            client_module, "_opener",
+            lambda: urllib.request.build_opener(urllib.request.ProxyHandler({})),
+        )
+    elif mode == "proxy_used":
+        # The redirect guard kept, the proxy guard gone: http_proxy is obeyed.
+        monkeypatch.setattr(
+            client_module, "_opener",
+            lambda: urllib.request.build_opener(client_module._NoRedirect()),
+        )
+    elif mode == "no_bearer":
+        # The configured token is never sent.
+        monkeypatch.setattr(client_module, "_headers", lambda token: {})
+    elif mode == "any_address":
+        # Any vehicle_id_url at all is accepted.
+        from lane_controller import config as config_module
+
+        monkeypatch.setattr(config_module, "vehicle_id_url_fault", lambda url: None)
+    else:
+        raise RuntimeError(f"unknown BREAK_VEHICLE_ID mode: {mode}")

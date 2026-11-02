@@ -38,7 +38,14 @@ from pathlib import Path
 from .config import LaneConfig
 from .controller import LaneController
 from .decision import DecisionCache
-from .durable import CacheDirectoryUnsafe, DurableStore, OutboxStore, outbox_path
+from .durable import (
+    CacheDirectoryUnsafe,
+    DurableStore,
+    OutboxStore,
+    StoreIdentityMismatch,
+    outbox_path,
+    store_identity,
+)
 from .events import EventQueue
 from .platform_client import PlatformClient
 from .runner import LaneRunner
@@ -94,6 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
              "credential with nothing to present it to is a credential lying around. A FILE, "
              "for the same reason as the other two",
     )
+    serve.add_argument(
+        "--vehicle-id-token-file",
+        type=Path,
+        help="a file holding a bearer token sent with every read to [lane] vehicle_id_url, "
+             "when that service requires one. A FILE, for the same reason as the others",
+    )
     return parser
 
 
@@ -108,6 +121,7 @@ SECRET_FORBIDDEN_MODE = 0o077
 SECRET_FILE_IS = {
     "--auth-token-file": "the token every read route of this lane requires.",
     "--act-token-file": "the act token: it opens the barrier, through POST /v1/lane/vend.",
+    "--vehicle-id-token-file": "the token sent with every read to [lane] vehicle_id_url.",
     "--platform-token-file": (
         "this lane's device token: the platform takes stay opens and closes from whoever "
         "presents it."
@@ -172,7 +186,9 @@ class WiredLane:
         self.seams = seams
 
 
-def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLane:
+def wire_lane(
+    config: LaneConfig, *, platform: PlatformClient | None, vehicle_id_token: str | None = None
+) -> WiredLane:
     """The lane `serve` runs: real software seams where configured, simulated
     hardware seams always, and a table saying which is which.
 
@@ -192,9 +208,13 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
     # recorded and removed once the platform has taken it, so a restart during
     # an outage loses none of them (`durable.OutboxStore`). Same directory,
     # same rule; refused by the same exception if the directory is not ours.
+    # BOTH FILES ARE STAMPED with which lane, garage and platform wrote them:
+    # another lane's cache is wiped, another lane's unsent outbox is refused.
+    identity = store_identity(config.lane_id, config.site_id, config.server_url)
     outbox = (
         OutboxStore(
-            outbox_path(config.cache_path), pictures_max_bytes=config.outbox_pictures_max_bytes
+            outbox_path(config.cache_path), pictures_max_bytes=config.outbox_pictures_max_bytes,
+            identity=identity,
         )
         if platform is not None and config.cache_path
         else None
@@ -213,7 +233,7 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
         events = EventQueue()
         seams["platform"] = "NONE (standalone: nothing is reported, nothing is refreshed)"
     if config.vehicle_id_url:
-        identifier = VehicleIdClient(config.vehicle_id_url)
+        identifier = VehicleIdClient(config.vehicle_id_url, token=vehicle_id_token)
         seams["identifier"] = f"REAL Vehicle ID at {config.vehicle_id_url}"
     else:
         identifier = StubVehicleIdentifier()
@@ -225,6 +245,7 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
             config.vehicle_id_url,
             structure=config.banned_match_structure,
             colour=config.banned_match_colour,
+            token=vehicle_id_token,
         )
         seams["banned"] = f"REAL search at {config.vehicle_id_url}"
     else:
@@ -239,7 +260,7 @@ def wire_lane(config: LaneConfig, *, platform: PlatformClient | None) -> WiredLa
         # `cmd_serve`, which prints it and exits 2 before the port opens.
         cache = DecisionCache(
             max_age_seconds=config.rules_max_age_seconds,
-            store=DurableStore(config.cache_path),
+            store=DurableStore(config.cache_path, identity=identity),
             pass_registers_offline_s=config.pass_registers_offline_days * 86_400.0,
         )
         held = "restored" if cache.default_action is not None or cache.stays_cursor else "empty"
@@ -366,8 +387,11 @@ def cmd_serve(args) -> int:
 
     platform = platform_client_for(config, args.platform_token_file)
     try:
-        wired = wire_lane(config, platform=platform)
-    except CacheDirectoryUnsafe as exc:
+        wired = wire_lane(
+            config, platform=platform,
+            vehicle_id_token=_token(args.vehicle_id_token_file, "--vehicle-id-token-file"),
+        )
+    except (CacheDirectoryUnsafe, StoreIdentityMismatch) as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 2
     service = LaneService(wired.controller)
@@ -384,7 +408,16 @@ def cmd_serve(args) -> int:
     reach = "local only by design" if args.host in ("127.0.0.1", "::1", "localhost") else "EXPOSED"
     print(f"lane-controller on http://{args.host}:{args.port}  ({reach})")
     print(f"  lane {config.lane_id} at site {config.site_id}, direction {config.direction}")
-    if service.can_vend():
+    if service.can_vend() and act_token is None:
+        # Said at start, because the route refuses every call without it
+        # (403), and an intercom that cannot open is found at the gate.
+        print(
+            "  WARNING: no --act-token-file: POST /v1/lane/vend answers 403 to every call, "
+            "so no person or intercom can open this lane through it",
+            file=sys.stderr,
+        )
+        print("  POST /v1/lane/vend is served and refuses every call (no act token)")
+    elif service.can_vend():
         print("  POST /v1/lane/vend WILL PULSE THE VEND RELAY on this lane")
     else:
         print("  no act route on this lane: capabilities.can_vend is false")

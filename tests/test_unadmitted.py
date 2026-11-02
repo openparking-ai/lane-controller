@@ -48,8 +48,11 @@ from lane_controller.sync import (
     ENTRY_CONFIRMED,
     ENTRY_UNADMITTED,
     ENTRY_UNCONFIRMABLE,
+    EXIT_HELD,
+    HELD,
     REASON_FORWARD,
     REASON_NO_PENDING_ENTRY,
+    SESSION_CLOSE,
     SESSION_OPEN,
     to_iso,
 )
@@ -261,19 +264,30 @@ def test_a_reverse_with_nothing_pending_is_read_and_is_not_an_entry(caplog):
     assert "reverse" in caplog.text and "not recorded" in caplog.text
 
 
-def test_an_exit_lane_reads_the_crossing_and_records_nothing(caplog):
-    """A car that left without paying is a different fact about different
-    money, and no kind on the platform names it yet. Logged, not recorded, and
-    not recorded as an ENTRY of anything."""
+def test_an_exit_lane_records_the_crossing_as_a_held_close_for_a_person(caplog):
+    """OP-5-5: a car that left with nothing pending -- a barrier raised by
+    hand with the platform down, a barrier that is up, a tailgater -- used to
+    be a log line and nothing else. It is the close the loops saw, `held`, in
+    the outbox with the closing-loop pictures; never an ENTRY of anything."""
     controller, _, loops = build(direction="exit", identities=[BANNED], crossings=[(F, 3.0)])
     controller.run_once()
+    kept_for: list[str] = []
+    queue_pictures = controller.events.queue_pictures
+    controller.events.queue_pictures = lambda event_id, frames: (
+        kept_for.append(event_id), queue_pictures(event_id, frames))[1]
 
     with caplog.at_level(logging.WARNING, logger="lane_controller.controller"):
         controller.run_once()
 
     assert loops.unread == 0
     assert ENTRY_UNADMITTED not in kinds(controller)
-    assert "EXIT" in caplog.text and "unbilled" in caplog.text
+    assert "EXIT" in caplog.text and "held close" in caplog.text
+    close = next(e for e in controller.events._queue if e.kind == SESSION_CLOSE)
+    assert close.detail["exit_confirmation"] == HELD
+    assert close.detail.get("local_decision") is None, "no decision was made for this car"
+    held = next(e for e in controller.events._queue if e.kind == EXIT_HELD)
+    assert held.detail["no_open_command"] is True
+    assert kept_for == [close.event_id], "the closing-loop pictures are kept against the close"
 
 
 def test_a_lane_with_no_closing_loops_has_nothing_to_poll():

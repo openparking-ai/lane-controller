@@ -243,7 +243,10 @@ never read back from "the last one"): a platform at migration 0017 or later
 card and the row are one computation, and its reconciler re-derives the number
 out of band from what the decision says it was computed from. A platform that
 does not consume it says why on the row; an older platform ignores the field
-and prices as before. `tests/test_close_decision.py` holds the seam, and
+and prices as before. A decision the engine answered names the engine that
+answered it (`rate_engine`: the installed version and the commit it was pinned
+to), so a fee priced by a lane whose pin differs from the platform's can be
+told apart on the row. `tests/test_close_decision.py` holds the seam, and
 `scripts/close_decision_fail_control.py` breaks it eight ways.
 
 **And it works after a restart with the internet down**, when `[lane]
@@ -257,7 +260,11 @@ outbox's stay opens and closes are kept beside it** (`decision-cache.outbox.sqli
 beside `decision-cache.sqlite`, same directory rule, 0600), with the pictures
 kept with the entries, written as each is recorded and removed once the platform
 has taken or refused it, so a restart during an outage loses none of them; the
-lane sends them first thing, in the order they happened. **The writes are made
+lane sends them first thing, in the order they happened. **Both files are
+stamped with the lane, garage and platform they were written for**: a cache
+written for another is wiped at start, and an outbox written for another that
+still holds stays refuses to start (`serve` exits 2 saying so) rather than
+sending them as this lane's or dropping them. **The writes are made
 by the outbox's own disk thread, never by the lane thread** (`events.DiskWriter`):
 a stay is recorded on the thread that decides the next car, and a disk that is
 slow or hung used to hold that car on SQLite's write; now it holds nothing on the
@@ -347,7 +354,9 @@ What makes that safe is enforced, not promised:
   order, asserted by a test that records every call.
 - **A read token never authorises an act.** The vend takes a second token from
   `--act-token-file`; each is `403` on the other's routes, and either in a query
-  string is `401`.
+  string is `401`. The vend takes its token on loopback too (`403` without one),
+  and refuses a `Host` that is not this lane's address and a body that is not
+  `application/json`.
 - **The answer is `vend_commanded`, never `opened`.** Nothing in this system
   measures the boom, and this lane's own health surface says so.
 
@@ -362,7 +371,7 @@ neither on the path between a car arriving and a barrier opening.
 
 | | |
 |---|---|
-| `sync_rules()` | the SLOW cadence: `GET /lane/rules` — the garage's rate plans whole, its space class, each entitlement module's register (verbatim; a module the platform could not read is NOT replaced with nothing) and the full set of open stays with a cursor. On failure it keeps the cache it had — a failed request is not a reason to forget good rules. |
+| `sync_rules()` | the SLOW cadence: `GET /lane/rules` — the garage's rate plans whole, its space class, each entitlement module's register (verbatim; a module the platform could not read is NOT replaced with nothing -- for `rules_max_age_seconds`: past that the kept register covers nobody, the exit answers `stale_facts` for a car only it names and a pass-only entry sends that car to a person, and past `pass_registers_offline_days` it is not held; a module the owner unlinked, `consulted: false`, holds no register at once) and the full set of open stays with a cursor. On failure it keeps the cache it had — a failed request is not a reason to forget good rules. |
 | `sync_stays()` | the FAST cadence: `GET /lane/stays?since=<cursor>` — every stay opened or closed since, closed rows included so the exit lane drops a car that left, paged and followed at once. A refusal drops the cursor so the next read takes the full set. It also carries this lane's closing and the owner's board, so a closing acts within one fast interval. |
 | `decide()` at a closed lane | closed to everyone: no car opens by itself, `fallback` / `lane_closed`. Closed `full` at an entry: a car a register covers today (the exit's own lookup, `register_cover`) gets in, every other identified car is `lane_closed`. A person's word through `POST /v1/lane/vend` opens it; a display code does not. |
 | `decide()` and the garage's settings | **At an entry, what the garage takes decides** (`garage_admits`). `transient_available: true`: every car opens -- unread, unknown, engine down, rules stale -- except full (a register-covered car still opens), closed to everyone, banned, an owner's rule against the plate, or nothing there. `transient_available: false` (**pass holders only**), at ANY default: a car a register covers today opens, every other car read with confidence is `deny` (`REASON_NOT_REGISTERED`), full or not; a car whose pass cannot be confirmed (plate unread or unsure, no register held) is `fallback`, a person's case that a display code does not complete. Both, when not full, are refusals a **registration QR** may still open (`qr_may_open`; see below). An owner's ALLOW rule for a plate comes before the registers, as it always did, and is applied only from a trusted cache. A DENY rule comes before everything else at every entry, stated garage or not, is asked of the plate read at any confidence (`plate_seen`, `owner_denies`), so a car read below the confidence is never a way around it, and **wins whatever the cache's age** (the owner's decision of 2026-10-30, replacing E3 for a deny: a ban is a ban, the gate fails shut and a person opens by hand); applied from rules past their age, the decision says so (`stale_deny: true` on the `decision` event, and in its reason). `true` with a default of `deny` is read as pass-only, the stricter reading. A payload without the field is the lane as it was: the default (`allow`, `deny`) and the fallback path. The default is an ENTRY rule: at an exit a car with no rule is let out, and `price_exit()` says covered, priced or not priceable here. Only a plate read at the lane's confidence is ever looked up, in a rule or a register (`plate_read`). |

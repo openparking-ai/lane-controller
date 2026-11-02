@@ -450,6 +450,7 @@ class LaneService:
             MalfunctionCode.IDENTITY_SERVICE_DEGRADED: self._identity_service_degraded(),
             MalfunctionCode.OUTBOX_DEPTH_GROWING: self._outbox_depth_growing(),
             MalfunctionCode.SESSION_ACTIONS_DEAD_LETTERED: self._dead_lettered(),
+            MalfunctionCode.PLATFORM_UNREACHABLE: self._platform_unreachable(),
             MalfunctionCode.CLOCK_SKEW_REJECTED: self._clock_skew_rejected(),
             MalfunctionCode.ARMING_LOOP_STUCK_OCCUPIED: self._arming_loop_stuck(),
             MalfunctionCode.DEACTIVATE_LOOP_STUCK_OCCUPIED: self._deactivate_loop_stuck(),
@@ -770,6 +771,23 @@ class LaneService:
             return HealthState.UNKNOWN
         return HealthState.ACTIVE if rejected else HealthState.OK
 
+    def _platform_unreachable(self) -> HealthState:
+        """`active` while the outbox's last call did not reach the platform,
+        or the platform refused THIS LANE (401, 403, a confirmed 404) -- the
+        outbox is held then, and nothing but this says why it is not draining.
+
+        `unknown` with no transport, or before it has made a call.
+        """
+        transport = self.controller.events.transport
+        if transport is None:
+            return HealthState.UNKNOWN
+        if getattr(transport, "lane_refused", None) is not None:
+            return HealthState.ACTIVE
+        reachable = getattr(transport, "reachable", None)
+        if reachable is None:
+            return HealthState.UNKNOWN
+        return HealthState.OK if reachable else HealthState.ACTIVE
+
     # --- GET /v1/lane/events ----------------------------------------------
 
     def events(self, since: int) -> EventPage:
@@ -826,6 +844,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     server_version = "openparking-lane-controller"
     sys_version = ""
+    #: Seconds a connection may sit silent before it is dropped. Without it a
+    #: client that opens a socket and sends nothing holds a thread for ever.
+    timeout = 10
 
     def log_message(self, fmt: str, *args) -> None:
         log.debug("%s - %s", self.address_string(), fmt % args)
@@ -883,11 +904,21 @@ class _Handler(BaseHTTPRequestHandler):
         if not self.service.can_vend():
             return self._json(404, {"error": "no such route on this lane"})
 
+        # The Host before the credential: a browser page that rebinds its own
+        # DNS name to 127.0.0.1 reaches this port with that NAME in Host, and a
+        # name this lane cannot prove is itself is not a caller of this route.
+        if not self._host_is_this_lane():
+            return self._forbidden("the Host header does not name this lane's address")
         refusal = self._authorise(
             self.act_token, self.token, "the vend route", unconfigured_refuses=True
         )
         if refusal is not None:
             return refusal()
+        # application/json only: a cross-site form can send text/plain without
+        # asking first, and a JSON body under that type is the shape of one.
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            return self._json(415, {"error": "the body must be sent as application/json"})
 
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -963,32 +994,21 @@ class _Handler(BaseHTTPRequestHandler):
         point of there being two.
         """
         if required is None:
-            if other is None:
-                # NEITHER credential is configured: the loopback default, and
-                # it is the default for the vend too. A lane on loopback with
-                # no files at all is the developer's lane and the demo's, and
-                # this is the same answer it has always given.
-                return None
-            if not unconfigured_refuses:
-                # No credential configured for this route: the loopback
-                # default, which is what the reads have always had. It stays
-                # open here even when the OTHER token is configured, because
-                # refusing a monitor with a 403 for a credential it was never
-                # asked for is a confusing failure and not a safer one -- and
-                # off loopback the bind already requires both.
-                return None
-            # THE ASYMMETRY, and it is deliberate. It holds ONCE A READ TOKEN
-            # EXISTS: a lane that has been given one credential and not the
-            # other has authorised nothing to vend, and serving the barrier to
-            # anything that can reach loopback because the act file was never
-            # written is a different size of mistake from an open read.
-            #
-            # It does NOT say that a lane with no act token never vends. A lane
-            # with NEITHER credential configured is the loopback default and the
-            # branch above returns `None` for it -- "Loopback takes neither,
-            # exactly as the reads do", which is what `docs/CONTRACT.md` says
-            # and what this comment used to overstate.
-            return lambda: self._forbidden(f"this lane has no credential configured for {what}")
+            if unconfigured_refuses:
+                # THE BARRIER NEVER OPENS WITHOUT ITS OWN CREDENTIAL, loopback
+                # or not. Loopback is every process on this box and, through a
+                # rebound DNS name, any browser on a page that reaches it; a
+                # lane with no act token has authorised nobody to vend.
+                return lambda: self._forbidden(
+                    f"this lane has no credential configured for {what}"
+                )
+            # No credential configured for a read route: the loopback default,
+            # which is what the reads have always had. It stays open even when
+            # the OTHER token is configured, because refusing a monitor with a
+            # 403 for a credential it was never asked for is a confusing
+            # failure and not a safer one -- and off loopback the bind already
+            # requires both.
+            return None
         presented = bearer(self.headers.get("Authorization"))
         if presented is None:
             return self._unauthorised
@@ -997,6 +1017,33 @@ class _Handler(BaseHTTPRequestHandler):
         if other is not None and _same(presented, other):
             return lambda: self._forbidden(f"that credential does not authorise {what}")
         return self._unauthorised
+
+    def _host_is_this_lane(self) -> bool:
+        """Whether the Host header names loopback or the address this binds.
+
+        A lane bound to every interface cannot know which of its addresses was
+        dialled, so there any IP literal is accepted -- a DNS rebinding needs a
+        NAME in Host, and a name is what is refused.
+        """
+        raw = (self.headers.get("Host") or "").strip()
+        if not raw:
+            return False
+        try:
+            host = urlparse(f"//{raw}").hostname
+        except ValueError:
+            return False
+        if not host:
+            return False
+        if host == "localhost" or is_loopback(host):
+            return True
+        bound = str(self.server.server_address[0]).lower()
+        if host == bound:
+            return True
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        return bound in ("", "0.0.0.0", "::")
 
     def _credential_in_query(self, query: str) -> bool:
         """Whether this request put a credential in the URL. Either token, any name.
@@ -1063,6 +1110,37 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+#: How many connections are served at once. Past it a new one is closed at
+#: once: a lane is asked by a monitor, an intercom and a person's screen, not
+#: by hundreds, and a thread per idle socket is how a box runs out of them.
+MAX_CONNECTIONS = 32
+
+
+class _BoundedServer(ThreadingHTTPServer):
+    """`ThreadingHTTPServer` with a ceiling on the threads it starts."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._slots.acquire(blocking=False):
+            log.warning("lane service at %d connections; closing a new one", MAX_CONNECTIONS)
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 def make_server(
     service: LaneService,
     host: str = "127.0.0.1",
@@ -1082,13 +1160,14 @@ def make_server(
         (_Handler,),
         {"service": service, "token": token or None, "act_token": act_token or None},
     )
-    return ThreadingHTTPServer((host, port), handler)
+    return _BoundedServer((host, port), handler)
 
 
 __all__ = [
     "ACT_ROUTES",
     "CREDENTIAL_QUERY_KEYS",
     "MAX_BODY_BYTES",
+    "MAX_CONNECTIONS",
     "READ_ROUTES",
     "InsecureBind",
     "LaneService",
