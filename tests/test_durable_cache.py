@@ -585,3 +585,118 @@ def test_one_platform_typed_two_ways_is_one_identity():
     # THE CONTROL: another host, port or path is another platform.
     for other in ("https://q.example", "https://p.example:8443", "https://p.example/v2"):
         assert store_identity("l", "s", other) != one, other
+
+
+# ---------------------------------------------------------------------------
+# A FULL DISK: a lane that `main` would start still starts.
+#
+# Re-review of #60: every start re-wrote the identity stamp and VACUUMed the
+# cache with no try, so on a full disk `serve` stopped starting where `main`
+# did. The disk here is SQLite answering SQLITE_FULL to every statement that
+# would write -- what a real full filesystem does (checked by hand on a 1 MB
+# tmpfs) -- while a read, and a CREATE ... IF NOT EXISTS of a table that is
+# already there, go through, as they do on a full disk.
+# ---------------------------------------------------------------------------
+
+_WRITES = ("INSERT", "REPLACE", "UPDATE", "DELETE", "VACUUM", "CREATE")
+
+
+class _FullDiskConnection:
+    def __init__(self, real):
+        self._real = real
+
+    def _would_write(self, sql: str) -> bool:
+        text = " ".join(sql.split()).upper()
+        if not text.startswith(_WRITES):
+            return False
+        if text.startswith("CREATE TABLE IF NOT EXISTS "):
+            name = text.split()[5].split("(")[0].lower()
+            return self._real.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone() is None
+        return True
+
+    def execute(self, sql, *args):
+        if self._would_write(sql):
+            raise sqlite3.OperationalError("database or disk is full")
+        return self._real.execute(sql, *args)
+
+    def executemany(self, sql, *args):
+        if self._would_write(sql):
+            raise sqlite3.OperationalError("database or disk is full")
+        return self._real.executemany(sql, *args)
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._real.__exit__(*exc)
+
+    def close(self):
+        self._real.close()
+
+
+@pytest.fixture
+def full_disk(monkeypatch):
+    from lane_controller import durable as durable_module
+
+    real_connect = sqlite3.connect
+
+    def turn_on():
+        monkeypatch.setattr(
+            durable_module.sqlite3, "connect",
+            lambda *a, **k: _FullDiskConnection(real_connect(*a, **k)),
+        )
+
+    return turn_on
+
+
+def _a_stay():
+    from lane_controller.events import LaneEvent
+
+    return LaneEvent(kind="session_open", lane_id="lane-a", at=1.0, detail={"plate": "A-1"})
+
+
+def test_stamped_stores_start_on_a_full_disk_and_keep_everything(cache_dir, full_disk):
+    from lane_controller.durable import OutboxStore, store_identity
+
+    mine = store_identity("lane-a", "s", None)
+    DurableStore(cache_dir / "c.sqlite", identity=mine).write({"rules": {"A-1": "allow"}})
+    OutboxStore(cache_dir / "o.sqlite", identity=mine).add(_a_stay())
+    full_disk()
+    cache = DurableStore(cache_dir / "c.sqlite", identity=mine)
+    outbox = OutboxStore(cache_dir / "o.sqlite", identity=mine)
+    assert cache.read() == {"rules": {"A-1": "allow"}}
+    assert [e.detail["plate"] for e in outbox.held()] == ["A-1"]
+
+
+def test_unstamped_stores_from_an_earlier_build_start_on_a_full_disk(cache_dir, full_disk):
+    from lane_controller.durable import OutboxStore, store_identity
+
+    DurableStore(cache_dir / "c.sqlite").write({"rules": {"A-1": "allow"}})
+    OutboxStore(cache_dir / "o.sqlite").add(_a_stay())
+    full_disk()
+    mine = store_identity("lane-a", "s", None)
+    assert DurableStore(cache_dir / "c.sqlite", identity=mine).read() == {
+        "rules": {"A-1": "allow"}
+    }
+    held = OutboxStore(cache_dir / "o.sqlite", identity=mine).held()
+    assert [e.detail["plate"] for e in held] == ["A-1"]
+
+
+def test_another_lanes_files_on_a_full_disk_are_still_refused(cache_dir, full_disk):
+    """The start goes on past a write the disk will not take -- never past an
+    identity that does not match: another lane's cache that cannot be wiped,
+    and another lane's outbox with stays in it, still stop `serve`."""
+    from lane_controller.durable import OutboxStore, StoreIdentityMismatch, store_identity
+
+    theirs = store_identity("lane-b", "s", None)
+    DurableStore(cache_dir / "c.sqlite", identity=theirs).write({"rules": {"B-1": "allow"}})
+    OutboxStore(cache_dir / "o.sqlite", identity=theirs).add(_a_stay())
+    full_disk()
+    mine = store_identity("lane-a", "s", None)
+    with pytest.raises(StoreIdentityMismatch):
+        DurableStore(cache_dir / "c.sqlite", identity=mine)
+    with pytest.raises(StoreIdentityMismatch):
+        OutboxStore(cache_dir / "o.sqlite", identity=mine)

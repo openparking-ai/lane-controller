@@ -143,12 +143,19 @@ def _platform_key(server_url: str | None) -> str:
 
 
 def _stamped(connection) -> str | None:
-    connection.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    """The stamp, READ ONLY: a start must not need a write to learn it, or a
+    full disk stops a lane that `main` would have started."""
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+    ).fetchone()
+    if table is None:
+        return None
     row = connection.execute("SELECT value FROM meta WHERE key = 'identity'").fetchone()
     return row[0] if row else None
 
 
 def _stamp(connection, identity: str) -> None:
+    connection.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     connection.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('identity', ?)", (identity,)
     )
@@ -243,26 +250,53 @@ class DurableStore:
                 "state TEXT NOT NULL)"
             ))
             if identity is not None:
-                # ANOTHER LANE'S CACHE IS NOT THIS LANE'S RULES: wiped, and
-                # refilled at the next refresh -- a cache is for that. A file
-                # with no stamp is this build's first start on it, and taken.
-                def bind(connection):
-                    held = _stamped(connection)
-                    if held is not None and held != identity:
-                        connection.execute("DELETE FROM cache")
-                    _stamp(connection, identity)
-                    return held
-
-                held = self._with_connection(bind)
-                if held is not None and held != identity:
-                    log.error(
-                        "the decision cache at %s was written for another lane, garage or "
-                        "platform; wiped", self.path,
-                    )
+                self._bind(identity)
             # A file written by an earlier build may still carry deleted rows
             # in its free pages; the cache is one small row, so rebuilding it
-            # once at start is cheap and leaves none.
-            _vacuum(self.path)
+            # once at start is cheap and leaves none. A VACUUM that cannot run
+            # (a full disk) costs the clean-up, never the start.
+            try:
+                _vacuum(self.path)
+            except sqlite3.Error as exc:
+                log.warning("the decision cache at %s could not be VACUUMed: %s", self.path, exc)
+
+    def _bind(self, identity: str) -> None:
+        """ANOTHER LANE'S CACHE IS NOT THIS LANE'S RULES: wiped, and refilled
+        at the next refresh -- a cache is for that. A file with no stamp is
+        this build's first start on it, and taken. Written only when the stamp
+        is missing or different, so an already-stamped lane starts on a full
+        disk as it always did. A stamp that cannot be written on an unstamped
+        file is logged and the start goes on; another lane's cache that cannot
+        be wiped is refused (`StoreIdentityMismatch`), never decided from."""
+        held = self._with_connection(_stamped)
+        if held == identity:
+            return
+        if held is None:
+            try:
+                self._with_connection(lambda c: _stamp(c, identity))
+            except sqlite3.Error:
+                log.exception(
+                    "the decision cache at %s could not be stamped; it is taken as this "
+                    "lane's and stamped at a later start", self.path,
+                )
+            return
+
+        def wipe(connection):
+            connection.execute("DELETE FROM cache")
+            _stamp(connection, identity)
+
+        try:
+            self._with_connection(wipe)
+        except sqlite3.Error as exc:
+            raise StoreIdentityMismatch(
+                f"the decision cache at {self.path} was written for another lane, garage or "
+                f"platform, and it could not be wiped ({exc}). It is not decided from: free "
+                "the disk, or point [lane] cache_path at a new directory."
+            ) from exc
+        log.error(
+            "the decision cache at %s was written for another lane, garage or platform; wiped",
+            self.path,
+        )
 
     def _with_connection(self, action):
         return _touch(self.path, action)
@@ -398,9 +432,22 @@ class OutboxStore:
                 # anything else opens the file. Unstamped there is nothing to
                 # compare, so a VACUUM that failed leaves it unstamped and the
                 # next start tries again.
-                if _touch(self.path, _stamped) is None and not self._clear_residue():
+                held = _touch(self.path, _stamped)
+                if held == identity:
+                    return  # stamped already: nothing to write, full disk or not
+                if held is None and not self._clear_residue():
                     return
-                _touch(self.path, lambda c: self._bind(c, identity))
+                try:
+                    _touch(self.path, lambda c: self._bind(c, identity))
+                except sqlite3.Error:
+                    # Only reached when the file is not another lane's with
+                    # anything in it -- that raises `StoreIdentityMismatch`
+                    # before any write. A stamp a full disk would not take
+                    # costs the stamp, never the start.
+                    log.exception(
+                        "the outbox at %s could not be stamped; it is stamped at a later "
+                        "start", self.path,
+                    )
 
     def _clear_residue(self) -> bool:
         """VACUUM the file once. It rewrites only the live rows (at most the
