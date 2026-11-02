@@ -120,8 +120,26 @@ def store_identity(lane_id: str, site_id: str, server_url: str | None) -> str:
     """The fingerprint both stores are stamped with: which lane, at which
     garage, reporting to which platform. A hash, so the file says nothing more
     about the installation than the configuration file beside it does."""
-    text = json.dumps([lane_id, site_id, server_url or ""])
+    text = json.dumps([lane_id, site_id, _platform_key(server_url)])
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _platform_key(server_url: str | None) -> str:
+    """The platform an address names, spelled one way: the scheme and host in
+    lower case, a default port dropped, and no trailing slash -- so
+    `https://P.example/` and `https://p.example` are one platform, and a
+    lane holding stays does not refuse to start over how its URL was typed."""
+    if not server_url:
+        return ""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(server_url.strip())
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    if port is not None and (scheme, port) not in (("https", 443), ("http", 80)):
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}{parts.path.rstrip('/')}"
 
 
 def _stamped(connection) -> str | None:

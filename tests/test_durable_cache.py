@@ -574,3 +574,14 @@ def test_an_outbox_whose_vacuum_fails_keeps_every_row_and_tries_again(cache_dir,
         assert c.execute("SELECT value FROM meta WHERE key='identity'").fetchone() is None, (
             "left unstamped, so the next start tries again"
         )
+
+
+def test_one_platform_typed_two_ways_is_one_identity():
+    from lane_controller.durable import store_identity
+
+    one = store_identity("l", "s", "https://p.example")
+    for same in ("https://p.example/", "HTTPS://P.Example", "https://p.example:443/"):
+        assert store_identity("l", "s", same) == one, same
+    # THE CONTROL: another host, port or path is another platform.
+    for other in ("https://q.example", "https://p.example:8443", "https://p.example/v2"):
+        assert store_identity("l", "s", other) != one, other
