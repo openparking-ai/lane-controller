@@ -408,7 +408,16 @@ def cmd_serve(args) -> int:
     reach = "local only by design" if args.host in ("127.0.0.1", "::1", "localhost") else "EXPOSED"
     print(f"lane-controller on http://{args.host}:{args.port}  ({reach})")
     print(f"  lane {config.lane_id} at site {config.site_id}, direction {config.direction}")
-    if service.can_vend():
+    if service.can_vend() and act_token is None:
+        # Said at start, because the route refuses every call without it
+        # (403), and an intercom that cannot open is found at the gate.
+        print(
+            "  WARNING: no --act-token-file: POST /v1/lane/vend answers 403 to every call, "
+            "so no person or intercom can open this lane through it",
+            file=sys.stderr,
+        )
+        print("  POST /v1/lane/vend is served and refuses every call (no act token)")
+    elif service.can_vend():
         print("  POST /v1/lane/vend WILL PULSE THE VEND RELAY on this lane")
     else:
         print("  no act route on this lane: capabilities.can_vend is false")

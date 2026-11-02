@@ -1155,3 +1155,24 @@ def test_sigterm_stops_serve_the_way_ctrl_c_does_and_its_handler_is_put_back(
     assert seen[1:] == [], "SIGTERM did not stop serve"
     assert platform.unique_opens == 1
     assert signal.getsignal(signal.SIGTERM) is before, "serve did not put the handler back"
+
+
+def test_serve_warns_at_start_when_an_entry_lane_has_no_act_token(tmp_path, monkeypatch, capsys):
+    """OP-5-2 follow-up: the vend refuses every call without an act token, and
+    a box deployed without the file says so at start, not at the gate."""
+    from lane_controller import cli
+
+    code, _ = _serve_with(tmp_path, monkeypatch, lambda controller: None)
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "no --act-token-file" in err and "403" in err
+
+    # THE CONTROL: with the act token, no warning.
+    token = tmp_path / "act"
+    token.write_text("an-act-token")
+    token.chmod(0o600)
+    real_main = cli.main
+    monkeypatch.setattr(cli, "main", lambda argv: real_main([*argv, "--act-token-file", str(token)]))
+    code, _ = _serve_with(tmp_path, monkeypatch, lambda controller: None)
+    assert code == 0
+    assert "no --act-token-file" not in capsys.readouterr().err
