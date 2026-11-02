@@ -339,6 +339,12 @@ jobs:
           # answer for another event taken -- and requires the exit-case
           # suite to fail each time.
           - exit_settled
+          # Vehicle-id transport fail-control
+          # Breaks where the lane's reads go and with what -- a 302/303 from
+          # the service followed, http_proxy obeyed, the configured token never
+          # sent, any vehicle_id_url accepted -- and requires the vehicle-id
+          # client suite to fail each time.
+          - vehicle_id_transport
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }

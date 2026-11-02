@@ -316,6 +316,7 @@ def test_a_falsy_check_on_presence_would_break_every_unconfigured_lane():
 
 import json  # noqa: E402
 import threading  # noqa: E402
+import urllib.request  # noqa: E402
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
 
 import pytest  # noqa: E402
@@ -348,16 +349,23 @@ def test_the_control_https_or_loopback_is_accepted(url):
 class _Recorder(BaseHTTPRequestHandler):
     seen: list
     redirect_to: str | None = None
+    status: int = 307
 
     def log_message(self, *args):
         pass
+
+    def do_GET(self):  # noqa: N802 -- a followed 302/303 arrives as a GET
+        self.seen.append((self.path, self.headers.get("Authorization")))
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
         self.rfile.read(length)
         self.seen.append((self.path, self.headers.get("Authorization")))
         if self.redirect_to:
-            self.send_response(307)
+            self.send_response(self.status)
             self.send_header("Location", self.redirect_to)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -370,40 +378,55 @@ class _Recorder(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def _serve(redirect_to=None):
-    handler = type("H", (_Recorder,), {"seen": [], "redirect_to": redirect_to})
+def _serve(redirect_to=None, status=307):
+    handler = type(
+        "H", (_Recorder,), {"seen": [], "redirect_to": redirect_to, "status": status}
+    )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, handler.seen
 
 
 def test_the_client_goes_direct_whatever_http_proxy_says(monkeypatch):
+    """The proxy settings are set HERE, after import: the client must not
+    depend on what the environment held when the module was loaded. The
+    "proxy" is a second recording server, so a request sent through it is
+    seen there and not at the service."""
     server, seen = _serve()
+    proxy, proxied = _serve()
     try:
-        for name in ("no_proxy", "NO_PROXY"):
+        for name in ("no_proxy", "NO_PROXY", "all_proxy", "ALL_PROXY"):
             monkeypatch.delenv(name, raising=False)
-        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
-        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
-        identity = VehicleIdClient(f"http://127.0.0.1:{server.server_address[1]}").identify(
-            [a_frame()]
-        )
+        address = f"http://127.0.0.1:{proxy.server_address[1]}"
+        for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"):
+            monkeypatch.setenv(name, address)
+        assert urllib.request.getproxies().get("http") == address, "the premise: a proxy is set"
+        identity = VehicleIdClient(
+            f"http://127.0.0.1:{server.server_address[1]}", token="T0KEN"
+        ).identify([a_frame()])
         assert identity.unavailable is None and identity.plate == "ABC123"
-        assert len(seen) == 1
+        assert len(seen) == 1, "the read did not reach the service directly"
+        assert proxied == [], "the frames and the token went through the proxy"
     finally:
         server.shutdown()
+        proxy.shutdown()
 
 
-def test_a_redirect_is_refused_not_followed():
+@pytest.mark.parametrize("status", [302, 303])
+def test_a_redirect_is_refused_not_followed(status):
+    """302 and 303 are the codes urllib FOLLOWS for a POST (as a GET); a 307
+    it never follows for a POST, so a 307 would prove nothing."""
     elsewhere, hit = _serve()
     try:
         port = elsewhere.server_address[1]
-        server, seen = _serve(redirect_to=f"http://127.0.0.1:{port}/v1/reads")
+        server, seen = _serve(redirect_to=f"http://127.0.0.1:{port}/v1/reads", status=status)
         try:
             identity = VehicleIdClient(
                 f"http://127.0.0.1:{server.server_address[1]}", token="T0KEN"
             ).identify([a_frame()])
             assert identity.unavailable is not None, "a redirect is not an answer"
-            assert len(seen) == 1 and hit == [], "the frames went where a 30x said"
+            assert len(seen) == 1
+            assert hit == [], "the request and its token went where a 30x said"
         finally:
             server.shutdown()
     finally:

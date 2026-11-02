@@ -105,10 +105,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
 
 
-#: THE ONE WAY THIS MODULE OPENS A URL: no proxy, whatever `http_proxy` says
-#: (a loopback service reached through a proxy is the frames on another
-#: machine), and no redirect.
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+def _opener() -> urllib.request.OpenerDirector:
+    """THE ONE WAY THIS MODULE OPENS A URL: no proxy, whatever `http_proxy`
+    says (a loopback service reached through a proxy is the frames on another
+    machine), and no redirect. Built per call, so nothing depends on what the
+    environment held when this module was imported."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
 def _headers(token: str | None) -> dict:
@@ -267,7 +269,7 @@ class VehicleIdClient:
             return None
 
     def _open_health(self, url: str) -> dict:
-        with _OPENER.open(url, timeout=self.timeout) as response:
+        with _opener().open(url, timeout=self.timeout) as response:
             return json.loads(response.read(MAX_RESPONSE_BYTES + 1))
 
 
@@ -312,7 +314,7 @@ def _post_json(url: str, payload: dict, timeout: float, *, token: str | None = N
         },
         method="POST",
     )
-    with _OPENER.open(request, timeout=timeout) as response:
+    with _opener().open(request, timeout=timeout) as response:
         body = response.read(MAX_RESPONSE_BYTES + 1)
         if len(body) > MAX_RESPONSE_BYTES:
             raise ValueError(
@@ -386,7 +388,7 @@ def _post_search(url: str, payload: dict, timeout: float, *, token: str | None =
         headers={"Content-Type": "application/json", **_headers(token)},
         method="POST",
     )
-    with _OPENER.open(request, timeout=timeout) as response:
+    with _opener().open(request, timeout=timeout) as response:
         body = response.read(MAX_RESPONSE_BYTES + 1)
         if len(body) > MAX_RESPONSE_BYTES:
             raise ValueError(
