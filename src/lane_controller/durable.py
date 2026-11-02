@@ -439,11 +439,20 @@ class OutboxStore:
                     return
                 try:
                     _touch(self.path, lambda c: self._bind(c, identity))
-                except sqlite3.Error:
-                    # Only reached when the file is not another lane's with
-                    # anything in it -- that raises `StoreIdentityMismatch`
-                    # before any write. A stamp a full disk would not take
-                    # costs the stamp, never the start.
+                except sqlite3.Error as exc:
+                    if held is not None:
+                        # ANOTHER LANE'S STAMP, empty or not, that this lane
+                        # could not replace: never queued into, whatever the
+                        # disk. Its next start would refuse this lane's stays
+                        # or hand them to the other lane.
+                        raise StoreIdentityMismatch(
+                            f"the outbox at {self.path} was written for another lane, garage "
+                            f"or platform, and it could not be re-stamped ({exc}). Nothing is "
+                            "queued into it: free the disk, or point [lane] cache_path at a "
+                            "new directory."
+                        ) from exc
+                    # An unstamped file (an earlier build's): a stamp a full
+                    # disk would not take costs the stamp, never the start.
                     log.exception(
                         "the outbox at %s could not be stamped; it is stamped at a later "
                         "start", self.path,

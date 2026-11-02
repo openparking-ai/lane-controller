@@ -700,3 +700,32 @@ def test_another_lanes_files_on_a_full_disk_are_still_refused(cache_dir, full_di
         DurableStore(cache_dir / "c.sqlite", identity=mine)
     with pytest.raises(StoreIdentityMismatch):
         OutboxStore(cache_dir / "o.sqlite", identity=mine)
+
+
+def test_another_lanes_empty_outbox_on_a_full_disk_is_refused_and_not_written(
+    cache_dir, full_disk, tmp_path, monkeypatch, capsys
+):
+    """Re-review of #60: an EMPTY outbox stamped for another lane that a full
+    disk will not let this lane re-stamp was logged and used, unstamped for
+    this lane -- so this lane's stays went into the other lane's file. It is
+    refused, as the cache is, and the file is left exactly as it was."""
+    from lane_controller import cli
+    from lane_controller.durable import OutboxStore, StoreIdentityMismatch, store_identity
+
+    path = cache_dir / "o.sqlite"
+    OutboxStore(path, identity=store_identity("lane-b", "s", None))
+    before = path.read_bytes()
+    full_disk()
+    with pytest.raises(StoreIdentityMismatch):
+        OutboxStore(path, identity=store_identity("lane-a", "s", None))
+    assert path.read_bytes() == before, "the other lane's file was written"
+
+    # And `serve` exits 2 on it, before the port opens.
+    def refuse(*args, **kwargs):
+        raise StoreIdentityMismatch("another lane's outbox")
+
+    monkeypatch.setattr(cli, "wire_lane", refuse)
+    monkeypatch.setattr(cli, "platform_client_for", lambda config, token_file: None)
+    example = Path(__file__).resolve().parent.parent / "config" / "lane.example.toml"
+    assert cli.main(["serve", "--config", str(example)]) == 2
+    assert "another lane's outbox" in capsys.readouterr().err
