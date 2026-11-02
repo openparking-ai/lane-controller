@@ -516,3 +516,61 @@ def test_wire_lane_stamps_the_cache_with_the_configured_lane(cache_dir):
     assert DurableStore(path).read() is not None
     cli.wire_lane(a_config(cache_path=str(path), lane_id="lane-other"), platform=None)
     assert DurableStore(path).read() is None or not DurableStore(path).read().get("rules")
+
+
+def test_an_outbox_from_an_earlier_build_is_cleaned_once_on_its_first_stamp(cache_dir):
+    """OP-5-13, the outbox: a stay an earlier build removed (DELETE without
+    secure_delete) left its plate in a free page. The first start that stamps
+    the file VACUUMs it; later starts do not rewrite it again."""
+    from lane_controller.durable import OutboxStore, store_identity
+
+    path = cache_dir / "o.sqlite"
+    OutboxStore(path)  # the tables, as an earlier build made them
+    connection = sqlite3.connect(path)  # an earlier build: no secure_delete
+    with connection:
+        connection.execute(
+            "INSERT INTO outbox (event_id, at, kind, lane_id, detail) VALUES (?, 1, ?, ?, ?)",
+            ("e-1", "session_open", "lane-a", SECRET * 2000),
+        )
+    with connection:
+        connection.execute("DELETE FROM outbox WHERE event_id = 'e-1'")
+    connection.close()
+    assert SECRET.encode() in path.read_bytes(), "the premise: the residue is in the file"
+
+    mine = store_identity("lane-a", "s", None)
+    OutboxStore(path, identity=mine)
+    assert SECRET.encode() not in path.read_bytes()
+
+    vacuums = []
+    import lane_controller.durable as durable_module
+
+    real = durable_module._vacuum
+    durable_module._vacuum = lambda p: (vacuums.append(p), real(p))[1]
+    try:
+        OutboxStore(path, identity=mine)
+    finally:
+        durable_module._vacuum = real
+    assert vacuums == [], "a stamped outbox is not rewritten on every start"
+
+
+def test_an_outbox_whose_vacuum_fails_keeps_every_row_and_tries_again(cache_dir, monkeypatch):
+    from lane_controller import durable as durable_module
+    from lane_controller.durable import OutboxStore, store_identity
+    from lane_controller.events import LaneEvent
+
+    path = cache_dir / "o.sqlite"
+    OutboxStore(path).add(
+        LaneEvent(kind="session_open", lane_id="lane-a", at=1.0, detail={"plate": "A-1"})
+    )
+
+    def full_disk(p):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(durable_module, "_vacuum", full_disk)
+    store = OutboxStore(path, identity=store_identity("lane-a", "s", None))
+    assert [e.detail["plate"] for e in store.held()] == ["A-1"]
+    with sqlite3.connect(path) as c:
+        c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        assert c.execute("SELECT value FROM meta WHERE key='identity'").fetchone() is None, (
+            "left unstamped, so the next start tries again"
+        )

@@ -374,7 +374,32 @@ class OutboxStore:
                 "CREATE TABLE IF NOT EXISTS cancels (exit_id TEXT PRIMARY KEY, at REAL NOT NULL)"
             ))
             if identity is not None:
+                # THE FIRST START OF A BUILD THAT STAMPS: whatever an earlier
+                # build deleted (before `secure_delete`) is still in the free
+                # pages, and this is the one moment to clear it -- once, before
+                # anything else opens the file. Unstamped there is nothing to
+                # compare, so a VACUUM that failed leaves it unstamped and the
+                # next start tries again.
+                if _touch(self.path, _stamped) is None and not self._clear_residue():
+                    return
                 _touch(self.path, lambda c: self._bind(c, identity))
+
+    def _clear_residue(self) -> bool:
+        """VACUUM the file once. It rewrites only the live rows (at most the
+        pictures' ceiling plus the stays), needs about that much free disk for
+        the copy, and holds the file exclusively while it runs -- here, at
+        construction, before the drain or the disk thread exist. A VACUUM
+        that fails (a full disk) is logged and changes nothing: the rows are
+        all still there, and the next start tries again."""
+        try:
+            _vacuum(self.path)
+        except sqlite3.Error:
+            log.exception(
+                "the outbox at %s could not be VACUUMed; what an earlier build deleted may "
+                "still be in its free pages", self.path,
+            )
+            return False
+        return True
 
     def _bind(self, connection, identity: str) -> None:
         """Stamp the file with this lane's identity -- or refuse it. An outbox
