@@ -417,8 +417,9 @@ def vehicle_id_url_fault(url) -> str | None:
     its plate, and a token when one is configured, so it is https, or plain
     http to a service on this box itself.
     """
-    if server_url_fault(url) is None:
-        return None
+    fault = server_url_fault(url)
+    if fault is None or "port" in fault:
+        return fault
     return (
         "must be an https:// address or plain http on this box (127.0.0.1, ::1, localhost): "
         "every read carries pictures of a car, and plain http carries them readable across "
@@ -436,7 +437,14 @@ def server_url_fault(url) -> str | None:
     or http to a platform on this box itself -- loopback, where nothing
     crosses a network: a platform run locally, for a test or the demo.
     """
-    parts = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+    try:
+        parts = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+        if parts is not None:
+            parts.port  # noqa: B018 -- raises for a port that is not one
+    except ValueError:
+        return "has a port that is not a number from 1 to 65535"
+    if parts is not None and parts.port == 0:
+        return "has a port that is not a number from 1 to 65535"
     if parts is not None and parts.scheme == "https" and parts.hostname:
         return None
     if parts is not None and parts.scheme == "http" and _is_loopback(parts.hostname):

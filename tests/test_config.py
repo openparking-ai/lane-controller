@@ -359,3 +359,21 @@ def test_nan_threshold_and_max_age_from_a_real_toml_file_are_refused(tmp_path):
     path = edited(tmp_path, r"^confidence_threshold\b", "confidence_threshold = nan")
     with pytest.raises(ValueError, match="confidence_threshold"):
         LaneConfig.from_file(path)
+
+
+@pytest.mark.parametrize("port", ["99999", "abc", "0"])
+@pytest.mark.parametrize("name", ["server_url", "vehicle_id_url"])
+def test_an_address_whose_port_is_not_a_port_is_a_config_error_not_a_traceback(name, port):
+    with pytest.raises(ValueError, match=f"{name}.*port"):
+        _lane(**{name: f"https://p.example:{port}"})
+
+
+def test_serve_with_an_impossible_port_exits_2_and_says_why(tmp_path, capsys):
+    from lane_controller import cli
+
+    path = edited(
+        tmp_path, r"^server_url\b", 'server_url = "https://platform.example:99999/api"'
+    )
+    assert cli.main(["serve", "--config", str(path)]) == 2
+    err = capsys.readouterr().err
+    assert "port" in err and "Traceback" not in err
