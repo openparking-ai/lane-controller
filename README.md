@@ -53,9 +53,9 @@ An entry that is never confirmed is HELD and
 flagged — never voided silently, and never turned into a session.
 
 **Two arming loops before the gate are the standard installation**
-(`arming_loops = 2`, `arming_spacing_m = 1.5`, a per-site setting), as the
-installer drawings show them: L2 under the driver at the pay station or
-pedestal, and L1 1.5 m behind it, both under the stopped vehicle. **The lane
+(`arming_loops = 2`, `arming_spacing_m = 1.2`, edge to edge), as the installer
+drawings suggest them: L1 under the driver at the pay station or pedestal, and
+L2 ahead of it, toward the barrier, both under a car stopped at the window. **The lane
 arms only when both read occupied together**, so an object has to span the gap
 between them: a person standing on one loop with a piece of metal cannot. One
 loop occupied alone arms nothing and is recorded (`arming_incomplete`); the
@@ -163,6 +163,13 @@ nothing on it, as it reads and never drives a pair of confirmation loops, and
 there is no `close()` anywhere in this package. A controller that could close a barrier is a
 controller that could close one on a vehicle; the safety case rests on that
 being impossible rather than on us being careful.
+
+**The installer drawings are a suggestion.** Loop positions are set at the
+site survey and may move during the install (cabling, underground services, the
+shape of the lane); `[loops]` declares what was actually installed. What must
+hold wherever they go: two arming loops both covered by a car stopped at the
+window, every two loops at least 1.2 m apart, two loops after the barrier for
+direction (one is a fallback), the third loop optional.
 
 **Every loop count, spacing and window is a per-site setting** in `[loops]`, and
 every one of them is an ASSUMPTION until a site measures it — nothing here

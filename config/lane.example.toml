@@ -231,12 +231,19 @@ vend_pulse_ms = 500
 
 [loops]
 # THE LANE'S LOOP GEOMETRY, AND THIS IS THE STANDARD INSTALLATION, as the
-# installer drawings show it: TWO arming loops before the barrier, L2 under the
-# driver at the pay station (where an exit's card reader is) or pedestal and L1 1.5 m
-# behind it, both under the stopped vehicle; the optional third (deactivate)
-# loop L0 behind those; and after the barrier its own closing loop L3 (wired to
-# the barrier, which closes on it) and past that the confirmation pair L4/L5,
-# 1.5 m apart, read by this lane, with a 10 second window.
+# installer drawings suggest it: TWO arming loops before the barrier, L1 under
+# the driver at the pay station (where an exit's card reader is) or pedestal and
+# L2 ahead of it, toward the barrier, 1.2 m apart, both under a car stopped at
+# the window; the optional third (deactivate) loop L0 behind those; and after
+# the barrier its own closing loop L3 (wired to the barrier, which closes on it)
+# and past that the confirmation pair L4/L5, 1.5 m apart, read by this lane,
+# with a 10 second window.
+#
+# THE DRAWINGS ARE A SUGGESTION. The installer sets the loop positions at the
+# site survey and they may move during the install (cabling, underground
+# services, the shape of the lane): write here what was actually installed.
+# Whatever the positions, two arming loops both covered by a car stopped at the
+# window, every two loops at least 1.2 m apart (the loop manual's minimum).
 #
 # EVERY VALUE HERE IS A PER-SITE SETTING AND AN ASSUMPTION -- nothing in this
 # package measures a spacing, and none of these is a
@@ -257,16 +264,17 @@ vend_pulse_ms = 500
 # standing on one loop with a piece of metal cannot, and two masses at the right
 # spacing is a deliberate, slow, visible setup rather than a casual fraud. One
 # loop occupied alone arms nothing and is recorded (`arming_incomplete`).
-# arming_spacing_m is the gap between the two, edge to edge: 1.5 m typical, and
-# both loops must lie under the shortest vehicle the site serves, stopped at
-# the window; adjust it to the site.
+# arming_spacing_m is the gap between the two, edge to edge, as installed: 1.2 m
+# in the drawings, the loop manual's minimum. Both loops must lie under the
+# shortest vehicle the site serves, stopped at the window -- at setup, test with
+# the smallest car you expect.
 #
 # With 1 -- WEAKER: a single object on the one loop arms the lane. The lane
 # runs exactly as it did before the second loop existed and does NOT get the
 # spanning protection; it records `arming_loops: 1` on every vehicle so the
 # weakness is in the record rather than only in a document.
 arming_loops     = 2
-arming_spacing_m = 1.5
+arming_spacing_m = 1.2
 
 # Loops AFTER the barrier that confirm the entry: 0, 1 or 2.
 #
@@ -317,13 +325,14 @@ confirmation_window_seconds = 10.0
 #                           stopped at the barrier.
 # The spacing must be MORE than the tail, or the lane refuses to start.
 #
-# The drawings' lane, every distance measured back from the gate arm: the
-# arming loop L2 centred at 3.5 m, each loop 0.76 m long, and L1 1.5 m behind
-# L2, so the NEAREST arming loop to this one is L1, its far edge at
-# 3.5 + 0.38 + 1.5 + 0.76 = 6.14 m; a Ford F-150 (6.20 m) stopped 1.0 m before
-# the arm, so its tail at 7.2 m; the third loop's near edge at 8.0 m. Tail
-# 7.2 - 6.14 = 1.06; spacing 8.0 - 6.14 = 1.86. A lane that admits longer
-# vehicles declares its own tail.
+# The drawings' suggested lane, every distance measured back from the gate arm:
+# each loop 0.76 m long; the arming loop L2 centred at 1.98 m, 1.2 m past the
+# closing loop under the arm; L1, under the driver, centred at 3.96 m, 1.2 m
+# behind L2 -- so the NEAREST arming loop to this one is L1, its far edge at
+# 3.96 + 0.38 = 4.34 m; a Ford F-150 (6.20 m) stopped 1.0 m before the arm, so
+# its tail at 7.2 m; the third loop's near edge at 8.0 m. Tail
+# 7.2 - 4.34 = 2.86; spacing 8.0 - 4.34 = 3.66. A site measures its own: a lane
+# that admits longer vehicles declares its own tail.
 deactivate_loops       = 1
-deactivate_spacing_m   = 1.86
-longest_vehicle_tail_m = 1.06
+deactivate_spacing_m   = 3.66
+longest_vehicle_tail_m = 2.86

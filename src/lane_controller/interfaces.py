@@ -39,7 +39,7 @@ class Frame:
 class LoopInput(Protocol):
     """One arming loop: an inductive loop that reports a vehicle presenting.
 
-    The standard lane has two of these, ~1.5 m apart, and arms only when both
+    The standard lane has two of these, ~1.2 m apart, and arms only when both
     read occupied together -- an object then has to SPAN the gap, which a
     person standing on one loop with a piece of metal cannot. How many a site
     has is `LoopConfig.arming_loops`; a site with one is weaker (a single object

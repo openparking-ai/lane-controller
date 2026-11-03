@@ -156,14 +156,14 @@ def test_the_example_config_is_the_standard_installation():
     five keys and loads. Without it a broken parser would pass the whole table."""
     loops = LaneConfig.from_file(EXAMPLE).loops
 
-    # Two arming loops, 1.5 m apart, both occupied together to arm (L1, L2), and,
+    # Two arming loops, 1.2 m apart, both occupied together to arm (L1, L2), and,
     # past the barrier's closing loop, the confirmation pair L4/L5, 1.5 m apart:
     # the loops the installer drawings show. Two arming loops, because one object
     # on one loop must not arm the lane; two confirmation loops, because one loop
     # cannot tell a car driving through from one backing out.
     assert loops.arming_loops == 2
     assert loops.closing_loops == 2
-    assert loops.arming_spacing_m == 1.5
+    assert loops.arming_spacing_m == 1.2
     assert loops.closing_spacing_m == 1.5
     assert loops.confirmation_window_seconds == 10.0
     assert loops.confirms_entry is True
