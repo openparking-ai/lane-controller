@@ -42,8 +42,8 @@ class LoopConfig:
     object has to span the gap. AFTER it, either the barrier's own closing loop
     or two confirmation loops:
 
-      * ONE closing loop -- the standard installation, the one in the installer
-        drawings. The loop every barrier lane already has, still wired to the
+      * ONE closing loop -- a fallback for a lane with no confirmation pair;
+        direction not known. The loop every barrier lane already has, still wired to the
         barrier, read through its detector's second output. Occupied after the
         vend, inside the window, confirms. It cannot see a car that reaches it
         and then backs out; that car's stay has no exit, as any open stay.

@@ -47,8 +47,9 @@ class LoopInput(Protocol):
 
     This is the *arming* stage only. The loops after the gate are not this,
     and this package reads them and never drives them (see ClosingLoops):
-    either the barrier's own closing loop, read through a second output of its
-    detector -- the standard installation -- or a pair of CONFIRMATION loops.
+    either a pair of CONFIRMATION loops -- the standard installation -- or, as
+    a fallback, the barrier's own closing loop, read through a second output of
+    its detector.
     """
 
     def wait_for_vehicle(self, timeout: float | None = None) -> bool:
@@ -125,7 +126,8 @@ class ClosingSequence(StrEnum):
 class ClosingLoops(Protocol):
     """The loops AFTER the barrier, read and never driven.
 
-    ONE LOOP, the standard installation: the barrier's own closing loop, which
+    ONE LOOP, the fallback (the standard installation is TWO, below): the
+    barrier's own closing loop, which
     lowers the boom and stays wired to the barrier. Its detector's second output
     goes to an input on the lane's control panel, and that input is all this
     package sees. The barrier closes on the loop by itself whether or not

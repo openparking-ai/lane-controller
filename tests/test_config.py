@@ -156,12 +156,13 @@ def test_the_example_config_is_the_standard_installation():
     five keys and loads. Without it a broken parser would pass the whole table."""
     loops = LaneConfig.from_file(EXAMPLE).loops
 
-    # One arming loop and the barrier's own closing loop, read only: the loops
-    # the installer drawings show. No second closing loop, so no spacing.
+    # One arming loop and, past the barrier's closing loop, the confirmation
+    # pair L4/L5, 1.5 m apart: the loops the installer drawings show. Two,
+    # because one loop cannot tell a car driving through from one backing out.
     assert loops.arming_loops == 1
-    assert loops.closing_loops == 1
+    assert loops.closing_loops == 2
     assert loops.arming_spacing_m == 1.5
-    assert loops.closing_spacing_m == 0.0
+    assert loops.closing_spacing_m == 1.5
     assert loops.confirmation_window_seconds == 10.0
     assert loops.confirms_entry is True
 
@@ -274,16 +275,56 @@ def test_a_declared_two_loop_lane_gets_the_three_outcomes(
 @pytest.mark.parametrize(
     ("crossings", "expected_event", "session"),
     [
+        ([(ClosingSequence.FORWARD, 3.0)], "entry_confirmed", CONFIRMED),
+        ([(ClosingSequence.REVERSE, 3.0)], "entry_backed_out", None),
+        ([(ClosingSequence.OCCUPIED, 3.0)], "entry_held", None),
+        ([], "entry_held", None),
+    ],
+)
+def test_the_standard_lane_tells_through_from_backed_out(crossings, expected_event, session):
+    """The example file as an installer copies it: the pair crossed A then B
+    confirms, B then A is a car backing out and opens nothing, nothing in the
+    window holds. A one-loop reading is not an answer this lane can give, and
+    is not taken for a confirmation."""
+    controller, vend = build_from(EXAMPLE, crossings)
+
+    controller.run_once()
+
+    assert vend.vend_count == 1
+    assert expected_event in kinds(controller)
+    if session is None:
+        assert SESSION_OPEN not in kinds(controller)
+    else:
+        assert detail(controller, SESSION_OPEN)["entry_confirmation"] == session
+
+
+def one_loop_example(tmp_path: Path) -> Path:
+    """The example file declaring the one-loop fallback: the barrier's own
+    closing loop, read only, and no spacing."""
+    once = edited(tmp_path, r"^closing_loops\b", "closing_loops     = 1")
+    lines = once.read_text().splitlines(keepends=True)
+    hits = [i for i, line in enumerate(lines) if re.match(r"^closing_spacing_m\b", line)]
+    assert len(hits) == 1
+    lines[hits[0]] = "closing_spacing_m = 0.0\n"
+    once.write_text("".join(lines))
+    assert LaneConfig.from_file(once).loops.closing_loops == 1
+    return once
+
+
+@pytest.mark.parametrize(
+    ("crossings", "expected_event", "session"),
+    [
         ([(ClosingSequence.OCCUPIED, 3.0)], "entry_confirmed", CONFIRMED),
         ([], "entry_held", None),
     ],
 )
-def test_the_standard_one_loop_lane_confirms_on_the_closing_loop(
-    crossings, expected_event, session
+def test_the_one_loop_fallback_still_confirms_on_the_closing_loop(
+    tmp_path, crossings, expected_event, session
 ):
-    """The example file as an installer copies it: the closing loop read after
-    the vend confirms, nothing in the window holds."""
-    controller, vend = build_from(EXAMPLE, crossings)
+    """closing_loops = 1 stays supported: the closing loop read after the vend
+    confirms, nothing in the window holds. Which way the car then went is not
+    known -- that is what the fallback gives up."""
+    controller, vend = build_from(one_loop_example(tmp_path), crossings)
 
     controller.run_once()
 

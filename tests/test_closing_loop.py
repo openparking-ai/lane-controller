@@ -1,6 +1,7 @@
 """One closing loop: the barrier's own, read through its detector's second output.
 
-The standard installation, and the one the installer drawings show. The loop
+The fallback for a lane with no confirmation pair (the standard installation,
+and the drawings', is the pair L4/L5 past it: `closing_loops = 2`). The loop
 stays wired to the barrier, which closes on it by itself; the lane reads the
 detector's second output on an input of its control panel and drives nothing.
 
@@ -14,8 +15,9 @@ What the code does, and it is the whole of what is claimed here:
     admitted, never a confirmed one -- and a stay all the same (2026-10-26),
     `no_open_command: true`, its plate unreadable when nothing read it;
   * the published geometry says `closing_loops: 1` and no spacing;
-  * a lane built from `config/lane.example.toml` -- the drawing's lane -- counts
-    in the platform's `inside_count`.
+  * a lane built from `config/lane.example.toml` -- the drawing's lane, with the
+    pair -- counts a car that went through in the platform's `inside_count`, and
+    not one that backed out.
 
 What one loop does NOT tell: a car that reaches it and then backs out. That is
 accepted; the stay then has no exit, as any open stay, and nothing here claims
@@ -287,9 +289,14 @@ def inside_count(platform: FakePlatform) -> int:
     return sum(1 for s in platform.open_sessions.values() if s["entry_confirmation"] == CONFIRMED)
 
 
-def test_a_lane_built_to_the_drawing_counts_inside():
-    """The example file is the drawing's lane. A car admitted there, reaching
-    the closing loop, is a car the garage counts as inside."""
+@pytest.mark.parametrize(
+    ("crossing", "inside"),
+    [(ClosingSequence.FORWARD, 1), (ClosingSequence.REVERSE, 0)],
+)
+def test_a_lane_built_to_the_drawing_counts_inside(crossing, inside):
+    """The example file is the drawing's lane, with the confirmation pair. A car
+    admitted there that crosses the pair forward is a car the garage counts as
+    inside; one that backs out over it is not."""
     config = LaneConfig.from_file(EXAMPLE)
     platform = FakePlatform()
     cache = DecisionCache()
@@ -302,7 +309,9 @@ def test_a_lane_built_to_the_drawing_counts_inside():
         identifier=StubVehicleIdentifier([VehicleIdentity(plate="DRAWN-1", confidence=0.97)]),
         arming_loop_b=OccupancyLoopInput(True) if config.loops.arming_loops == 2 else None,
         deactivate_loop=OccupancyLoopInput(False) if config.loops.has_deactivate_loop else None,
-        closing_loops=ScriptedClosingLoops([(OCC, 3.0)]) if config.loops.confirms_entry else None,
+        closing_loops=(
+            ScriptedClosingLoops([(crossing, 3.0)]) if config.loops.confirms_entry else None
+        ),
         cache=cache,
         events=EventQueue(PlatformTransport(platform)),
     )
@@ -310,5 +319,7 @@ def test_a_lane_built_to_the_drawing_counts_inside():
     controller.run_once()
     controller.deliver()
 
-    assert len(platform.open_sessions) == 1
-    assert inside_count(platform) == 1, "the car the drawing's lane admitted is not counted inside"
+    assert len(platform.open_sessions) == inside
+    assert inside_count(platform) == inside, (
+        f"the drawing's lane, {crossing.value}: counted inside wrong"
+    )

@@ -5,9 +5,10 @@
 The barrier still closes itself on its own closing loop; the controller has no
 part in that and no way to interfere with it. The closing loops at the end of
 the line above are READ and never driven, and they are what says whether a
-vehicle actually went through: either the barrier's own closing loop, read
-through its detector's second output (the standard installation), or a pair of
-confirmation loops after the gate.
+vehicle actually went through: either a pair of confirmation loops after the
+gate (the standard installation), or, as a fallback that does not see
+direction, the barrier's own closing loop, read through its detector's second
+output.
 
 THE TICKET IS NOT THE ENTRY. A vend creates a PENDING entry. The closing loop
 reading a vehicle inside the confirmation window promotes it to a session; at a

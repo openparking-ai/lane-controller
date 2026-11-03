@@ -52,17 +52,25 @@ reads a vehicle inside the confirmation window.
 An entry that is never confirmed is HELD and
 flagged — never voided silently, and never turned into a session.
 
-**One closing loop is the standard installation**, and it is the loop every
-barrier lane already has: the barrier's own closing loop, under the arm, which
-the installer drawings show. It stays wired to the barrier, which closes on it by
-itself. Its loop detector's second output goes to an input on the lane's control
-panel, and the lane only reads that input (`closing_loops = 1`). Occupied after
-the vend, inside the window, is `confirmed`, at an entry and at an exit alike.
-**What one loop does not tell:** which way the car then went. A car that reaches
-the loop and backs out is not seen; its stay simply has no exit, as any open
-stay. A site that wants that seen installs two confirmation loops after the gate
-(`closing_loops = 2`): crossed A then B they confirm, B then A is a car backing
-out. Every event carries the geometry it relied on, `closing_loops` included.
+**Two confirmation loops after the gate are the standard installation**
+(`closing_loops = 2`, `closing_spacing_m = 1.5`, a 10 second window -- every
+one of them a per-site setting), as the installer drawings show them: past the
+barrier's own closing loop L3, the confirmation pair L4/L5, read by the lane's
+loop detector. Crossed A then B inside the window, the entry (or the exit) is
+`confirmed`; B then A is a car backing out -- no session, no occupancy, and an
+exit that backs out after paying is still the same stay. **Two, because one loop
+cannot tell those apart.** L3 itself stays wired to the barrier, which closes on
+it by itself; it confirms the gate closed behind the car, and its detector's
+second output goes, read only, to an input on the lane's control panel.
+
+**One closing loop is a supported fallback -- direction not known: a
+backing-out car is not seen.** A lane with no pair declares `closing_loops = 1`
+and `closing_spacing_m = 0.0`, and the lane reads the barrier's closing loop
+through that second output. Occupied after the vend, inside the window, is
+`confirmed`, at an entry and at an exit alike; a car that reaches the loop and
+backs out is not seen, and its stay simply has no exit, as any open stay.
+Every event carries the geometry it relied on, `closing_loops` included, so a
+fallback lane is in the record as one.
 
 **It narrows the fraud rather than closing it**: a ticket with no car becomes a
 ticket with *a* car, because nothing here binds the crossing to the vehicle that
@@ -574,7 +582,7 @@ None of it is required to run this package, and none of it has been purchased ye
 |---|---|
 | Controller | Seeed reComputer Industrial J3011 (Jetson Orin NX), in the gate housing |
 | Barrier | Q-SAQ, driven by a dry-contact vend relay |
-| Detection | Inductive arming loops before the barrier, an optional deactivate loop before those, and the barrier's own closing loop, wired to the barrier and read through its detector's second output; or two confirmation loops after the gate |
+| Detection | Inductive arming loops before the barrier, an optional deactivate loop before those, the barrier's own closing loop wired to the barrier, and two confirmation loops after it, crossed in order; or, as a fallback that does not see direction, the closing loop alone, read through its detector's second output |
 | Cameras — default | Reolink RLC-810A |
 | Cameras — upper tiers | Axis P1465-LE, Hanwha XNO-9082R |
 
