@@ -38,9 +38,13 @@ class LoopConfig:
     `LaneConfig` built in code, and they describe the lane this package shipped
     before the loops existed.
 
-    Two arming loops BEFORE the barrier: both must read occupied together, so an
-    object has to span the gap. AFTER it, either the barrier's own closing loop
-    or two confirmation loops:
+    Two arming loops BEFORE the barrier, the standard installation: both must
+    read occupied together, so an object has to span the gap. One arming loop
+    is supported and WEAKER -- a single object on it arms the lane -- and the
+    default below only because it describes the lane this package shipped
+    before the loops existed; a configuration file declares its count. AFTER
+    the barrier, either the barrier's own closing loop or two confirmation
+    loops:
 
       * ONE closing loop -- a fallback for a lane with no confirmation pair;
         direction not known. The loop every barrier lane already has, still wired to the
@@ -63,9 +67,11 @@ class LoopConfig:
     `deactivate_loops: 0` on every vehicle rather than saying nothing.
     """
 
-    #: 1 or 2. With 2, one loop alone arms nothing and is recorded instead.
+    #: 1 or 2; 2 is the standard installation. With 2, one loop alone arms
+    #: nothing and is recorded instead. With 1, a single object arms the lane.
     arming_loops: int = 1
-    #: Metres between the two arming loops. Assumed, never measured here.
+    #: Metres between the two arming loops, edge to edge. Assumed, never
+    #: measured here.
     arming_spacing_m: float = 1.5
     #: 0, 1 or 2. 1 is the barrier's own closing loop, read only.
     closing_loops: int = 0

@@ -231,10 +231,12 @@ vend_pulse_ms = 500
 
 [loops]
 # THE LANE'S LOOP GEOMETRY, AND THIS IS THE STANDARD INSTALLATION, as the
-# installer drawings show it: one arming loop before the barrier, the third
-# (deactivate) loop behind it, and after the barrier its own closing loop L3
-# (wired to the barrier, which closes on it) and past that the confirmation
-# pair L4/L5, 1.5 m apart, read by this lane, with a 10 second window.
+# installer drawings show it: TWO arming loops before the barrier, L2 under the
+# driver at the pay station (where an exit's card reader is) or pedestal and L1 1.5 m
+# behind it, both under the stopped vehicle; the optional third (deactivate)
+# loop L0 behind those; and after the barrier its own closing loop L3 (wired to
+# the barrier, which closes on it) and past that the confirmation pair L4/L5,
+# 1.5 m apart, read by this lane, with a 10 second window.
 #
 # EVERY VALUE HERE IS A PER-SITE SETTING AND AN ASSUMPTION -- nothing in this
 # package measures a spacing, and none of these is a
@@ -248,14 +250,22 @@ vend_pulse_ms = 500
 # mistyped one -- both write `unconfirmable` on every session -- and only one of
 # them is a decision.
 
-# Arming loops BEFORE the barrier: 1 or 2. With 2, the lane arms only when both
-# read occupied together, so an object has to SPAN the gap between them -- a
-# person standing on one loop with a piece of metal cannot, and two masses at
-# the right spacing is a deliberate, slow, visible setup rather than a casual
-# fraud. With 1, the lane runs exactly as it always has and does NOT get that
-# protection; it records `arming_loops: 1` on every vehicle so the weakness is
-# in the record rather than only in a document.
-arming_loops     = 1
+# Arming loops BEFORE the barrier: 2, the standard installation, or 1.
+#
+# With 2 -- L1 and L2 in the drawings -- the lane arms only when BOTH read
+# occupied together, so an object has to SPAN the gap between them: a person
+# standing on one loop with a piece of metal cannot, and two masses at the right
+# spacing is a deliberate, slow, visible setup rather than a casual fraud. One
+# loop occupied alone arms nothing and is recorded (`arming_incomplete`).
+# arming_spacing_m is the gap between the two, edge to edge: 1.5 m typical, and
+# both loops must lie under the shortest vehicle the site serves, stopped at
+# the window; adjust it to the site.
+#
+# With 1 -- WEAKER: a single object on the one loop arms the lane. The lane
+# runs exactly as it did before the second loop existed and does NOT get the
+# spanning protection; it records `arming_loops: 1` on every vehicle so the
+# weakness is in the record rather than only in a document.
+arming_loops     = 2
 arming_spacing_m = 1.5
 
 # Loops AFTER the barrier that confirm the entry: 0, 1 or 2.
@@ -291,7 +301,10 @@ closing_spacing_m = 1.5
 # Held is its own answer: never voided silently (that is the abandoned-ticket
 # fraud) and never turned into a session (that is a phantom occupant).
 confirmation_window_seconds = 10.0
-# THE DEACTIVATE LOOP, before the arming loops: 0 or 1. While it reads occupied
+# THE DEACTIVATE LOOP, before the arming loops: 0 or 1. OPTIONAL -- the third
+# loop, for tailgaters; the drawings draw it (L0), dashed, as optional, so this
+# example declares it. A site without it declares 0, 0.0 and 0.0, and loses
+# only the hold below. While it reads occupied
 # the lane does not arm -- a second vehicle that close behind the one at the
 # barrier would follow it through, so the boom stays down until it backs off,
 # and the hold is recorded (`arming_suppressed` / `arming_suppression_ended`).
@@ -305,11 +318,12 @@ confirmation_window_seconds = 10.0
 # The spacing must be MORE than the tail, or the lane refuses to start.
 #
 # The drawings' lane, every distance measured back from the gate arm: the
-# arming loop centred at 3.5 m and 0.76 m long, so its far edge at 3.88 m; a
-# Ford F-150 (6.20 m) stopped 1.0 m before the arm, so its tail at 7.2 m; the
-# third loop's near edge at 8.0 m. Tail 7.2 - 3.88 = 3.32; spacing 8.0 - 3.88 =
-# 4.12. A lane that admits longer vehicles declares its own tail. A site with
-# no such loop declares 0, 0.0 and 0.0, and runs exactly as it did.
+# arming loop L2 centred at 3.5 m, each loop 0.76 m long, and L1 1.5 m behind
+# L2, so the NEAREST arming loop to this one is L1, its far edge at
+# 3.5 + 0.38 + 1.5 + 0.76 = 6.14 m; a Ford F-150 (6.20 m) stopped 1.0 m before
+# the arm, so its tail at 7.2 m; the third loop's near edge at 8.0 m. Tail
+# 7.2 - 6.14 = 1.06; spacing 8.0 - 6.14 = 1.86. A lane that admits longer
+# vehicles declares its own tail.
 deactivate_loops       = 1
-deactivate_spacing_m   = 4.12
-longest_vehicle_tail_m = 3.32
+deactivate_spacing_m   = 1.86
+longest_vehicle_tail_m = 1.06

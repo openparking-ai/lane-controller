@@ -52,6 +52,19 @@ reads a vehicle inside the confirmation window.
 An entry that is never confirmed is HELD and
 flagged — never voided silently, and never turned into a session.
 
+**Two arming loops before the gate are the standard installation**
+(`arming_loops = 2`, `arming_spacing_m = 1.5`, a per-site setting), as the
+installer drawings show them: L2 under the driver at the pay station or
+pedestal, and L1 1.5 m behind it, both under the stopped vehicle. **The lane
+arms only when both read occupied together**, so an object has to span the gap
+between them: a person standing on one loop with a piece of metal cannot. One
+loop occupied alone arms nothing and is recorded (`arming_incomplete`); the
+check is `LaneController.arming_complete` in `src/lane_controller/controller.py`,
+applied on every arrival and by `POST /v1/lane/vend` alike. **One arming loop
+is supported and weaker -- a single object on it arms the lane**; a lane that
+declares `arming_loops = 1` records `arming_loops: 1` on every vehicle, so the
+weaker lane is in the record as one.
+
 **Two confirmation loops after the gate are the standard installation**
 (`closing_loops = 2`, `closing_spacing_m = 1.5`, a 10 second window -- every
 one of them a per-site setting), as the installer drawings show them: past the
@@ -153,11 +166,12 @@ being impossible rather than on us being careful.
 
 **Every loop count, spacing and window is a per-site setting** in `[loops]`, and
 every one of them is an ASSUMPTION until a site measures it — nothing here
-measures a spacing. A site with one arming loop and no
-closing loops runs exactly as it always did; what it does not get is named in
-the record on every vehicle rather than described in a document.
+measures a spacing. A site with one arming loop (weaker: a single object arms
+it) and no closing loops runs exactly as it always did; what it does not get is
+named in the record on every vehicle rather than described in a document.
 
-**A third loop, before the arming loops, HOLDS arming**: the deactivate loop.
+**A third loop, before the arming loops, HOLDS arming, and it is optional**:
+the deactivate loop, for tailgaters (L0 in the drawings, drawn as optional).
 While it reads occupied the lane does not arm — a second vehicle that close
 behind the one at the barrier would follow it through an open boom, so the
 boom stays down until it backs off, and the assisted vend refuses for the same

@@ -156,10 +156,12 @@ def test_the_example_config_is_the_standard_installation():
     five keys and loads. Without it a broken parser would pass the whole table."""
     loops = LaneConfig.from_file(EXAMPLE).loops
 
-    # One arming loop and, past the barrier's closing loop, the confirmation
-    # pair L4/L5, 1.5 m apart: the loops the installer drawings show. Two,
-    # because one loop cannot tell a car driving through from one backing out.
-    assert loops.arming_loops == 1
+    # Two arming loops, 1.5 m apart, both occupied together to arm (L1, L2), and,
+    # past the barrier's closing loop, the confirmation pair L4/L5, 1.5 m apart:
+    # the loops the installer drawings show. Two arming loops, because one object
+    # on one loop must not arm the lane; two confirmation loops, because one loop
+    # cannot tell a car driving through from one backing out.
+    assert loops.arming_loops == 2
     assert loops.closing_loops == 2
     assert loops.arming_spacing_m == 1.5
     assert loops.closing_spacing_m == 1.5
@@ -209,7 +211,7 @@ def test_a_config_with_no_loops_table_at_all_refuses_to_start(tmp_path):
         LaneConfig.from_file(path)
 
 
-def build_from(path: Path, crossings):
+def build_from(path: Path, crossings, *, second_arming_loop: bool = True):
     """A whole lane wired from a CONFIG FILE, so the declaration is what drives it."""
     config = LaneConfig.from_file(path)
     cache = DecisionCache()
@@ -221,12 +223,31 @@ def build_from(path: Path, crossings):
         camera=CannedCameraFeed(),
         vend=vend,
         identifier=StubVehicleIdentifier([VehicleIdentity(plate="CFG-1", confidence=0.97)]),
-        arming_loop_b=OccupancyLoopInput(True) if config.loops.arming_loops == 2 else None,
+        arming_loop_b=(
+            OccupancyLoopInput(second_arming_loop) if config.loops.arming_loops == 2 else None
+        ),
         deactivate_loop=OccupancyLoopInput(False) if config.loops.has_deactivate_loop else None,
         closing_loops=ScriptedClosingLoops(crossings) if config.loops.confirms_entry else None,
         cache=cache,
     )
     return controller, vend
+
+
+def test_the_standard_lane_arms_only_on_both_arming_loops():
+    """The example file as an installer copies it: a vehicle on both arming
+    loops arms the lane and is let in; the same arrival with the second arming
+    loop clear -- one object on one loop -- arms nothing, vends nothing, and is
+    recorded as `arming_incomplete`."""
+    both, both_vend = build_from(EXAMPLE, [(ClosingSequence.FORWARD, 3.0)])
+    both.run_once()
+    assert "armed" in kinds(both)
+    assert both_vend.vend_count == 1
+
+    one, one_vend = build_from(EXAMPLE, [(ClosingSequence.FORWARD, 3.0)], second_arming_loop=False)
+    one.run_once()
+    assert "arming_incomplete" in kinds(one)
+    assert "armed" not in kinds(one)
+    assert one_vend.vend_count == 0
 
 
 def kinds(controller):
