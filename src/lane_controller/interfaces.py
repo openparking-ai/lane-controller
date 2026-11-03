@@ -39,16 +39,17 @@ class Frame:
 class LoopInput(Protocol):
     """One arming loop: an inductive loop that reports a vehicle presenting.
 
-    A lane may have two of these, ~1.5 m apart, and arms only when both read
-    occupied together -- an object then has to SPAN the gap, which a person
-    standing on one loop with a piece of metal cannot. How many a site has is
-    `LoopConfig.arming_loops`; a site with one is not refused and says so in
-    every record it writes.
+    The standard lane has two of these, ~1.2 m apart, and arms only when both
+    read occupied together -- an object then has to SPAN the gap, which a
+    person standing on one loop with a piece of metal cannot. How many a site
+    has is `LoopConfig.arming_loops`; a site with one is weaker (a single object
+    arms it), is not refused, and says so in every record it writes.
 
     This is the *arming* stage only. The loops after the gate are not this,
     and this package reads them and never drives them (see ClosingLoops):
-    either the barrier's own closing loop, read through a second output of its
-    detector -- the standard installation -- or a pair of CONFIRMATION loops.
+    either a pair of CONFIRMATION loops -- the standard installation -- or, as
+    a fallback, the barrier's own closing loop, read through a second output of
+    its detector.
     """
 
     def wait_for_vehicle(self, timeout: float | None = None) -> bool:
@@ -125,7 +126,8 @@ class ClosingSequence(StrEnum):
 class ClosingLoops(Protocol):
     """The loops AFTER the barrier, read and never driven.
 
-    ONE LOOP, the standard installation: the barrier's own closing loop, which
+    ONE LOOP, the fallback (the standard installation is TWO, below): the
+    barrier's own closing loop, which
     lowers the boom and stays wired to the barrier. Its detector's second output
     goes to an input on the lane's control panel, and that input is all this
     package sees. The barrier closes on the loop by itself whether or not

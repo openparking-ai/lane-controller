@@ -65,12 +65,14 @@ UNREADABLE = [VehicleIdentity(plate=None, confidence=0.10, presence=True)]
 
 
 
-#: The installer drawings' lane, every distance back from the gate arm (admin
-#: `src/drawings/numbers.js`): L2 centred at 3.5 m, 0.76 m long; an F-150 of
-#: 6.20 m stopped 1.0 m before the arm; L1's near edge at 8.0 m.
-ARMING_FAR_EDGE_M = 3.5 + 0.76 / 2
-DRAWN_SPACING_M = 4.12  # 8.0 - 3.88
-DRAWN_TAIL_M = 3.32  # 1.0 + 6.20 - 3.88
+#: The installer drawings' suggested lane, every distance back from the gate
+#: arm (admin `src/drawings/numbers.js`): each loop 0.76 m long, the arming loop
+#: L2 centred at 1.98 m and L1, under the driver, at 3.96 m -- so the arming
+#: loop nearest the third loop is L1, its far edge at 4.34 m; an F-150 of
+#: 6.20 m stopped 1.0 m before the arm; the third loop L0's near edge at 8.0 m.
+ARMING_FAR_EDGE_M = 3.96 + 0.76 / 2
+DRAWN_SPACING_M = 3.66  # 8.0 - 4.34
+DRAWN_TAIL_M = 2.86  # 1.0 + 6.20 - 4.34
 EXAMPLE = Path(__file__).parent.parent / "config" / "lane.example.toml"
 
 
@@ -418,7 +420,7 @@ def test_deactivate_loops_is_zero_or_one(count):
     [
         7.0,  # inside a stopped F-150 (tail at 7.2 m): the U7e brief's case
         7.2,  # exactly at the tail: touching it is under it
-        4.5,
+        6.5,  # behind the arming loop L1 (far edge 4.34 m), still under the truck
     ],
 )
 def test_a_deactivate_loop_under_the_longest_stopped_vehicle_is_refused(near_edge_from_arm_m):
@@ -443,9 +445,10 @@ def test_a_distance_that_is_not_one_is_refused(key, bad):
 
 def test_the_drawn_lane_is_accepted():
     """The installer drawings' lane (admin `src/drawings/numbers.js`): L2
-    centred 3.5 m before the arm, 0.76 m long; an F-150, 6.20 m, stopped 1.0 m
-    before the arm; L1's near edge 8.0 m before the arm. L1 sits 0.8 m behind
-    the tail and 4.12 m from L2 -- under the 6.0 m floor this replaced."""
+    centred 1.98 m before the arm and L1 3.96 m, each 0.76 m long; an F-150,
+    6.20 m, stopped 1.0 m before the arm; L0's near edge 8.0 m before the arm.
+    L0 sits 0.8 m behind the tail and 3.66 m from L1 -- under the 6.0 m
+    floor this replaced."""
     loops = LoopConfig(
         deactivate_loops=1,
         deactivate_spacing_m=DRAWN_SPACING_M,

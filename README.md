@@ -52,17 +52,38 @@ reads a vehicle inside the confirmation window.
 An entry that is never confirmed is HELD and
 flagged — never voided silently, and never turned into a session.
 
-**One closing loop is the standard installation**, and it is the loop every
-barrier lane already has: the barrier's own closing loop, under the arm, which
-the installer drawings show. It stays wired to the barrier, which closes on it by
-itself. Its loop detector's second output goes to an input on the lane's control
-panel, and the lane only reads that input (`closing_loops = 1`). Occupied after
-the vend, inside the window, is `confirmed`, at an entry and at an exit alike.
-**What one loop does not tell:** which way the car then went. A car that reaches
-the loop and backs out is not seen; its stay simply has no exit, as any open
-stay. A site that wants that seen installs two confirmation loops after the gate
-(`closing_loops = 2`): crossed A then B they confirm, B then A is a car backing
-out. Every event carries the geometry it relied on, `closing_loops` included.
+**Two arming loops before the gate are the standard installation**
+(`arming_loops = 2`, `arming_spacing_m = 1.2`, edge to edge), as the installer
+drawings suggest them: L1 under the driver at the pay station or pedestal, and
+L2 ahead of it, toward the barrier, both under a car stopped at the window. **The lane
+arms only when both read occupied together**, so an object has to span the gap
+between them: a person standing on one loop with a piece of metal cannot. One
+loop occupied alone arms nothing and is recorded (`arming_incomplete`); the
+check is `LaneController.arming_complete` in `src/lane_controller/controller.py`,
+applied on every arrival and by `POST /v1/lane/vend` alike. **One arming loop
+is supported and weaker -- a single object on it arms the lane**; a lane that
+declares `arming_loops = 1` records `arming_loops: 1` on every vehicle, so the
+weaker lane is in the record as one.
+
+**Two confirmation loops after the gate are the standard installation**
+(`closing_loops = 2`, `closing_spacing_m = 1.5`, a 10 second window -- every
+one of them a per-site setting), as the installer drawings show them: past the
+barrier's own closing loop L3, the confirmation pair L4/L5, read by the lane's
+loop detector. Crossed A then B inside the window, the entry (or the exit) is
+`confirmed`; B then A is a car backing out -- no session, no occupancy, and an
+exit that backs out after paying is still the same stay. **Two, because one loop
+cannot tell those apart.** L3 itself stays wired to the barrier, which closes on
+it by itself; it confirms the gate closed behind the car, and its detector's
+second output goes, read only, to an input on the lane's control panel.
+
+**One closing loop is a supported fallback -- direction not known: a
+backing-out car is not seen.** A lane with no pair declares `closing_loops = 1`
+and `closing_spacing_m = 0.0`, and the lane reads the barrier's closing loop
+through that second output. Occupied after the vend, inside the window, is
+`confirmed`, at an entry and at an exit alike; a car that reaches the loop and
+backs out is not seen, and its stay simply has no exit, as any open stay.
+Every event carries the geometry it relied on, `closing_loops` included, so a
+fallback lane is in the record as one.
 
 **It narrows the fraud rather than closing it**: a ticket with no car becomes a
 ticket with *a* car, because nothing here binds the crossing to the vehicle that
@@ -143,13 +164,21 @@ there is no `close()` anywhere in this package. A controller that could close a 
 controller that could close one on a vehicle; the safety case rests on that
 being impossible rather than on us being careful.
 
+**The installer drawings are a suggestion.** Loop positions are set at the
+site survey and may move during the install (cabling, underground services, the
+shape of the lane); `[loops]` declares what was actually installed. What must
+hold wherever they go: two arming loops both covered by a car stopped at the
+window, every two loops at least 1.2 m apart, two loops after the barrier for
+direction (one is a fallback), the third loop optional.
+
 **Every loop count, spacing and window is a per-site setting** in `[loops]`, and
 every one of them is an ASSUMPTION until a site measures it — nothing here
-measures a spacing. A site with one arming loop and no
-closing loops runs exactly as it always did; what it does not get is named in
-the record on every vehicle rather than described in a document.
+measures a spacing. A site with one arming loop (weaker: a single object arms
+it) and no closing loops runs exactly as it always did; what it does not get is
+named in the record on every vehicle rather than described in a document.
 
-**A third loop, before the arming loops, HOLDS arming**: the deactivate loop.
+**A third loop, before the arming loops, HOLDS arming, and it is optional**:
+the deactivate loop, for tailgaters (L0 in the drawings, drawn as optional).
 While it reads occupied the lane does not arm — a second vehicle that close
 behind the one at the barrier would follow it through an open boom, so the
 boom stays down until it backs off, and the assisted vend refuses for the same
@@ -574,7 +603,7 @@ None of it is required to run this package, and none of it has been purchased ye
 |---|---|
 | Controller | Seeed reComputer Industrial J3011 (Jetson Orin NX), in the gate housing |
 | Barrier | Q-SAQ, driven by a dry-contact vend relay |
-| Detection | Inductive arming loops before the barrier, an optional deactivate loop before those, and the barrier's own closing loop, wired to the barrier and read through its detector's second output; or two confirmation loops after the gate |
+| Detection | Inductive arming loops before the barrier, an optional deactivate loop before those, the barrier's own closing loop wired to the barrier, and two confirmation loops after it, crossed in order; or, as a fallback that does not see direction, the closing loop alone, read through its detector's second output |
 | Cameras — default | Reolink RLC-810A |
 | Cameras — upper tiers | Axis P1465-LE, Hanwha XNO-9082R |
 
